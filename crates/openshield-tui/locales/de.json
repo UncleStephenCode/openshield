@@ -1,0 +1,48 @@
+{
+  "cli.about":"Sichere Terminaloberfläche für OpenShield","main.terminal_required":"die TUI benötigt ein interaktives Terminal","main.terminal_init_failed":"Terminal konnte nicht initialisiert werden","main.draw_failed":"TUI konnte nicht dargestellt werden","main.input_poll_failed":"Fehler beim Warten auf Eingabe","main.input_read_failed":"Fehler beim Lesen der Eingabe","view.status":"Zustand","view.rules":"Regeln","view.events":"Ereignisse","view.help":"Hilfe",
+  "common.unknown":"unbekannt","common.any":"beliebig","common.yes":"ja","common.no":"nein","common.manual":"manuell","common.learned":"Lernen","common.learned_immutable":"Lernen (Ursprung unveränderlich)",
+  "status.policy":"Richtlinie: ","status.telemetry":"Telemetrie: ","status.access":"Zugriff: ","status.mode":"Modus: ","status.revision":"Richtlinienrevision: {revision}","status.rule_counts":"Regeln: {rules}; aktive eingehende Freigaben: {inbound}","status.inbound_policy":"Eingangsrichtlinie: standardmäßig DROP; nur Pakete aktiver Freigaberegeln passieren.","status.age_unknown":"Alter unbekannt","status.age":"Alter {duration}","status.counters_title":"Neueste nftables-Zähler ({age}; Pakete / Bytes):","status.counters_waiting":"nftables-Zähler: warte auf erste Aktualisierung…","status.observe_socket":"Beobachtung: {path}","status.control_socket":"Steuerung: {path}","status.title":" Zustand ",
+  "health.connecting":"Verbindung wird hergestellt…","health.connected":"verbunden","health.disconnected":"getrennt ({reason})","health.telemetry_stale":"EINGESCHRÄNKT: seit {duration} keine frischen Zähler","health.subscription_active":"Abonnement aktiv","health.subscription_waiting":"Abonnement aktiv, warte auf Zähler…","health.telemetry_disconnected":"EINGESCHRÄNKT: Datenstrom getrennt ({reason})","access.read_only":"NUR LESEN (Änderungen erfordern root)","access.privileged":"PRIVILEGIERTE STEUERUNG",
+  "rules.column_enabled":"An","rules.column_direction":"Richt.","rules.column_protocol":"Prot.","rules.column_peer":"Gegenstelle/Netz","rules.column_port":"Anschluss","rules.column_interface":"Schnittstelle","rules.column_name":"Bezeichnung","rules.column_origin":"Ursprung","rules.title":" Freigaberegeln ","events.title":" Ereignisse (neueste zuerst) ","events.title_dropped":" Ereignisse (neueste zuerst; vom Kanal verworfen: {count}) ",
+  "help.navigation":"1/2/3/4   Status / Regeln / Ereignisse / Hilfe","help.next_tab":"Tab       nächster Reiter","help.select_rule":"↑/↓       Regel auswählen","help.quit":"q         beenden","help.open_help":"?         Hilfe","help.control_title":"Steuerung (nur root):","help.select_mode":"m         Modus auswählen","help.rule_actions":"n/e/d     Regel erstellen / bearbeiten / löschen","help.toggle_rule":"Space     ausgewählte Regel ein- oder ausschalten","help.editor":"Editor: Tab/Shift-Tab — Feld; ←/→ — Auswahl; Enter — speichern; Esc — abbrechen.","help.unprivileged":"Unprivilegierte Sitzung: Änderungsbefehle sind deaktiviert.","help.title":" Hilfe ",
+  "footer.status":"m: Modus   ?: Hilfe   q: beenden","footer.rules_read_only":"↑/↓: Auswahl   nur lesen   ?: Hilfe   q: beenden","footer.rules":"n: neu   e: bearbeiten   d: löschen   Space: an/aus","footer.events_live":"Ereignisse in Echtzeit   q: beenden","footer.events_offline":"Echtzeitereignisse nicht verfügbar   q: beenden","footer.help":"q: beenden",
+  "overlay.mode_picker":" Modus auswählen ","overlay.block_all_title":" ALLES BLOCKIEREN ","overlay.block_all_body":"Der GESAMTE ein- und ausgehende IP-Verkehr wird blockiert. Fortfahren? [y/N]","overlay.delete_title":" Regel löschen ","overlay.delete_body":"„{name}“ löschen? [y/N]","editor.field_name":"Bezeichnung","editor.field_direction":"Richtung","editor.field_protocol":"Protokoll","editor.field_peer":"Entfernte Stelle/CIDR","editor.field_port":"Port/Bereich","editor.field_interface":"Schnittstelle","editor.field_enabled":"Aktiviert","editor.field_origin":"Ursprung","editor.help":"Die Regel erlaubt passenden Verkehr; für eine Eingangsregel eingehend wählen. Alle anderen Eingangspakete werden blockiert.","editor.edit_title":" Regel bearbeiten ","editor.new_title":" Neue Freigaberegel ",
+  "mode.block_all":"alles blockieren","mode.learning":"Lernen","mode.enforcing":"Regeln anwenden","direction.inbound":"ein","direction.outbound":"aus","duration.subsecond":"unter 1 Sek.","duration.seconds":"{value} Sek.","duration.minutes":"{value} Min.","duration.hours":"{value} Std.",
+  "control.policy_changed_title":" Richtlinie geändert ","control.policy_changed_body":"Der Befehl wurde nicht angewendet und wird nicht automatisch wiederholt. Aktion nach der Aktualisierung erneut ausführen.\n\n{message}","control.rejected_title":" Befehl abgelehnt ","control.rejected_body":"Der Daemon bestätigte, dass die Änderung nicht angewendet wurde ({code}).\n\n{message}","control.unconfirmed_title":" Ergebnis unbestätigt ","control.unconfirmed_body":"Keine Daemon-Antwort: Der Befehl könnte vor dem Verbindungsabbruch angewendet worden sein. Nicht automatisch wiederholen; aktuellen Schnappschuss abwarten und prüfen.\n\n{error}","control.resync_failed":"\n\nSynchronisierung konnte nicht angefordert werden: {error}","control.resync_scheduled":"\n\nEin aktueller Schnappschuss wird automatisch geladen.","control.applied":"Befehl angewendet, Revision {revision}","control.applied_rule":"Befehl auf „{rule}“ angewendet, Revision {revision}",
+  "validation.name_empty":"Regelname darf nicht leer sein","validation.icmp_port":"Für ICMP darf kein Port angegeben werden","validation.invalid_interface":"Ungültige Schnittstelle: {error}","validation.invalid_name":"Ungültiger Name: {error}","validation.invalid_rule":"Ungültige Regel: {error}","validation.invalid_peer":"Ungültige IP-Adresse oder CIDR: {error}","validation.port_missing":"Port fehlt","validation.port_number":"Port muss eine Zahl von 1 bis 65535 sein","validation.port_end_number":"Bereichsende muss eine Zahl sein","validation.port_format":"Portformat: 443 oder 8000-8100","validation.invalid_port_range":"Ungültiger Portbereich: {error}",
+  "notice.daemon_restarted":"Daemon-Neustart erkannt; Zustand neu geladen und unfertige Änderungen verworfen","notice.connection_lost":"Verbindung verloren; unfertige Änderung verworfen","notice.revisions_skipped":"Revisionen {first}..{last} fehlen; Zustand wird aus einem Schnappschuss aktualisiert","notice.wait_snapshot":"Zuerst auf einen aktuellen Richtlinienschnappschuss warten","notice.base_revision_missing":"Änderung verworfen: Basisrevision nicht verfügbar","notice.no_rule_selected":"Keine Regel ausgewählt","notice.read_only":"Nur-Lese-Modus: Änderungen sind nur root über control.sock erlaubt",
+  "status.counter_accepted_in":"Eingang erlaubt","status.counter_accepted_out":"Ausgang erlaubt","status.counter_dropped_in":"Eingang verworfen","status.counter_dropped_out":"Ausgang verworfen","status.counter_learned_out":"Ausgang gelernt","event.mode_changed":"Modus: {previous} → {current}","event.rule_created":"Regel „{rule}“ erstellt","event.rule_updated":"Regel „{rule}“ geändert","event.rule_deleted":"Regel „{rule}“ gelöscht","event.rule_enabled":"Regel „{rule}“: {state}","event.enabled":"aktiviert","event.disabled":"deaktiviert","event.counters":"Zähler: in +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; out +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; gelernt {learned_packets}/{learned_bytes}B"
+  ,"editor.field_application":"Anwendungsabgleich"
+  ,"editor.field_executable":"Pfad der ausführbaren Datei"
+  ,"editor.field_device":"Geräte-ID"
+  ,"editor.field_inode":"Inode-Nr."
+  ,"editor.field_command_mode":"Befehlszeilenabgleich"
+  ,"editor.field_arguments":"Argumente (JSON-Array)"
+  ,"editor.field_uid":"Benutzer-ID (UID)"
+  ,"editor.field_cgroup":"Kontrollgruppe (cgroup)"
+  ,"editor.command_any":"Beliebige Argumente"
+  ,"editor.command_exact":"Exakte Argumente"
+  ,"editor.command_prefix":"Argumentpräfix"
+  ,"editor.application_help":"Der Anwendungsabgleich ist nur für ausgehende Regeln verfügbar. Der Pfad der ausführbaren Datei ist erforderlich; Gerät und Inode müssen gemeinsam angegeben werden."
+  ,"rules.column_application":"Anwendung"
+  ,"rules.network_only":"nur Netzwerk"
+  ,"rules.application_redacted":"Anwendungsdetails ausgeblendet"
+  ,"rules.details_title":" Anwendungsdetails "
+  ,"rules.details_executable":"Ausführbare Datei"
+  ,"rules.details_file_id":"Gerät {device}, Inode {inode}"
+  ,"rules.details_command":"Befehlszeile"
+  ,"rules.details_uid":"Benutzer-ID (UID)"
+  ,"rules.details_cgroup":"Kontrollgruppe (cgroup)"
+  ,"validation.application_outbound":"Der Anwendungsabgleich ist nur für ausgehende Regeln verfügbar"
+  ,"validation.executable_required":"Beim Anwendungsabgleich ist ein Pfad zur ausführbaren Datei erforderlich"
+  ,"validation.file_id_pair":"Gerät und Inode müssen gemeinsam angegeben werden"
+  ,"validation.invalid_device":"Die Geräte-ID muss eine nichtnegative Ganzzahl sein"
+  ,"validation.invalid_inode":"Der Inode muss eine positive Ganzzahl sein"
+  ,"validation.arguments_unused":"Bei beliebigen Argumenten muss das Argumentfeld leer sein"
+  ,"validation.arguments_json":"Argumente müssen ein JSON-Array sein"
+  ,"validation.arguments_strings":"Jedes Argument muss eine Zeichenkette sein"
+  ,"validation.invalid_executable":"Ungültiger Pfad der ausführbaren Datei: {error}"
+  ,"validation.invalid_arguments":"Ungültige Befehlszeilenargumente: {error}"
+  ,"validation.invalid_uid":"Die Benutzer-ID muss eine nichtnegative Ganzzahl sein"
+  ,"validation.invalid_cgroup":"Ungültige Kontrollgruppe: {error}"
+}

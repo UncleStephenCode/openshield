@@ -1,0 +1,30 @@
+[package]
+name = "openshield-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Privileged OpenShield nftables daemon"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+libc.workspace = true
+nix.workspace = true
+openshield-core = { version = "=0.1.0", path = "../openshield-core" }
+openshield-protocol = { version = "=0.1.0", path = "../openshield-protocol" }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "openshield-daemon"
+path = "src/main.rs"

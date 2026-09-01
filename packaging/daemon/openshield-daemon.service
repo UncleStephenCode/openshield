@@ -1,0 +1,68 @@
+[Unit]
+Description=OpenShield nftables firewall daemon
+Documentation=https://github.com/UncleStephenCode/openshield
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+ExecStartPre=/usr/bin/openshield-daemon --install-fail-closed
+ExecStart=/usr/bin/openshield-daemon
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillMode=mixed
+
+# CAP_SYS_PTRACE and read/search-only DAC bypass are required solely to bind a
+# queued socket inode to /proc/<pid>/{fd,exe,cmdline,cgroup,status}. Selected
+# direct inspection syscalls are denied below, but this is not process-memory
+# isolation; see docs/THREAT_MODEL.md.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+UMask=0077
+RuntimeDirectory=openshield
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=openshield
+StateDirectoryMode=0700
+
+# Filesystem and kernel hardening.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/openshield /var/lib/openshield
+
+# Runtime attack-surface reduction. AF_NETLINK is required by nft(8).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallFilter=~ptrace process_vm_readv process_vm_writev kcmp pidfd_getfd open_by_handle_at
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+# When enabled with systemctl, make network-pre.target require the firewall's
+# successful ordered startup. Network managers that bypass network-pre.target
+# still need a distribution-specific dependency or initramfs policy.
+RequiredBy=network-pre.target

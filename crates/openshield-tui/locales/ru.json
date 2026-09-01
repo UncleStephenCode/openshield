@@ -1,0 +1,76 @@
+{
+  "cli.about": "Безопасное терминальное управление OpenShield",
+  "main.terminal_required": "для TUI необходим интерактивный терминал",
+  "main.terminal_init_failed": "не удалось инициализировать терминал",
+  "main.draw_failed": "не удалось отрисовать TUI",
+  "main.input_poll_failed": "ошибка ожидания ввода",
+  "main.input_read_failed": "ошибка чтения ввода",
+  "control.policy_changed_title": " Политика изменилась ",
+  "control.policy_changed_body": "Команда не применена и не будет повторена автоматически. Повторите действие после обновления состояния.\n\n{message}",
+  "control.rejected_title": " Команда отклонена ",
+  "control.rejected_body": "Демон подтвердил, что изменение не применено ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Результат не подтверждён ",
+  "control.unconfirmed_body": "Ответ демона не получен: команда могла быть применена до разрыва связи. Не повторяйте её автоматически; дождитесь актуального снимка и проверьте его.\n\n{error}",
+  "control.resync_failed": "\n\nНе удалось запросить синхронизацию: {error}",
+  "control.resync_scheduled": "\n\nАктуальный снимок будет загружен автоматически.",
+  "control.applied": "Команда применена, ревизия {revision}",
+  "control.applied_rule": "Команда применена к «{rule}», ревизия {revision}",
+  "view.status": "Статус", "view.rules": "Правила", "view.events": "События", "view.help": "Справка",
+  "validation.name_empty": "Название правила не может быть пустым",
+  "validation.icmp_port": "Для ICMP нельзя указывать порт",
+  "validation.invalid_interface": "Некорректный интерфейс: {error}",
+  "validation.invalid_name": "Некорректное название: {error}",
+  "validation.invalid_rule": "Некорректное правило: {error}",
+  "validation.invalid_peer": "Некорректный IP-адрес или CIDR: {error}",
+  "validation.port_missing": "Не указан порт", "validation.port_number": "Порт должен быть числом от 1 до 65535", "validation.port_end_number": "Конец диапазона должен быть числом", "validation.port_format": "Формат порта: 443 или 8000-8100", "validation.invalid_port_range": "Некорректный диапазон портов: {error}",
+  "notice.daemon_restarted": "Обнаружен перезапуск демона; состояние перечитано, незавершённые изменения отменены",
+  "notice.connection_lost": "Связь потеряна; незавершённое изменение отменено",
+  "notice.revisions_skipped": "Пропущены ревизии {first}..{last}; состояние будет обновлено снимком",
+  "notice.wait_snapshot": "Сначала дождитесь актуального снимка политики", "notice.base_revision_missing": "Изменение отменено: нет базовой ревизии политики", "notice.no_rule_selected": "Нет выбранного правила", "notice.read_only": "Режим только для чтения: изменения доступны только root через control.sock",
+  "common.unknown": "неизвестен", "common.any": "любой", "common.yes": "да", "common.no": "нет", "common.manual": "ручное", "common.learned": "обучение", "common.learned_immutable": "обучение (источник неизменяем)",
+  "status.policy": "Политика: ", "status.telemetry": "Телеметрия: ", "status.access": "Доступ: ", "status.mode": "Режим: ", "status.revision": "Ревизия политики: {revision}", "status.rule_counts": "Правила: {rules}; активных входящих разрешений: {inbound}",
+  "status.inbound_policy": "Входящая политика: DROP по умолчанию; пропускаются только пакеты по активным разрешающим правилам.",
+  "status.age_unknown": "возраст неизвестен", "status.age": "возраст {duration}", "status.counters_title": "Последние счётчики nftables ({age}; пакеты / байты):", "status.counter_accepted_in": "принято вход", "status.counter_accepted_out": "принято выход", "status.counter_dropped_in": "отброшено вход", "status.counter_dropped_out": "отброшено выход", "status.counter_learned_out": "обучено выход", "status.counters_waiting": "Счётчики nftables: ожидание первого обновления…", "status.observe_socket": "Наблюдение: {path}", "status.control_socket": "Управление: {path}", "status.title": " Состояние ",
+  "health.connecting": "подключение…", "health.connected": "подключено", "health.disconnected": "нет связи ({reason})", "health.telemetry_stale": "ДЕГРАДАЦИЯ: нет свежих счётчиков {duration}", "health.subscription_active": "подписка активна", "health.subscription_waiting": "подписка активна, ожидание счётчиков…", "health.telemetry_disconnected": "ДЕГРАДАЦИЯ: поток отключён ({reason})", "access.read_only": "ТОЛЬКО ЧТЕНИЕ (изменения доступны root)", "access.privileged": "ПРИВИЛЕГИРОВАННОЕ УПРАВЛЕНИЕ",
+  "rules.column_enabled": "Вкл", "rules.column_direction": "Напр.", "rules.column_protocol": "Прот.", "rules.column_peer": "Узел/сеть", "rules.column_port": "Порт", "rules.column_interface": "Интерфейс", "rules.column_name": "Название", "rules.column_origin": "Источник", "rules.title": " Разрешающие правила ",
+  "events.title": " События (новые сверху) ", "events.title_dropped": " События (новые сверху; отброшено каналом: {count}) ",
+  "help.navigation": "1/2/3/4   статус / правила / события / справка", "help.next_tab": "Tab       следующая вкладка", "help.select_rule": "↑/↓       выбор правила", "help.quit": "q         выход", "help.open_help": "?         справка", "help.control_title": "Управление (только root):", "help.select_mode": "m         выбрать режим", "help.rule_actions": "n/e/d     создать / изменить / удалить правило", "help.toggle_rule": "Space     включить или выключить выбранное правило", "help.editor": "В редакторе: Tab/Shift-Tab — поле; ←/→ — выбор; Enter — сохранить; Esc — отмена.", "help.unprivileged": "Сеанс непривилегированный: команды изменения намеренно отключены.", "help.title": " Справка ",
+  "footer.status": "m: режим   ?: справка   q: выход", "footer.rules_read_only": "↑/↓: выбор   только чтение   ?: справка   q: выход", "footer.rules": "n: создать   e: изменить   d: удалить   Space: вкл/выкл", "footer.events_live": "события обновляются в реальном времени   q: выход", "footer.events_offline": "события реального времени сейчас недоступны   q: выход", "footer.help": "q: выход",
+  "overlay.mode_picker": " Выбор режима ", "overlay.block_all_title": " ПОЛНАЯ БЛОКИРОВКА ", "overlay.block_all_body": "Будет заблокирован ВЕСЬ входящий и исходящий IP-трафик. Продолжить? [y/N]", "overlay.delete_title": " Удаление правила ", "overlay.delete_body": "Удалить «{name}»? [y/N]",
+  "editor.field_name": "Название", "editor.field_direction": "Направление", "editor.field_protocol": "Протокол", "editor.field_peer": "Удалённый узел/CIDR", "editor.field_port": "Порт/диапазон", "editor.field_interface": "Интерфейс", "editor.field_enabled": "Включено", "editor.field_origin": "Источник", "editor.help": "Правило разрешает совпавший трафик; для входящего выберите «вход». Все прочие входящие пакеты блокируются.", "editor.edit_title": " Изменить правило ", "editor.new_title": " Новое разрешающее правило ",
+  "event.mode_changed": "режим: {previous} → {current}", "event.rule_created": "создано правило «{rule}»", "event.rule_updated": "изменено правило «{rule}»", "event.rule_deleted": "удалено правило «{rule}»", "event.rule_enabled": "правило «{rule}»: {state}", "event.enabled": "включено", "event.disabled": "выключено", "event.counters": "счётчики: in +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; out +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; learned {learned_packets}/{learned_bytes}B",
+  "mode.block_all": "полная блокировка", "mode.learning": "обучение", "mode.enforcing": "выполнение правил", "direction.inbound": "вход", "direction.outbound": "выход", "duration.subsecond": "<1 с", "duration.seconds": "{value} с", "duration.minutes": "{value} мин", "duration.hours": "{value} ч"
+  ,"editor.field_application": "Сопоставление с приложением"
+  ,"editor.field_executable": "Путь к исполняемому файлу"
+  ,"editor.field_device": "Идентификатор устройства"
+  ,"editor.field_inode": "Индексный дескриптор (inode)"
+  ,"editor.field_command_mode": "Сопоставление командной строки"
+  ,"editor.field_arguments": "Аргументы (массив JSON)"
+  ,"editor.field_uid": "Идентификатор пользователя (UID)"
+  ,"editor.field_cgroup": "Контрольная группа (cgroup)"
+  ,"editor.command_any": "Любые аргументы"
+  ,"editor.command_exact": "Точное совпадение аргументов"
+  ,"editor.command_prefix": "Префикс аргументов"
+  ,"editor.application_help": "Сопоставление с приложением доступно только для исходящих правил. Путь к исполняемому файлу обязателен; устройство и inode указываются вместе."
+  ,"rules.column_application": "Приложение"
+  ,"rules.network_only": "только сеть"
+  ,"rules.application_redacted": "данные приложения скрыты"
+  ,"rules.details_title": " Сведения о приложении "
+  ,"rules.details_executable": "Исполняемый файл"
+  ,"rules.details_file_id": "устройство {device}, inode {inode}"
+  ,"rules.details_command": "Командная строка"
+  ,"rules.details_uid": "Идентификатор пользователя (UID)"
+  ,"rules.details_cgroup": "Контрольная группа (cgroup)"
+  ,"validation.application_outbound": "Сопоставление с приложением доступно только для исходящих правил"
+  ,"validation.executable_required": "При сопоставлении с приложением необходимо указать путь к исполняемому файлу"
+  ,"validation.file_id_pair": "Устройство и inode необходимо указывать вместе"
+  ,"validation.invalid_device": "Идентификатор устройства должен быть неотрицательным целым числом"
+  ,"validation.invalid_inode": "Inode должен быть положительным целым числом"
+  ,"validation.arguments_unused": "Для режима любых аргументов поле аргументов должно быть пустым"
+  ,"validation.arguments_json": "Аргументы должны быть массивом JSON"
+  ,"validation.arguments_strings": "Каждый аргумент должен быть строкой"
+  ,"validation.invalid_executable": "Недопустимый путь к исполняемому файлу: {error}"
+  ,"validation.invalid_arguments": "Недопустимые аргументы командной строки: {error}"
+  ,"validation.invalid_uid": "Идентификатор пользователя должен быть неотрицательным целым числом"
+  ,"validation.invalid_cgroup": "Недопустимая контрольная группа: {error}"
+}

@@ -1,0 +1,431 @@
+#![forbid(unsafe_code)]
+
+mod app;
+mod i18n;
+mod terminal;
+mod transport;
+mod ui;
+
+use std::io::{self, IsTerminal};
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+use crossterm::event::{
+    self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
+use nix::unistd::geteuid;
+use openshield_core::Mode;
+use openshield_protocol::{Ack, ControlRequest, ErrorCode};
+
+use crate::app::{App, FormField, Overlay, View};
+use crate::i18n::{I18n, Locale};
+use crate::terminal::TerminalSession;
+use crate::transport::{Observer, ObserverUpdate, SocketPaths};
+
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STATUS_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_FATAL_ERROR_CHARS: usize = 4_096;
+
+#[derive(Debug, Parser)]
+#[command(name = "openshield-tui", version)]
+struct Cli {
+    #[arg(long, value_name = "LOCALE")]
+    locale: Option<Locale>,
+}
+
+fn main() -> ExitCode {
+    terminal::install_panic_hook();
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("openshield-tui: {}", terminal_safe(&format!("{error:#}")));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .take(MAX_FATAL_ERROR_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let i18n = cli.locale.map_or_else(I18n::detect, I18n::load)?;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!(i18n.tr("main.terminal_required").to_owned());
+    }
+
+    let paths = SocketPaths::fixed();
+
+    let read_only = !geteuid().is_root();
+    let observer = Observer::start(&paths);
+    let mut app = App::new(read_only, i18n.clone());
+    let mut terminal = TerminalSession::enter()
+        .with_context(|| i18n.tr("main.terminal_init_failed").to_owned())?;
+    let mut needs_draw = true;
+    let mut last_status_draw = Instant::now();
+
+    while !app.should_quit {
+        needs_draw |= drain_observer_updates(&observer, &mut app);
+        if app.view == View::Status
+            && Instant::now().saturating_duration_since(last_status_draw)
+                >= STATUS_AGE_REFRESH_INTERVAL
+        {
+            needs_draw = true;
+        }
+        if needs_draw {
+            terminal
+                .terminal_mut()
+                .draw(|frame| ui::draw(frame, &app, &paths.observe, &paths.control))
+                .with_context(|| i18n.tr("main.draw_failed").to_owned())?;
+            if app.view == View::Status {
+                last_status_draw = Instant::now();
+            }
+            needs_draw = false;
+        }
+
+        if event::poll(INPUT_POLL_INTERVAL)
+            .with_context(|| i18n.tr("main.input_poll_failed").to_owned())?
+        {
+            match event::read().with_context(|| i18n.tr("main.input_read_failed").to_owned())? {
+                TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.notice = None;
+                    if let Some(request) = handle_key(&mut app, key) {
+                        execute_control(&paths, &observer, &mut app, request);
+                    }
+                    needs_draw = true;
+                }
+                TerminalEvent::Resize(_, _) => needs_draw = true,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drain_observer_updates(observer: &Observer, app: &mut App) -> bool {
+    let mut updated = false;
+    while let Ok(update) = observer.try_recv() {
+        updated = true;
+        match update {
+            ObserverUpdate::Connected => app.connection = app::ConnectionState::Connected,
+            ObserverUpdate::Disconnected(reason) => app.set_disconnected(reason),
+            ObserverUpdate::TelemetryConnected => app.set_telemetry_connected(),
+            ObserverUpdate::TelemetryDisconnected(reason) => {
+                app.set_telemetry_disconnected(reason);
+            }
+            ObserverUpdate::Snapshot(snapshot) => {
+                app.connection = app::ConnectionState::Connected;
+                app.set_snapshot(snapshot);
+            }
+            ObserverUpdate::Restarted(snapshot) => {
+                app.connection = app::ConnectionState::Connected;
+                app.set_restarted_snapshot(snapshot);
+            }
+            ObserverUpdate::Event(event) => app.push_event(*event),
+            ObserverUpdate::Dropped(count) => {
+                app.dropped_events = app.dropped_events.saturating_add(count);
+            }
+        }
+    }
+    updated
+}
+
+fn execute_control(
+    paths: &SocketPaths,
+    observer: &Observer,
+    app: &mut App,
+    request: ControlRequest,
+) {
+    match transport::send_control(paths, request) {
+        Ok(ack) => app.notice = Some(ack_message(&ack, &app.i18n)),
+        Err(error) => {
+            let presentation = control_failure_presentation(&error, &app.i18n);
+            let resync_status = if presentation.request_resync {
+                request_resync_notice(observer, &app.i18n)
+            } else {
+                String::new()
+            };
+            app.overlay = Overlay::Message {
+                title: presentation.title,
+                body: format!("{}{resync_status}", presentation.body),
+            };
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ControlFailurePresentation {
+    title: String,
+    body: String,
+    request_resync: bool,
+}
+
+fn control_failure_presentation(
+    error: &transport::IpcError,
+    i18n: &I18n,
+) -> ControlFailurePresentation {
+    match error {
+        transport::IpcError::Rejected {
+            code: ErrorCode::Conflict,
+            message,
+        } => ControlFailurePresentation {
+            title: i18n.tr("control.policy_changed_title").to_owned(),
+            body: i18n.format("control.policy_changed_body", &[("message", message)]),
+            request_resync: true,
+        },
+        transport::IpcError::Rejected { code, message } => ControlFailurePresentation {
+            title: i18n.tr("control.rejected_title").to_owned(),
+            body: {
+                let code = format!("{code:?}");
+                i18n.format(
+                    "control.rejected_body",
+                    &[("code", code.as_str()), ("message", message)],
+                )
+            },
+            request_resync: true,
+        },
+        _ => ControlFailurePresentation {
+            title: i18n.tr("control.unconfirmed_title").to_owned(),
+            body: {
+                let error = error.to_string();
+                i18n.format("control.unconfirmed_body", &[("error", error.as_str())])
+            },
+            request_resync: true,
+        },
+    }
+}
+
+fn request_resync_notice(observer: &Observer, i18n: &I18n) -> String {
+    observer.request_resync().map_or_else(
+        |error| {
+            i18n.format(
+                "control.resync_failed",
+                &[("error", error.to_string().as_str())],
+            )
+        },
+        |()| i18n.tr("control.resync_scheduled").to_owned(),
+    )
+}
+
+fn ack_message(ack: &Ack, i18n: &I18n) -> String {
+    let revision = ack.revision.to_string();
+    ack.affected_rule.as_ref().map_or_else(
+        || i18n.format("control.applied", &[("revision", revision.as_str())]),
+        |rule| {
+            let name = rule.spec.name.to_string();
+            i18n.format(
+                "control.applied_rule",
+                &[("rule", name.as_str()), ("revision", revision.as_str())],
+            )
+        },
+    )
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        app.should_quit = true;
+        return None;
+    }
+
+    match &app.overlay {
+        Overlay::None => handle_normal_key(app, key),
+        Overlay::ModePicker { .. } => handle_mode_picker_key(app, key),
+        Overlay::ConfirmBlockAll => handle_block_confirmation_key(app, key),
+        Overlay::ConfirmDelete { .. } => handle_delete_confirmation_key(app, key),
+        Overlay::Editor(_) => handle_editor_key(app, key),
+        Overlay::Message { .. } => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                app.close_overlay();
+            }
+            None
+        }
+    }
+}
+
+fn handle_normal_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    match key.code {
+        KeyCode::Char('q' | 'Q') => app.should_quit = true,
+        KeyCode::Char('?' | '4') => app.view = View::Help,
+        KeyCode::Char('1') => app.view = View::Status,
+        KeyCode::Char('2') => app.view = View::Rules,
+        KeyCode::Char('3') => app.view = View::Events,
+        KeyCode::Tab => app.view = app.view.next(),
+        KeyCode::Up if app.view == View::Rules => app.select_previous_rule(),
+        KeyCode::Down if app.view == View::Rules => app.select_next_rule(),
+        KeyCode::Char('m' | 'M') => app.open_mode_picker(),
+        KeyCode::Char('n' | 'N') if app.view == View::Rules => app.open_create_rule(),
+        KeyCode::Char('e' | 'E') if app.view == View::Rules => app.open_edit_rule(),
+        KeyCode::Char('d' | 'D') if app.view == View::Rules => {
+            app.open_delete_confirmation();
+        }
+        KeyCode::Char(' ') if app.view == View::Rules => return app.toggle_selected_rule(),
+        _ => {}
+    }
+    None
+}
+
+fn handle_mode_picker_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    let Overlay::ModePicker { selected } = &app.overlay else {
+        return None;
+    };
+    let selected = *selected;
+    let choice = match key.code {
+        KeyCode::Esc => {
+            app.close_overlay();
+            return None;
+        }
+        KeyCode::Char('1') => Some(Mode::BlockAll),
+        KeyCode::Char('2') => Some(Mode::Learning),
+        KeyCode::Char('3') => Some(Mode::Enforcing),
+        KeyCode::Enter => Some(selected),
+        KeyCode::Up | KeyCode::Left => {
+            let previous = match selected {
+                Mode::BlockAll => Mode::Enforcing,
+                Mode::Learning => Mode::BlockAll,
+                Mode::Enforcing => Mode::Learning,
+            };
+            app.overlay = Overlay::ModePicker { selected: previous };
+            None
+        }
+        KeyCode::Down | KeyCode::Right => {
+            let next = match selected {
+                Mode::BlockAll => Mode::Learning,
+                Mode::Learning => Mode::Enforcing,
+                Mode::Enforcing => Mode::BlockAll,
+            };
+            app.overlay = Overlay::ModePicker { selected: next };
+            None
+        }
+        _ => None,
+    };
+    choice.and_then(|mode| app.request_mode(mode))
+}
+
+fn handle_block_confirmation_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    match key.code {
+        KeyCode::Char('y' | 'Y' | 'д' | 'Д') => app.confirm_block_all(true),
+        KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Esc | KeyCode::Enter => {
+            app.confirm_block_all(false)
+        }
+        _ => None,
+    }
+}
+
+fn handle_delete_confirmation_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    match key.code {
+        KeyCode::Char('y' | 'Y' | 'д' | 'Д') => app.confirm_delete(true),
+        KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Esc | KeyCode::Enter => {
+            app.confirm_delete(false)
+        }
+        _ => None,
+    }
+}
+
+fn handle_editor_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_overlay();
+            return None;
+        }
+        KeyCode::Enter => return app.submit_editor(),
+        _ => {}
+    }
+
+    let Overlay::Editor(form) = &mut app.overlay else {
+        return None;
+    };
+    match key.code {
+        KeyCode::Tab => form.move_next(),
+        KeyCode::BackTab => form.move_previous(),
+        KeyCode::Left => form.cycle_choice(true),
+        KeyCode::Right | KeyCode::Char(' ')
+            if matches!(
+                form.active_field,
+                FormField::Direction
+                    | FormField::Protocol
+                    | FormField::Application
+                    | FormField::CommandMode
+                    | FormField::Enabled
+            ) =>
+        {
+            form.cycle_choice(false);
+        }
+        KeyCode::Backspace => form.backspace(),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            form.insert_char(character);
+        }
+        _ => {}
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use crossterm::event::KeyEvent;
+
+    use super::*;
+
+    #[test]
+    fn read_only_keyboard_shortcut_does_not_open_editor() {
+        let mut app = App::new(true, I18n::test_english());
+        app.view = View::Rules;
+        let request = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(request.is_none());
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn block_all_keyboard_path_still_requires_confirmation() {
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(openshield_core::Snapshot {
+            revision: 4,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        });
+        app.open_mode_picker();
+        let request = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        );
+        assert!(request.is_none());
+        assert_eq!(app.overlay, Overlay::ConfirmBlockAll);
+    }
+
+    #[test]
+    fn lost_ack_is_presented_as_ambiguous_and_forces_resync() {
+        let error = transport::IpcError::Timeout(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "response was lost after request write",
+        ));
+        let presentation = control_failure_presentation(&error, &I18n::test_english());
+
+        assert!(presentation.request_resync);
+        assert!(presentation.body.contains("may have been applied"));
+        assert!(presentation.body.contains("Do not retry"));
+        assert_eq!(presentation.title, " Result not confirmed ");
+    }
+}
