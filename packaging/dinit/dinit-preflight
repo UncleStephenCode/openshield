@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+# The first operation is intentionally independent of NSS and group setup.  If
+# the dedicated observer group cannot be created, startup aborts with BlockAll
+# already resident in the kernel.
+/usr/bin/openshield-daemon --install-fail-closed
+/usr/libexec/openshield/ensure-group

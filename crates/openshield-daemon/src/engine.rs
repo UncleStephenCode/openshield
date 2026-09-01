@@ -10,8 +10,9 @@ use chrono::Utc;
 #[cfg(test)]
 use openshield_core::LearnedEndpoint;
 use openshield_core::{
-    CoreError, Event, EventKind, FirewallCounters, LearnedApplicationEndpoint, MAX_FLOW_GENERATION,
-    MAX_RULES, Mode, Rule, RuleOrigin, Snapshot, State, StateStore,
+    ApplicationLearningAdmission, ApplicationLearningAdmissionIndex, CoreError, Event, EventKind,
+    FirewallCounters, LearnedApplicationEndpoint, MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule,
+    RuleOrigin, Snapshot, State, StateStore,
 };
 use openshield_protocol::{
     Ack, ControlRequest, ErrorCode, ProtocolError, Response, clamp_page_limit,
@@ -19,7 +20,7 @@ use openshield_protocol::{
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::application::pin_rule_application;
+use crate::application::{ApplicationDecisionPolicy, pin_rule_application};
 use crate::backend::FirewallBackend;
 
 pub const MAX_EVENT_SUBSCRIBERS: usize = 64;
@@ -155,19 +156,36 @@ impl Drop for EventSubscription {
 
 pub struct Engine {
     state: State,
+    application_policy: Arc<ApplicationDecisionPolicy>,
+    application_learning_admission: Arc<ApplicationLearningAdmissionIndex>,
     backend: Box<dyn FirewallBackend>,
     store: Box<dyn StateStore>,
     events: EventBus,
     poisoned: bool,
     fatal: bool,
     restart_required: bool,
+    startup_policy: StartupPolicy,
     learning_persistence: LearningPersistence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPolicy {
+    Pending,
+    Active,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LearningPersistence {
     Active,
     Paused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LearningQueueAdmission {
+    Enqueue,
+    AlreadyKnown,
+    Saturated,
+    PersistencePaused,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,38 +199,60 @@ impl std::fmt::Debug for Engine {
         formatter
             .debug_struct("Engine")
             .field("state", &self.state)
+            .field(
+                "application_policy_rules",
+                &self.application_policy.rule_count(),
+            )
+            .field(
+                "application_learning_revision",
+                &self.application_learning_admission.revision(),
+            )
             .field("store", &self.store)
             .field("events", &self.events)
             .field("poisoned", &self.poisoned)
             .field("fatal", &self.fatal)
             .field("restart_required", &self.restart_required)
+            .field("startup_policy", &self.startup_policy)
             .field("learning_persistence", &self.learning_persistence)
             .finish_non_exhaustive()
     }
 }
 
 fn rotate_startup_flow_generation(state: &mut State) -> Result<()> {
-    // Uuid::new_v4 uses the operating system CSPRNG. Restrict startup epochs
-    // to the lower half of the 30-bit domain so hundreds of millions of
-    // monotonic restrictive mutations remain available after every restart.
-    const STARTUP_EPOCH_MASK: u32 = MAX_FLOW_GENERATION >> 1;
-    let random = Uuid::new_v4();
-    let bytes = random.as_bytes();
-    let mut generation =
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & STARTUP_EPOCH_MASK;
-    if generation == 0 {
-        generation = 1;
-    }
-    if generation == state.flow_generation() {
-        generation = if generation == STARTUP_EPOCH_MASK {
-            generation - 1
-        } else {
-            generation + 1
-        };
-    }
+    // Never reuse an epoch which may still exist in conntrack after an older
+    // daemon instance. A random value could collide with N-2 or an earlier
+    // live flow; a persisted monotonic epoch cannot. Exhaustion is deliberately
+    // fail-closed rather than wrapping an old authorization into validity.
+    let generation = state
+        .flow_generation()
+        .checked_add(1)
+        .filter(|generation| *generation <= MAX_FLOW_GENERATION)
+        .ok_or_else(|| anyhow!("startup flow-authorization epochs are exhausted"))?;
     state
         .rotate_flow_generation(generation)
         .context("cannot rotate the startup flow-authorization epoch")
+}
+
+fn build_application_decision_policy(state: &State) -> ApplicationDecisionPolicy {
+    let rules = if state.mode() == Mode::Enforcing {
+        state
+            .rules()
+            .filter(|rule| rule.spec.enabled && rule.spec.application.is_some())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ApplicationDecisionPolicy::new(Snapshot {
+        revision: state.revision(),
+        flow_generation: state.flow_generation(),
+        mode: state.mode(),
+        rules,
+    })
+}
+
+fn build_application_learning_admission(state: &State) -> ApplicationLearningAdmissionIndex {
+    state.application_learning_admission_index()
 }
 
 impl Engine {
@@ -242,25 +282,17 @@ impl Engine {
                         )),
                     };
                 }
-                if let Err(apply_error) = backend.apply(&state.snapshot()) {
-                    let fail_closed = backend.fail_closed();
-                    return match fail_closed {
-                        Ok(()) => Err(apply_error).context(
-                            "persisted policy could not be applied; fail-closed policy installed",
-                        ),
-                        Err(fail_error) => Err(anyhow!(
-                            "persisted policy failed ({apply_error:#}); fail-closed policy also failed ({fail_error:#})"
-                        )),
-                    };
-                }
                 state
             }
             Ok(None) => {
                 let mut state = State::new();
+                state
+                    .set_mode(Mode::Learning)
+                    .context("cannot construct the initial Learning policy")?;
                 rotate_startup_flow_generation(&mut state)?;
-                store
-                    .save(&state)
-                    .context("cannot persist initial fail-closed state")?;
+                store.save(&state).context(
+                    "cannot persist the initial Learning policy; BlockAll remains active",
+                )?;
                 state
             }
             Err(load_error) => {
@@ -276,16 +308,42 @@ impl Engine {
             }
         };
 
+        let application_policy = Arc::new(build_application_decision_policy(&state));
+        let application_learning_admission = Arc::new(build_application_learning_admission(&state));
         Ok(Self {
             state,
+            application_policy,
+            application_learning_admission,
             backend,
             store,
             events,
             poisoned: false,
             fatal: false,
             restart_required: false,
+            startup_policy: StartupPolicy::Pending,
             learning_persistence: LearningPersistence::Active,
         })
+    }
+
+    /// Installs the validated desired policy after the fail-closed NFQUEUE
+    /// consumer is ready. State loading always leaves kernel `BlockAll` active,
+    /// so startup cannot expose a queue-listener gap.
+    pub fn activate_startup_policy(&mut self) -> Result<()> {
+        if self.startup_policy == StartupPolicy::Active {
+            return Ok(());
+        }
+        if let Err(apply_error) = self.backend.apply(&self.state.snapshot()) {
+            let fail_closed = self.backend.fail_closed();
+            return match fail_closed {
+                Ok(()) => Err(apply_error)
+                    .context("startup policy could not be applied; BlockAll was retained"),
+                Err(fail_error) => Err(anyhow!(
+                    "startup policy failed ({apply_error:#}); retaining BlockAll also failed ({fail_error:#})"
+                )),
+            };
+        }
+        self.startup_policy = StartupPolicy::Active;
+        Ok(())
     }
 
     #[must_use]
@@ -319,11 +377,77 @@ impl Engine {
         Ok(self.state.revision())
     }
 
-    pub fn decision_snapshot(&self) -> Result<Snapshot, ProtocolError> {
+    /// Returns the bounded policy subset needed by userspace application
+    /// attribution.
+    ///
+    /// Network-only rules are enforced before NFQUEUE and Learning needs no
+    /// rule scan at all. Avoid cloning the complete (up to 10,000-rule) state
+    /// for every queued packet.
+    pub fn application_decision_snapshot(
+        &self,
+    ) -> Result<Arc<ApplicationDecisionPolicy>, ProtocolError> {
         if self.fatal || self.poisoned {
             return Err(self.emergency_protocol_error());
         }
-        Ok(self.state.snapshot())
+        Ok(Arc::clone(&self.application_policy))
+    }
+
+    /// Reads only the fields which can invalidate an in-flight packet
+    /// authorization. This final check runs while holding the engine lock and
+    /// must not clone the complete rule set a second time.
+    pub fn application_decision_identity(&self) -> Result<(Mode, u32), ProtocolError> {
+        if self.fatal || self.poisoned {
+            return Err(self.emergency_protocol_error());
+        }
+        Ok((self.state.mode(), self.state.flow_generation()))
+    }
+
+    /// Decides whether an attributed Learning observation can usefully enter
+    /// the bounded persistence queue.
+    ///
+    /// The current state is checked after procfs attribution because learning
+    /// commits intentionally retain the flow generation. This makes an exact
+    /// rule learned during attribution visible without admitting one more
+    /// redundant observation. Policy changes and poisoned state fail closed.
+    pub(crate) fn application_learning_queue_admission(
+        &self,
+        expected_mode: Mode,
+        expected_flow_generation: u32,
+        endpoint: &LearnedApplicationEndpoint,
+    ) -> Result<LearningQueueAdmission, ProtocolError> {
+        if self.fatal || self.poisoned {
+            return Err(self.emergency_protocol_error());
+        }
+        if expected_mode != Mode::Learning
+            || self.state.mode() != expected_mode
+            || self.state.flow_generation() != expected_flow_generation
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "policy changed while the application learning endpoint was attributed",
+            ));
+        }
+        if self.application_learning_admission.revision() != self.state.revision()
+            || self.application_learning_admission.mode() != self.state.mode()
+            || self.application_learning_admission.flow_generation() != self.state.flow_generation()
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                "application learning admission cache is not current",
+            ));
+        }
+        if self.learning_persistence == LearningPersistence::Paused {
+            return Ok(LearningQueueAdmission::PersistencePaused);
+        }
+        match self
+            .application_learning_admission
+            .classify(endpoint)
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?
+        {
+            ApplicationLearningAdmission::AlreadyKnown => Ok(LearningQueueAdmission::AlreadyKnown),
+            ApplicationLearningAdmission::Saturated => Ok(LearningQueueAdmission::Saturated),
+            ApplicationLearningAdmission::Candidate => Ok(LearningQueueAdmission::Enqueue),
+        }
     }
 
     #[must_use]
@@ -598,8 +722,34 @@ impl Engine {
     }
 
     pub fn quarantine_after_runtime_failure(&mut self) {
+        if self.startup_policy == StartupPolicy::Pending {
+            self.poisoned = true;
+            self.learning_persistence = LearningPersistence::Paused;
+            if let Err(error) = self.backend.fail_closed() {
+                error!(error = %format_args!("{error:#}"), "cannot retain startup BlockAll quarantine");
+                self.fatal = true;
+            }
+            return;
+        }
         if !self.poisoned && !self.fatal {
             self.enter_emergency_fail_closed(self.state.revision());
+        }
+    }
+
+    /// Replaces the live kernel policy with `BlockAll` during a normal stop,
+    /// while deliberately leaving the persisted user-selected mode intact for
+    /// the next supervised start.
+    pub fn install_shutdown_quarantine(&mut self) -> Result<()> {
+        match self.backend.fail_closed() {
+            Ok(()) => {
+                self.events.clear_counter_snapshot();
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                self.fatal = true;
+                Err(error).context("cannot install the shutdown BlockAll quarantine")
+            }
         }
     }
 
@@ -656,7 +806,7 @@ impl Engine {
             ));
         }
 
-        self.state = candidate;
+        self.replace_state(candidate);
         self.learning_persistence = LearningPersistence::Active;
         self.events.clear_counter_snapshot();
         for event in events {
@@ -703,7 +853,7 @@ impl Engine {
             return Ok(false);
         }
 
-        self.state = candidate;
+        self.replace_state(candidate);
         self.events.clear_counter_snapshot();
         for event in events {
             self.events.publish(event);
@@ -758,7 +908,7 @@ impl Engine {
                         return;
                     }
                 };
-                self.state = fail_closed.clone();
+                self.replace_state(fail_closed.clone());
                 self.events.clear_counter_snapshot();
                 match self.store.save(&fail_closed) {
                     Ok(()) => self.restart_required = true,
@@ -797,6 +947,14 @@ impl Engine {
                 "emergency BlockAll is active but could not be persisted; daemon is quarantined and requires storage repair",
             )
         }
+    }
+
+    fn replace_state(&mut self, state: State) {
+        let application_policy = Arc::new(build_application_decision_policy(&state));
+        let application_learning_admission = Arc::new(build_application_learning_admission(&state));
+        self.state = state;
+        self.application_policy = application_policy;
+        self.application_learning_admission = application_learning_admission;
     }
 }
 
@@ -841,8 +999,8 @@ mod tests {
 
     use anyhow::{Result as AnyResult, bail};
     use openshield_core::{
-        Direction, InterfaceName, PortRange, RuleName, RuleSpec, Snapshot, StorageError,
-        TransportProtocol,
+        ApplicationPath, ApplicationSelector, Direction, ExecutableFileId, InterfaceName,
+        PortRange, RuleName, RuleSpec, Snapshot, StorageError, TransportProtocol,
     };
 
     use super::*;
@@ -906,6 +1064,14 @@ mod tests {
                 failure_script: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
+
+        fn empty() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(None)),
+                fail_next: Arc::new(AtomicBool::new(false)),
+                failure_script: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
     }
 
     impl StateStore for StoreProbe {
@@ -950,6 +1116,36 @@ mod tests {
         )?)
     }
 
+    fn learned_application_endpoint(
+        address_offset: u32,
+        uid: u32,
+        application_number: u64,
+    ) -> AnyResult<LearnedApplicationEndpoint> {
+        Ok(LearnedApplicationEndpoint {
+            endpoint: LearnedEndpoint {
+                address: std::net::Ipv4Addr::from(0x0a00_0001_u32 + address_offset).into(),
+                protocol: TransportProtocol::Tcp,
+                port: Some(PortRange::single(443)?),
+                interface: Some(InterfaceName::new("eth0")?),
+            },
+            application: ApplicationSelector::new(
+                Some(ApplicationPath::new(format!(
+                    "/usr/bin/openshield-engine-test-{application_number}"
+                ))?),
+                Some(ExecutableFileId {
+                    device: 8,
+                    inode: application_number + 1,
+                    size: application_number + 1,
+                    ctime_seconds: 1_700_000_000,
+                    ctime_nanoseconds: 0,
+                }),
+                None,
+                Some(uid),
+                None,
+            )?,
+        })
+    }
+
     fn engine_with_probes() -> AnyResult<(Engine, BackendProbe, StoreProbe, EventBus)> {
         engine_with_state(State::new())
     }
@@ -958,11 +1154,12 @@ mod tests {
         let backend = BackendProbe::default();
         let store = StoreProbe::new(state);
         let events = EventBus::new();
-        let engine = Engine::load(
+        let mut engine = Engine::load(
             Box::new(backend.clone()),
             Box::new(store.clone()),
             events.clone(),
         )?;
+        engine.activate_startup_policy()?;
         backend
             .applied
             .lock()
@@ -972,34 +1169,271 @@ mod tests {
     }
 
     #[test]
-    fn startup_installs_block_all_then_persists_a_fresh_flow_epoch() -> AnyResult<()> {
-        let state = State::new();
-        let previous_generation = state.flow_generation();
+    fn packet_decision_omits_rules_that_cannot_require_userspace_attribution() -> AnyResult<()> {
+        let mut state = State::new();
+        state.create_rule(manual_rule("kernel-only")?)?;
+        state.set_mode(Mode::Enforcing)?;
+        let (mut engine, _backend, _store, _events) = engine_with_state(state)?;
+
+        let snapshot = engine
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        let same_policy = engine
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        assert!(Arc::ptr_eq(&snapshot, &same_policy));
+        assert_eq!(snapshot.mode, Mode::Enforcing);
+        assert!(snapshot.rules.is_empty());
+        assert_eq!(
+            engine
+                .application_decision_identity()
+                .map_err(|error| anyhow!(error.message))?,
+            (snapshot.mode, snapshot.flow_generation)
+        );
+
+        let previous_revision = engine.revision();
+        engine
+            .handle_control(ControlRequest::SetMode {
+                expected_revision: previous_revision,
+                mode: Mode::Learning,
+            })
+            .map_err(|error| anyhow!(error.message))?;
+        let learning_policy = engine
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        assert!(!Arc::ptr_eq(&snapshot, &learning_policy));
+        assert_eq!(learning_policy.mode, Mode::Learning);
+        assert!(learning_policy.rules.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn learning_admission_cache_skips_known_and_saturated_observations() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let endpoints = (0..256)
+            .map(|offset| learned_application_endpoint(offset, 1_000, 1))
+            .collect::<AnyResult<Vec<_>>>()?;
+        let known = endpoints[0].clone();
+        assert_eq!(
+            state
+                .learn_new_application_endpoints(endpoints, MAX_RULES)?
+                .len(),
+            256
+        );
+        let saturated = learned_application_endpoint(300, 1_000, 1)?;
+        let candidate = learned_application_endpoint(301, 1_001, 2)?;
+        let (mut engine, _backend, _store, _events) = engine_with_state(state)?;
+        let generation = engine.state.flow_generation();
+
+        assert_eq!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &known)
+                .map_err(|error| anyhow!(error.message))?,
+            LearningQueueAdmission::AlreadyKnown
+        );
+        assert_eq!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &saturated)
+                .map_err(|error| anyhow!(error.message))?,
+            LearningQueueAdmission::Saturated
+        );
+        assert_eq!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &candidate)
+                .map_err(|error| anyhow!(error.message))?,
+            LearningQueueAdmission::Enqueue
+        );
+        assert!(
+            engine
+                .application_learning_queue_admission(
+                    Mode::Learning,
+                    generation.saturating_add(1),
+                    &candidate,
+                )
+                .is_err()
+        );
+
+        assert_eq!(
+            engine
+                .harvest_application_learning(generation, vec![candidate.clone()])
+                .map_err(|error| anyhow!(error.message))?,
+            1
+        );
+        assert_eq!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &candidate)
+                .map_err(|error| anyhow!(error.message))?,
+            LearningQueueAdmission::AlreadyKnown
+        );
+
+        let later = learned_application_endpoint(302, 1_002, 3)?;
+        engine.learning_persistence = LearningPersistence::Paused;
+        assert_eq!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &later)
+                .map_err(|error| anyhow!(error.message))?,
+            LearningQueueAdmission::PersistencePaused
+        );
+        engine.poisoned = true;
+        assert!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &later)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_start_stays_blocked_until_learning_policy_is_explicitly_activated() -> AnyResult<()> {
+        let previous_generation = State::new().flow_generation();
         let backend = BackendProbe::default();
-        let store = StoreProbe::new(state);
-        let engine = Engine::load(
+        let store = StoreProbe::empty();
+        let mut engine = Engine::load(
             Box::new(backend.clone()),
             Box::new(store.clone()),
             EventBus::new(),
         )?;
         let generation = engine.state.flow_generation();
         assert_ne!(generation, previous_generation);
+        assert_eq!(engine.mode(), Mode::Learning);
         assert_eq!(
             store
                 .state
                 .lock()
                 .map_err(|_| anyhow!("store probe poisoned"))?
                 .as_ref()
-                .map(State::flow_generation),
-            Some(generation)
+                .map(|state| (state.mode(), state.flow_generation())),
+            Some((Mode::Learning, generation))
         );
+        {
+            let applied = backend
+                .applied
+                .lock()
+                .map_err(|_| anyhow!("backend probe poisoned"))?;
+            assert_eq!(applied.len(), 1);
+            assert_eq!(applied[0].mode, Mode::BlockAll);
+        }
+
+        engine.activate_startup_policy()?;
         let applied = backend
             .applied
             .lock()
             .map_err(|_| anyhow!("backend probe poisoned"))?;
         assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].mode, Mode::BlockAll);
+        assert_eq!(applied[1].mode, Mode::Learning);
         assert_eq!(applied[1].flow_generation, generation);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_saved_mode_is_preserved_across_startup() -> AnyResult<()> {
+        for expected_mode in [Mode::BlockAll, Mode::Learning, Mode::Enforcing] {
+            let mut state = State::new();
+            if expected_mode != Mode::BlockAll {
+                state.set_mode(expected_mode)?;
+            }
+            let backend = BackendProbe::default();
+            let store = StoreProbe::new(state);
+            let mut engine =
+                Engine::load(Box::new(backend.clone()), Box::new(store), EventBus::new())?;
+
+            assert_eq!(engine.mode(), expected_mode);
+            engine.activate_startup_policy()?;
+            let applied = backend
+                .applied
+                .lock()
+                .map_err(|_| anyhow!("backend probe poisoned"))?;
+            assert_eq!(applied.len(), 2);
+            assert_eq!(applied[0].mode, Mode::BlockAll);
+            assert_eq!(applied[1].mode, expected_mode);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_startup_epoch_stays_fail_closed_instead_of_reusing_a_mark() -> AnyResult<()> {
+        let mut state = State::new();
+        state.rotate_flow_generation(MAX_FLOW_GENERATION)?;
+        let backend = BackendProbe::default();
+        let store = StoreProbe::new(state);
+
+        assert!(
+            Engine::load(Box::new(backend.clone()), Box::new(store), EventBus::new(),).is_err()
+        );
+        let applied = backend
+            .applied
+            .lock()
+            .map_err(|_| anyhow!("backend probe poisoned"))?;
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].mode, Mode::BlockAll);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_first_learning_activation_retains_block_all_and_learning_intent() -> AnyResult<()> {
+        let backend = BackendProbe::default();
+        let store = StoreProbe::empty();
+        let mut engine = Engine::load(
+            Box::new(backend.clone()),
+            Box::new(store.clone()),
+            EventBus::new(),
+        )?;
+        backend
+            .failure_script
+            .lock()
+            .map_err(|_| anyhow!("backend failure script poisoned"))?
+            .extend([true, false]);
+
+        assert!(engine.activate_startup_policy().is_err());
+        assert_eq!(engine.mode(), Mode::Learning);
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .map_err(|_| anyhow!("store probe poisoned"))?
+                .as_ref()
+                .map(State::mode),
+            Some(Mode::Learning)
+        );
+        let applied = backend
+            .applied
+            .lock()
+            .map_err(|_| anyhow!("backend probe poisoned"))?;
+        assert_eq!(
+            applied.last().map(|snapshot| snapshot.mode),
+            Some(Mode::BlockAll)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_quarantine_does_not_overwrite_the_saved_mode() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        let (mut engine, backend, store, _events) = engine_with_state(state)?;
+        let saved_revision = engine.revision();
+
+        engine.install_shutdown_quarantine()?;
+
+        assert_eq!(engine.mode(), Mode::Enforcing);
+        assert_eq!(engine.revision(), saved_revision);
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .map_err(|_| anyhow!("store probe poisoned"))?
+                .as_ref()
+                .map(|state| (state.mode(), state.revision())),
+            Some((Mode::Enforcing, saved_revision))
+        );
+        let applied = backend
+            .applied
+            .lock()
+            .map_err(|_| anyhow!("backend probe poisoned"))?;
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].mode, Mode::BlockAll);
         Ok(())
     }
 

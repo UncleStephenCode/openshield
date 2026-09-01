@@ -1,88 +1,185 @@
 {
-  "cli.about":"Interface de terminal sécurisée pour OpenShield","main.terminal_required":"la TUI nécessite un terminal interactif","main.terminal_init_failed":"impossible d’initialiser le terminal","main.draw_failed":"impossible d’afficher la TUI","main.input_poll_failed":"erreur pendant l’attente d’une entrée","main.input_read_failed":"erreur de lecture de l’entrée",
-  "view.status":"État","view.rules":"Règles","view.events":"Événements","view.help":"Aide",
-  "common.unknown":"inconnu","common.any":"tous","common.yes":"oui","common.no":"non","common.manual":"manuel","common.learned":"apprentissage","common.learned_immutable":"apprentissage (origine immuable)",
-  "status.policy":"Politique : ","status.telemetry":"Télémétrie : ","status.access":"Accès : ","status.mode":"Mode : ","status.revision":"Révision de la politique : {revision}","status.rule_counts":"Règles : {rules} ; autorisations entrantes actives : {inbound}","status.inbound_policy":"Politique entrante : DROP par défaut ; seuls les paquets correspondant aux règles actives sont acceptés.","status.age_unknown":"ancienneté inconnue","status.age":"ancienneté {duration}","status.counters_title":"Derniers compteurs nftables ({age} ; paquets / octets) :","status.counters_waiting":"Compteurs nftables : attente de la première mise à jour…","status.observe_socket":"Observation : {path}","status.control_socket":"Contrôle : {path}","status.title":" État ",
-  "health.connecting":"connexion…","health.connected":"connecté","health.disconnected":"déconnecté ({reason})","health.telemetry_stale":"DÉGRADÉ : aucun compteur récent depuis {duration}","health.subscription_active":"abonnement actif","health.subscription_waiting":"abonnement actif, attente des compteurs…","health.telemetry_disconnected":"DÉGRADÉ : flux déconnecté ({reason})","access.read_only":"LECTURE SEULE (les modifications exigent root)","access.privileged":"CONTRÔLE PRIVILÉGIÉ",
-  "rules.column_enabled":"Act.","rules.column_direction":"Sens","rules.column_protocol":"Prot.","rules.column_peer":"Pair/réseau","rules.column_port":"N° port","rules.column_interface":"Iface","rules.column_name":"Nom","rules.column_origin":"Origine","rules.title":" Règles d’autorisation ",
-  "events.title":" Événements (récents en premier) ","events.title_dropped":" Événements (récents en premier ; ignorés par le canal : {count}) ",
-  "help.navigation":"1/2/3/4   état / règles / événements / aide","help.next_tab":"Tab       onglet suivant","help.select_rule":"↑/↓       choisir une règle","help.quit":"q         quitter","help.open_help":"?         aide","help.control_title":"Contrôle (root uniquement) :","help.select_mode":"m         choisir le mode","help.rule_actions":"n/e/d     créer / modifier / supprimer une règle","help.toggle_rule":"Space     activer ou désactiver la règle choisie","help.editor":"Éditeur : Tab/Shift-Tab — champ ; ←/→ — choix ; Enter — enregistrer ; Esc — annuler.","help.unprivileged":"Session non privilégiée : les commandes de modification sont désactivées.","help.title":" Aide ",
-  "footer.status":"m : mode   ? : aide   q : quitter","footer.rules_read_only":"↑/↓ : choisir   lecture seule   ? : aide   q : quitter","footer.rules":"n : créer   e : modifier   d : supprimer   Space : act./désact.","footer.events_live":"événements en temps réel   q : quitter","footer.events_offline":"événements temps réel indisponibles   q : quitter","footer.help":"q : quitter",
-  "overlay.mode_picker":" Choisir le mode ","overlay.block_all_title":" TOUT BLOQUER ","overlay.block_all_body":"TOUT le trafic IP entrant et sortant sera bloqué. Continuer ? [y/N]","overlay.delete_title":" Supprimer la règle ","overlay.delete_body":"Supprimer « {name} » ? [y/N]",
-  "editor.field_name":"Nom","editor.field_direction":"Sens","editor.field_protocol":"Protocole","editor.field_peer":"Pair distant/CIDR","editor.field_port":"Port/plage","editor.field_interface":"Interface réseau","editor.field_enabled":"Activée","editor.field_origin":"Origine","editor.help":"La règle autorise le trafic correspondant ; choisissez entrant pour une règle entrante. Tous les autres paquets entrants sont bloqués.","editor.edit_title":" Modifier la règle ","editor.new_title":" Nouvelle règle d’autorisation ",
-  "mode.block_all":"tout bloquer","mode.learning":"apprentissage","mode.enforcing":"appliquer les règles","direction.inbound":"entrant","direction.outbound":"sortant","duration.subsecond":"moins de 1 s","duration.seconds":"{value} sec.","duration.minutes":"{value} min.","duration.hours":"{value} h."
-  ,"control.policy_changed_title":" Politique modifiée "
-  ,"control.policy_changed_body":"La commande n’a pas été appliquée et ne sera pas relancée automatiquement. Répétez l’action après l’actualisation de l’état.\n\n{message}"
-  ,"control.rejected_title":" Commande rejetée "
-  ,"control.rejected_body":"Le démon a confirmé que la modification n’a pas été appliquée ({code}).\n\n{message}"
-  ,"control.unconfirmed_title":" Résultat non confirmé "
-  ,"control.unconfirmed_body":"Aucune réponse du démon n’a été reçue : la commande a pu être appliquée avant l’échec de la connexion. Ne la relancez pas automatiquement ; attendez un instantané à jour et vérifiez-le.\n\n{error}"
-  ,"control.resync_failed":"\n\nImpossible de demander la synchronisation : {error}"
-  ,"control.resync_scheduled":"\n\nUn instantané à jour sera chargé automatiquement."
-  ,"control.applied":"Commande appliquée, révision {revision}"
-  ,"control.applied_rule":"Commande appliquée à « {rule} », révision {revision}"
-  ,"validation.name_empty":"Le nom de la règle ne peut pas être vide"
-  ,"validation.icmp_port":"Aucun port ne peut être indiqué pour ICMP"
-  ,"validation.invalid_interface":"Interface non valide : {error}"
-  ,"validation.invalid_name":"Nom non valide : {error}"
-  ,"validation.invalid_rule":"Règle non valide : {error}"
-  ,"validation.invalid_peer":"Adresse IP ou CIDR non valide : {error}"
-  ,"validation.port_missing":"Le port est manquant"
-  ,"validation.port_number":"Le port doit être un nombre compris entre 1 et 65535"
-  ,"validation.port_end_number":"La fin de la plage doit être un nombre"
-  ,"validation.port_format":"Format du port : 443 ou 8000-8100"
-  ,"validation.invalid_port_range":"Plage de ports non valide : {error}"
-  ,"notice.daemon_restarted":"Redémarrage du démon détecté ; l’état a été rechargé et les modifications inachevées ont été annulées"
-  ,"notice.connection_lost":"Connexion perdue ; la modification inachevée a été annulée"
-  ,"notice.revisions_skipped":"Les révisions {first}..{last} ont été manquées ; l’état sera actualisé depuis un instantané"
-  ,"notice.wait_snapshot":"Attendez d’abord un instantané à jour de la politique"
-  ,"notice.base_revision_missing":"Modification annulée : la révision de base de la politique est indisponible"
-  ,"notice.no_rule_selected":"Aucune règle n’est sélectionnée"
-  ,"notice.read_only":"Mode lecture seule : les modifications sont réservées à root via control.sock"
-  ,"status.counter_accepted_in":"acceptés en entrée"
-  ,"status.counter_accepted_out":"acceptés en sortie"
-  ,"status.counter_dropped_in":"rejetés en entrée"
-  ,"status.counter_dropped_out":"rejetés en sortie"
-  ,"status.counter_learned_out":"appris en sortie"
-  ,"event.mode_changed":"mode : {previous} → {current}"
-  ,"event.rule_created":"règle « {rule} » créée"
-  ,"event.rule_updated":"règle « {rule} » modifiée"
-  ,"event.rule_deleted":"règle « {rule} » supprimée"
-  ,"event.rule_enabled":"règle « {rule} » : {state}"
-  ,"event.enabled":"activée"
-  ,"event.disabled":"désactivée"
-  ,"event.counters":"compteurs : entrée +{accepted_in_packets}/{accepted_in_bytes} o -{dropped_in_packets}/{dropped_in_bytes} o ; sortie +{accepted_out_packets}/{accepted_out_bytes} o -{dropped_out_packets}/{dropped_out_bytes} o ; appris {learned_packets}/{learned_bytes} o"
-  ,"editor.field_application":"Correspondance d’application"
-  ,"editor.field_executable":"Chemin de l’exécutable"
-  ,"editor.field_device":"Identifiant du périphérique"
-  ,"editor.field_inode":"Inœud (inode)"
-  ,"editor.field_command_mode":"Correspondance de la ligne de commande"
-  ,"editor.field_arguments":"Arguments (tableau JSON)"
-  ,"editor.field_uid":"Identifiant utilisateur (UID)"
-  ,"editor.field_cgroup":"Groupe de contrôle (cgroup)"
-  ,"editor.command_any":"Tous les arguments"
-  ,"editor.command_exact":"Arguments exacts"
-  ,"editor.command_prefix":"Préfixe d’arguments"
-  ,"editor.application_help":"La correspondance d’application n’est disponible que pour les règles sortantes. Le chemin de l’exécutable est obligatoire ; le périphérique et l’inœud doivent être indiqués ensemble."
-  ,"rules.column_application":"Application ciblée"
-  ,"rules.network_only":"réseau uniquement"
-  ,"rules.application_redacted":"détails de l’application masqués"
-  ,"rules.details_title":" Détails de l’application "
-  ,"rules.details_executable":"Exécutable"
-  ,"rules.details_file_id":"périphérique {device}, inœud {inode}"
-  ,"rules.details_command":"Ligne de commande"
-  ,"rules.details_uid":"Identifiant utilisateur (UID)"
-  ,"rules.details_cgroup":"Groupe de contrôle (cgroup)"
-  ,"validation.application_outbound":"La correspondance d’application n’est disponible que pour les règles sortantes"
-  ,"validation.executable_required":"Le chemin de l’exécutable est obligatoire lorsque la correspondance d’application est activée"
-  ,"validation.file_id_pair":"Le périphérique et l’inœud doivent être indiqués ensemble"
-  ,"validation.invalid_device":"L’identifiant du périphérique doit être un entier positif ou nul"
-  ,"validation.invalid_inode":"L’inœud doit être un entier strictement positif"
-  ,"validation.arguments_unused":"Les arguments doivent être vides dans le mode tous les arguments"
-  ,"validation.arguments_json":"Les arguments doivent former un tableau JSON"
-  ,"validation.arguments_strings":"Chaque argument doit être une chaîne de caractères"
-  ,"validation.invalid_executable":"Chemin d’exécutable non valide : {error}"
-  ,"validation.invalid_arguments":"Arguments de ligne de commande non valides : {error}"
-  ,"validation.invalid_uid":"L’identifiant utilisateur doit être un entier positif ou nul"
-  ,"validation.invalid_cgroup":"Groupe de contrôle non valide : {error}"
+  "cli.about": "Interface de terminal sécurisée pour OpenShield",
+  "main.terminal_required": "la TUI nécessite un terminal interactif",
+  "main.terminal_init_failed": "impossible d’initialiser le terminal",
+  "main.draw_failed": "impossible d’afficher la TUI",
+  "main.input_poll_failed": "erreur pendant l’attente d’une entrée",
+  "main.input_read_failed": "erreur de lecture de l’entrée",
+  "view.status": "État",
+  "view.rules": "Règles",
+  "view.events": "Événements",
+  "view.help": "Aide",
+  "common.unknown": "inconnu",
+  "common.any": "tous",
+  "common.yes": "oui",
+  "common.no": "non",
+  "common.manual": "manuel",
+  "common.learned": "apprentissage",
+  "common.learned_immutable": "apprentissage (origine immuable)",
+  "status.policy": "Politique : ",
+  "status.telemetry": "Télémétrie : ",
+  "status.access": "Accès : ",
+  "status.mode": "Mode : ",
+  "status.revision": "Révision de la politique : {revision}",
+  "status.rule_counts": "Règles : {rules} ; autorisations entrantes actives : {inbound}",
+  "status.inbound_policy": "Politique entrante : DROP par défaut ; seuls les paquets correspondant aux règles actives sont acceptés.",
+  "status.age_unknown": "ancienneté inconnue",
+  "status.age": "ancienneté {duration}",
+  "status.counters_title": "Derniers compteurs du pare-feu ({age} ; paquets / octets) :",
+  "status.counters_waiting": "Compteurs du pare-feu : attente de la première mise à jour…",
+  "status.observe_socket": "Observation : {path}",
+  "status.control_socket": "Contrôle : {path}",
+  "status.title": " État ",
+  "health.connecting": "connexion…",
+  "health.connected": "connecté",
+  "health.disconnected": "déconnecté ({reason})",
+  "health.telemetry_stale": "DÉGRADÉ : aucun compteur récent depuis {duration}",
+  "health.subscription_active": "abonnement actif",
+  "health.subscription_waiting": "abonnement actif, attente des compteurs…",
+  "health.telemetry_disconnected": "DÉGRADÉ : flux déconnecté ({reason})",
+  "access.read_only": "LECTURE SEULE (les modifications exigent root)",
+  "access.privileged": "CONTRÔLE PRIVILÉGIÉ",
+  "rules.column_enabled": "Act.",
+  "rules.column_direction": "Sens",
+  "rules.column_protocol": "Prot.",
+  "rules.column_peer": "Pair/réseau",
+  "rules.column_port": "N° port",
+  "rules.column_interface": "Iface",
+  "rules.column_name": "Nom",
+  "rules.column_origin": "Origine",
+  "rules.title": " Règles d’autorisation ",
+  "events.title": " Événements (récents en premier) ",
+  "events.title_dropped": " Événements (récents en premier ; ignorés par le canal : {count}) ",
+  "help.navigation": "1/2/3/4   état / règles / événements / aide",
+  "help.next_tab": "Tab       onglet suivant",
+  "help.select_rule": "↑/↓       choisir une règle",
+  "help.quit": "q         quitter",
+  "help.open_help": "?         aide",
+  "help.control_title": "Contrôle (root uniquement) :",
+  "help.select_mode": "m         choisir le mode",
+  "help.rule_actions": "n/e/d     créer / modifier / supprimer une règle",
+  "help.toggle_rule": "Space     activer ou désactiver la règle choisie",
+  "help.editor": "Éditeur : Tab/Shift-Tab — champ ; ←/→ — choix ; Enter — enregistrer ; Esc — annuler.",
+  "help.unprivileged": "L’observation exige root ou l’appartenance au groupe openshield ; les commandes de modification exigent root.",
+  "help.title": " Aide ",
+  "footer.status": "m : mode   ? : aide   q : quitter",
+  "footer.rules_read_only": "↑/↓ : choisir   lecture seule   ? : aide   q : quitter",
+  "footer.rules": "n : créer   e : modifier   d : supprimer   Space : act./désact.",
+  "footer.events_live": "événements en temps réel   q : quitter",
+  "footer.events_offline": "événements temps réel indisponibles   q : quitter",
+  "footer.help": "q : quitter",
+  "overlay.mode_picker": " Choisir le mode ",
+  "overlay.block_all_title": " TOUT BLOQUER ",
+  "overlay.block_all_body": "TOUT le trafic IP entrant et sortant sera bloqué. Continuer ? [y/N]",
+  "overlay.delete_title": " Supprimer la règle ",
+  "overlay.delete_body": "Supprimer « {name} » ? [y/N]",
+  "editor.field_name": "Nom",
+  "editor.field_direction": "Sens",
+  "editor.field_protocol": "Protocole",
+  "editor.field_peer": "Pair distant/CIDR",
+  "editor.field_port": "Port/plage",
+  "editor.field_interface": "Interface réseau",
+  "editor.field_enabled": "Activée",
+  "editor.field_origin": "Origine",
+  "editor.help": "La règle autorise le trafic correspondant ; choisissez entrant pour une règle entrante. Tous les autres paquets entrants sont bloqués.",
+  "editor.edit_title": " Modifier la règle ",
+  "editor.new_title": " Nouvelle règle d’autorisation ",
+  "mode.block_all": "tout bloquer",
+  "mode.learning": "apprentissage",
+  "mode.enforcing": "appliquer les règles",
+  "direction.inbound": "entrant",
+  "direction.outbound": "sortant",
+  "duration.subsecond": "moins de 1 s",
+  "duration.seconds": "{value} sec.",
+  "duration.minutes": "{value} min.",
+  "duration.hours": "{value} h.",
+  "control.policy_changed_title": " Politique modifiée ",
+  "control.policy_changed_body": "La commande n’a pas été appliquée et ne sera pas relancée automatiquement. Répétez l’action après l’actualisation de l’état.\n\n{message}",
+  "control.rejected_title": " Commande rejetée ",
+  "control.rejected_body": "Le démon a confirmé que la modification n’a pas été appliquée ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Résultat non confirmé ",
+  "control.unconfirmed_body": "Aucune réponse du démon n’a été reçue : la commande a pu être appliquée avant l’échec de la connexion. Ne la relancez pas automatiquement ; attendez un instantané à jour et vérifiez-le.\n\n{error}",
+  "control.resync_failed": "\n\nImpossible de demander la synchronisation : {error}",
+  "control.resync_scheduled": "\n\nUn instantané à jour sera chargé automatiquement.",
+  "control.applied": "Commande appliquée, révision {revision}",
+  "control.applied_rule": "Commande appliquée à « {rule} », révision {revision}",
+  "validation.name_empty": "Le nom de la règle ne peut pas être vide",
+  "validation.icmp_port": "Aucun port ne peut être indiqué pour ICMP",
+  "validation.invalid_interface": "Interface non valide : {error}",
+  "validation.invalid_name": "Nom non valide : {error}",
+  "validation.invalid_rule": "Règle non valide : {error}",
+  "validation.invalid_peer": "Adresse IP ou CIDR non valide : {error}",
+  "validation.port_missing": "Le port est manquant",
+  "validation.port_number": "Le port doit être un nombre compris entre 1 et 65535",
+  "validation.port_end_number": "La fin de la plage doit être un nombre",
+  "validation.port_format": "Format du port : 443 ou 8000-8100",
+  "validation.invalid_port_range": "Plage de ports non valide : {error}",
+  "notice.daemon_restarted": "Redémarrage du démon détecté ; l’état a été rechargé et les modifications inachevées ont été annulées",
+  "notice.connection_lost": "Connexion perdue ; la modification inachevée a été annulée",
+  "notice.revisions_skipped": "Les révisions {first}..{last} ont été manquées ; l’état sera actualisé depuis un instantané",
+  "notice.wait_snapshot": "Attendez d’abord un instantané à jour de la politique",
+  "notice.base_revision_missing": "Modification annulée : la révision de base de la politique est indisponible",
+  "notice.no_rule_selected": "Aucune règle n’est sélectionnée",
+  "notice.read_only": "Mode lecture seule : les modifications sont réservées à root via control.sock",
+  "status.counter_accepted_in": "acceptés en entrée",
+  "status.counter_accepted_out": "acceptés en sortie",
+  "status.counter_dropped_in": "rejetés en entrée",
+  "status.counter_dropped_out": "rejetés en sortie",
+  "status.counter_learned_out": "appris en sortie",
+  "event.mode_changed": "mode : {previous} → {current}",
+  "event.rule_created": "règle « {rule} » créée",
+  "event.rule_updated": "règle « {rule} » modifiée",
+  "event.rule_deleted": "règle « {rule} » supprimée",
+  "event.rule_enabled": "règle « {rule} » : {state}",
+  "event.enabled": "activée",
+  "event.disabled": "désactivée",
+  "event.counters": "compteurs : entrée +{accepted_in_packets}/{accepted_in_bytes} o -{dropped_in_packets}/{dropped_in_bytes} o ; sortie +{accepted_out_packets}/{accepted_out_bytes} o -{dropped_out_packets}/{dropped_out_bytes} o ; appris {learned_packets}/{learned_bytes} o",
+  "editor.field_application": "Correspondance d’application",
+  "editor.field_executable": "Chemin de l’exécutable",
+  "editor.field_command_mode": "Correspondance de la ligne de commande",
+  "editor.field_arguments": "Arguments (tableau JSON)",
+  "editor.field_uid": "Identifiant utilisateur (UID)",
+  "editor.field_cgroup": "Groupe de contrôle (cgroup)",
+  "editor.command_any": "Tous les arguments",
+  "editor.command_exact": "Arguments exacts",
+  "editor.command_prefix": "Préfixe d’arguments",
+  "editor.application_help": "La correspondance d’application n’est disponible que pour les règles sortantes. Le chemin de l’exécutable est obligatoire. Le démon épingle automatiquement la version du fichier ; la modification est refusée si la version déjà épinglée a changé.",
+  "rules.column_application": "Application ciblée",
+  "rules.network_only": "réseau uniquement",
+  "rules.application_redacted": "détails de l’application masqués",
+  "rules.details_title": " Détails de l’application ",
+  "rules.details_executable": "Exécutable",
+  "rules.details_file_id": "périphérique {device}, inœud {inode}",
+  "rules.details_command": "Ligne de commande",
+  "rules.details_uid": "Identifiant utilisateur (UID)",
+  "rules.details_cgroup": "Groupe de contrôle (cgroup)",
+  "validation.application_outbound": "La correspondance d’application n’est disponible que pour les règles sortantes",
+  "validation.executable_required": "Le chemin de l’exécutable est obligatoire lorsque la correspondance d’application est activée",
+  "validation.arguments_unused": "Les arguments doivent être vides dans le mode tous les arguments",
+  "validation.arguments_json": "Les arguments doivent former un tableau JSON",
+  "validation.arguments_strings": "Chaque argument doit être une chaîne de caractères",
+  "validation.invalid_executable": "Chemin d’exécutable non valide : {error}",
+  "validation.invalid_arguments": "Arguments de ligne de commande non valides : {error}",
+  "validation.invalid_uid": "L’identifiant utilisateur doit être un entier positif ou nul",
+  "validation.invalid_cgroup": "Groupe de contrôle non valide : {error}",
+  "ipc.connect_error": "Impossible de se connecter au socket IPC {path} : {error}",
+  "ipc.control_root_required": "Les requêtes de contrôle nécessitent un UID effectif 0 (root)",
+  "ipc.coordinator_unavailable": "Le coordinateur de révisions de l'observateur n'est pas disponible",
+  "ipc.daemon_rejected": "Le daemon a rejeté la requête ({code}) : {message}",
+  "ipc.generation_exhausted": "Le compteur de générations de l'observateur est épuisé",
+  "ipc.inconsistent_pages": "La politique a changé pendant la lecture des pages de règles ; nouvelle tentative de lecture",
+  "ipc.inspect_error": "Impossible d'inspecter le chemin IPC {path} : {error}",
+  "ipc.invalid_snapshot": "Le daemon a renvoyé un instantané de politique invalide : {error}",
+  "ipc.local_groups_error": "Impossible de lire les groupes supplémentaires du processus actuel : {error}",
+  "ipc.not_observer_group_member": "L'observation nécessite root ou l'appartenance au groupe openshield",
+  "ipc.observer_group_error": "Impossible de déterminer le groupe d'observation obligatoire d'openshield : {error}",
+  "ipc.peer_credentials_error": "Impossible de lire les identifiants du daemon sur le socket IPC : {error}",
+  "ipc.protocol_error": "Erreur de protocole IPC : {error}",
+  "ipc.rule_count_mismatch": "Le daemon a déclaré {advertised} règles, mais a renvoyé {received}",
+  "ipc.socket_path_changed": "Le chemin du socket IPC a changé pendant la connexion : {path}",
+  "ipc.timeout_error": "Impossible de configurer le délai d'attente IPC : {error}",
+  "ipc.unexpected_response": "Réponse inattendue du daemon : {error}",
+  "ipc.untrusted_directory": "Répertoire parent IPC non fiable : {path}",
+  "ipc.untrusted_peer": "L'UID {uid} du pair IPC n'appartient pas à un daemon privilégié",
+  "ipc.untrusted_socket": "Le chemin IPC n'est pas un socket Unix appartenant à root : {path}"
 }

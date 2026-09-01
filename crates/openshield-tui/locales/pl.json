@@ -1,85 +1,185 @@
 {
-  "cli.about":"Bezpieczny interfejs terminalowy OpenShield","main.terminal_required":"TUI wymaga interaktywnego terminala","main.terminal_init_failed":"nie udało się zainicjować terminala","main.draw_failed":"nie udało się narysować TUI","main.input_poll_failed":"błąd oczekiwania na wejście","main.input_read_failed":"błąd odczytu wejścia","view.status":"Stan","view.rules":"Reguły","view.events":"Zdarzenia","view.help":"Pomoc",
-  "common.unknown":"nieznany","common.any":"dowolny","common.yes":"tak","common.no":"nie","common.manual":"ręczna","common.learned":"uczenie","common.learned_immutable":"uczenie (pochodzenie niezmienne)",
-  "status.policy":"Polityka: ","status.telemetry":"Telemetria: ","status.access":"Dostęp: ","status.mode":"Tryb: ","status.revision":"Wersja polityki: {revision}","status.rule_counts":"Reguły: {rules}; aktywne zezwolenia przychodzące: {inbound}","status.inbound_policy":"Polityka przychodząca: domyślnie DROP; przechodzą tylko pakiety pasujące do aktywnych reguł zezwalających.","status.age_unknown":"czas aktualizacji nieznany","status.age":"sprzed {duration}","status.counters_title":"Najnowsze liczniki nftables ({age}; pakiety / bajty):","status.counters_waiting":"Liczniki nftables: oczekiwanie na pierwszą aktualizację…","status.observe_socket":"Obserwacja: {path}","status.control_socket":"Sterowanie: {path}","status.title":" Stan ",
-  "health.connecting":"łączenie…","health.connected":"połączono","health.disconnected":"rozłączono ({reason})","health.telemetry_stale":"DEGRADACJA: brak świeżych liczników przez {duration}","health.subscription_active":"subskrypcja aktywna","health.subscription_waiting":"subskrypcja aktywna, oczekiwanie na liczniki…","health.telemetry_disconnected":"DEGRADACJA: strumień rozłączony ({reason})","access.read_only":"TYLKO ODCZYT (zmiany wymagają root)","access.privileged":"UPRZYWILEJOWANE STEROWANIE",
-  "rules.column_enabled":"Wł.","rules.column_direction":"Kier.","rules.column_protocol":"Prot.","rules.column_peer":"Host/sieć","rules.column_port":"Nr portu","rules.column_interface":"Interfejs","rules.column_name":"Nazwa","rules.column_origin":"Pochodzenie","rules.title":" Reguły zezwalające ","events.title":" Zdarzenia (najnowsze pierwsze) ","events.title_dropped":" Zdarzenia (najnowsze pierwsze; odrzucone przez kanał: {count}) ",
-  "help.navigation":"1/2/3/4   stan / reguły / zdarzenia / pomoc","help.next_tab":"Tab       następna karta","help.select_rule":"↑/↓       wybór reguły","help.quit":"q         wyjście","help.open_help":"?         pomoc","help.control_title":"Sterowanie (tylko root):","help.select_mode":"m         wybór trybu","help.rule_actions":"n/e/d     utwórz / edytuj / usuń regułę","help.toggle_rule":"Space     włącz lub wyłącz wybraną regułę","help.editor":"Edytor: Tab/Shift-Tab — pole; ←/→ — wybór; Enter — zapisz; Esc — anuluj.","help.unprivileged":"Sesja bez uprawnień: polecenia zmian są wyłączone.","help.title":" Pomoc ",
-  "footer.status":"m: tryb   ?: pomoc   q: wyjście","footer.rules_read_only":"↑/↓: wybór   tylko odczyt   ?: pomoc   q: wyjście","footer.rules":"n: utwórz   e: edytuj   d: usuń   Space: wł./wył.","footer.events_live":"zdarzenia w czasie rzeczywistym   q: wyjście","footer.events_offline":"zdarzenia czasu rzeczywistego niedostępne   q: wyjście","footer.help":"q: wyjście",
-  "overlay.mode_picker":" Wybór trybu ","overlay.block_all_title":" ZABLOKUJ WSZYSTKO ","overlay.block_all_body":"CAŁY przychodzący i wychodzący ruch IP zostanie zablokowany. Kontynuować? [y/N]","overlay.delete_title":" Usuń regułę ","overlay.delete_body":"Usunąć „{name}”? [y/N]","editor.field_name":"Nazwa","editor.field_direction":"Kierunek","editor.field_protocol":"Protokół","editor.field_peer":"Zdalny host/CIDR","editor.field_port":"Port/zakres","editor.field_interface":"Interfejs","editor.field_enabled":"Włączona","editor.field_origin":"Pochodzenie","editor.help":"Reguła zezwala na pasujący ruch; dla reguły przychodzącej wybierz kierunek przychodzący. Pozostałe pakiety przychodzące są blokowane.","editor.edit_title":" Edytuj regułę ","editor.new_title":" Nowa reguła zezwalająca ",
-  "mode.block_all":"blokuj wszystko","mode.learning":"uczenie","mode.enforcing":"egzekwowanie reguł","direction.inbound":"wejście","direction.outbound":"wyjście","duration.subsecond":"<1 sek.","duration.seconds":"{value} sek.","duration.minutes":"{value} min.","duration.hours":"{value} godz."
-  ,"control.policy_changed_title":" Polityka uległa zmianie "
-  ,"control.policy_changed_body":"Polecenie nie zostało zastosowane i nie zostanie automatycznie ponowione. Powtórz działanie po odświeżeniu stanu.\n\n{message}"
-  ,"control.rejected_title":" Polecenie odrzucone "
-  ,"control.rejected_body":"Demon potwierdził, że zmiana nie została zastosowana ({code}).\n\n{message}"
-  ,"control.unconfirmed_title":" Wynik niepotwierdzony "
-  ,"control.unconfirmed_body":"Nie otrzymano odpowiedzi demona: polecenie mogło zostać zastosowane przed zerwaniem połączenia. Nie ponawiaj go automatycznie; poczekaj na aktualną migawkę i sprawdź wynik.\n\n{error}"
-  ,"control.resync_failed":"\n\nNie udało się zażądać synchronizacji: {error}"
-  ,"control.resync_scheduled":"\n\nAktualna migawka zostanie wczytana automatycznie."
-  ,"control.applied":"Polecenie zastosowano, wersja polityki {revision}"
-  ,"control.applied_rule":"Polecenie zastosowano do „{rule}”, wersja polityki {revision}"
-  ,"validation.name_empty":"Nazwa reguły nie może być pusta"
-  ,"validation.icmp_port":"Dla ICMP nie można określić portu"
-  ,"validation.invalid_interface":"Nieprawidłowy interfejs: {error}"
-  ,"validation.invalid_name":"Nieprawidłowa nazwa: {error}"
-  ,"validation.invalid_rule":"Nieprawidłowa reguła: {error}"
-  ,"validation.invalid_peer":"Nieprawidłowy adres IP lub CIDR: {error}"
-  ,"validation.port_missing":"Nie podano portu"
-  ,"validation.port_number":"Port musi być liczbą od 1 do 65535"
-  ,"validation.port_end_number":"Koniec zakresu musi być liczbą"
-  ,"validation.port_format":"Format portu: 443 lub 8000-8100"
-  ,"validation.invalid_port_range":"Nieprawidłowy zakres portów: {error}"
-  ,"notice.daemon_restarted":"Wykryto ponowne uruchomienie demona; stan wczytano ponownie, a niedokończone zmiany anulowano"
-  ,"notice.connection_lost":"Utracono połączenie; niedokończoną zmianę anulowano"
-  ,"notice.revisions_skipped":"Pominięto wersje {first}..{last}; stan zostanie odświeżony z migawki"
-  ,"notice.wait_snapshot":"Najpierw poczekaj na aktualną migawkę polityki"
-  ,"notice.base_revision_missing":"Zmianę anulowano: bazowa wersja polityki jest niedostępna"
-  ,"notice.no_rule_selected":"Nie wybrano żadnej reguły"
-  ,"notice.read_only":"Tryb tylko do odczytu: zmiany może wprowadzać wyłącznie root przez control.sock"
-  ,"status.counter_accepted_in":"zaakceptowane przychodzące"
-  ,"status.counter_accepted_out":"zaakceptowane wychodzące"
-  ,"status.counter_dropped_in":"odrzucone przychodzące"
-  ,"status.counter_dropped_out":"odrzucone wychodzące"
-  ,"status.counter_learned_out":"wyuczone wychodzące"
-  ,"event.mode_changed":"tryb: {previous} → {current}"
-  ,"event.rule_created":"utworzono regułę „{rule}”"
-  ,"event.rule_updated":"zaktualizowano regułę „{rule}”"
-  ,"event.rule_deleted":"usunięto regułę „{rule}”"
-  ,"event.rule_enabled":"reguła „{rule}”: {state}"
-  ,"event.enabled":"włączona"
-  ,"event.disabled":"wyłączona"
-  ,"event.counters":"liczniki: wejście +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; wyjście +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; wyuczone {learned_packets}/{learned_bytes}B"
-  ,"editor.field_application":"Dopasowanie aplikacji"
-  ,"editor.field_executable":"Ścieżka pliku wykonywalnego"
-  ,"editor.field_device":"Identyfikator urządzenia"
-  ,"editor.field_inode":"I-węzeł (inode)"
-  ,"editor.field_command_mode":"Dopasowanie wiersza poleceń"
-  ,"editor.field_arguments":"Argumenty (tablica JSON)"
-  ,"editor.field_uid":"Identyfikator użytkownika (UID)"
-  ,"editor.field_cgroup":"Grupa kontrolna (cgroup)"
-  ,"editor.command_any":"Dowolne argumenty"
-  ,"editor.command_exact":"Dokładne argumenty"
-  ,"editor.command_prefix":"Prefiks argumentów"
-  ,"editor.application_help":"Dopasowanie aplikacji jest dostępne tylko dla reguł wychodzących. Ścieżka pliku wykonywalnego jest wymagana; urządzenie i i-węzeł należy podać razem."
-  ,"rules.column_application":"Aplikacja"
-  ,"rules.network_only":"tylko sieć"
-  ,"rules.application_redacted":"szczegóły aplikacji ukryte"
-  ,"rules.details_title":" Szczegóły aplikacji "
-  ,"rules.details_executable":"Plik wykonywalny"
-  ,"rules.details_file_id":"urządzenie {device}, i-węzeł {inode}"
-  ,"rules.details_command":"Wiersz poleceń"
-  ,"rules.details_uid":"Identyfikator użytkownika (UID)"
-  ,"rules.details_cgroup":"Grupa kontrolna (cgroup)"
-  ,"validation.application_outbound":"Dopasowanie aplikacji jest dostępne tylko dla reguł wychodzących"
-  ,"validation.executable_required":"Po włączeniu dopasowania aplikacji wymagana jest ścieżka pliku wykonywalnego"
-  ,"validation.file_id_pair":"Urządzenie i i-węzeł należy podać razem"
-  ,"validation.invalid_device":"Identyfikator urządzenia musi być nieujemną liczbą całkowitą"
-  ,"validation.invalid_inode":"I-węzeł musi być dodatnią liczbą całkowitą"
-  ,"validation.arguments_unused":"W trybie dowolnych argumentów pole argumentów musi być puste"
-  ,"validation.arguments_json":"Argumenty muszą być tablicą JSON"
-  ,"validation.arguments_strings":"Każdy argument musi być ciągiem znaków"
-  ,"validation.invalid_executable":"Nieprawidłowa ścieżka pliku wykonywalnego: {error}"
-  ,"validation.invalid_arguments":"Nieprawidłowe argumenty wiersza poleceń: {error}"
-  ,"validation.invalid_uid":"Identyfikator użytkownika musi być nieujemną liczbą całkowitą"
-  ,"validation.invalid_cgroup":"Nieprawidłowa grupa kontrolna: {error}"
+  "cli.about": "Bezpieczny interfejs terminalowy OpenShield",
+  "main.terminal_required": "TUI wymaga interaktywnego terminala",
+  "main.terminal_init_failed": "nie udało się zainicjować terminala",
+  "main.draw_failed": "nie udało się narysować TUI",
+  "main.input_poll_failed": "błąd oczekiwania na wejście",
+  "main.input_read_failed": "błąd odczytu wejścia",
+  "view.status": "Stan",
+  "view.rules": "Reguły",
+  "view.events": "Zdarzenia",
+  "view.help": "Pomoc",
+  "common.unknown": "nieznany",
+  "common.any": "dowolny",
+  "common.yes": "tak",
+  "common.no": "nie",
+  "common.manual": "ręczna",
+  "common.learned": "uczenie",
+  "common.learned_immutable": "uczenie (pochodzenie niezmienne)",
+  "status.policy": "Polityka: ",
+  "status.telemetry": "Telemetria: ",
+  "status.access": "Dostęp: ",
+  "status.mode": "Tryb: ",
+  "status.revision": "Wersja polityki: {revision}",
+  "status.rule_counts": "Reguły: {rules}; aktywne zezwolenia przychodzące: {inbound}",
+  "status.inbound_policy": "Polityka przychodząca: domyślnie DROP; przechodzą tylko pakiety pasujące do aktywnych reguł zezwalających.",
+  "status.age_unknown": "czas aktualizacji nieznany",
+  "status.age": "sprzed {duration}",
+  "status.counters_title": "Najnowsze liczniki zapory sieciowej ({age}; pakiety / bajty):",
+  "status.counters_waiting": "Liczniki zapory sieciowej: oczekiwanie na pierwszą aktualizację…",
+  "status.observe_socket": "Obserwacja: {path}",
+  "status.control_socket": "Sterowanie: {path}",
+  "status.title": " Stan ",
+  "health.connecting": "łączenie…",
+  "health.connected": "połączono",
+  "health.disconnected": "rozłączono ({reason})",
+  "health.telemetry_stale": "DEGRADACJA: brak świeżych liczników przez {duration}",
+  "health.subscription_active": "subskrypcja aktywna",
+  "health.subscription_waiting": "subskrypcja aktywna, oczekiwanie na liczniki…",
+  "health.telemetry_disconnected": "DEGRADACJA: strumień rozłączony ({reason})",
+  "access.read_only": "TYLKO ODCZYT (zmiany wymagają root)",
+  "access.privileged": "UPRZYWILEJOWANE STEROWANIE",
+  "rules.column_enabled": "Wł.",
+  "rules.column_direction": "Kier.",
+  "rules.column_protocol": "Prot.",
+  "rules.column_peer": "Host/sieć",
+  "rules.column_port": "Nr portu",
+  "rules.column_interface": "Interfejs",
+  "rules.column_name": "Nazwa",
+  "rules.column_origin": "Pochodzenie",
+  "rules.title": " Reguły zezwalające ",
+  "events.title": " Zdarzenia (najnowsze pierwsze) ",
+  "events.title_dropped": " Zdarzenia (najnowsze pierwsze; odrzucone przez kanał: {count}) ",
+  "help.navigation": "1/2/3/4   stan / reguły / zdarzenia / pomoc",
+  "help.next_tab": "Tab       następna karta",
+  "help.select_rule": "↑/↓       wybór reguły",
+  "help.quit": "q         wyjście",
+  "help.open_help": "?         pomoc",
+  "help.control_title": "Sterowanie (tylko root):",
+  "help.select_mode": "m         wybór trybu",
+  "help.rule_actions": "n/e/d     utwórz / edytuj / usuń regułę",
+  "help.toggle_rule": "Space     włącz lub wyłącz wybraną regułę",
+  "help.editor": "Edytor: Tab/Shift-Tab — pole; ←/→ — wybór; Enter — zapisz; Esc — anuluj.",
+  "help.unprivileged": "Obserwacja wymaga uprawnień root lub członkostwa w grupie openshield; polecenia zmian wymagają root.",
+  "help.title": " Pomoc ",
+  "footer.status": "m: tryb   ?: pomoc   q: wyjście",
+  "footer.rules_read_only": "↑/↓: wybór   tylko odczyt   ?: pomoc   q: wyjście",
+  "footer.rules": "n: utwórz   e: edytuj   d: usuń   Space: wł./wył.",
+  "footer.events_live": "zdarzenia w czasie rzeczywistym   q: wyjście",
+  "footer.events_offline": "zdarzenia czasu rzeczywistego niedostępne   q: wyjście",
+  "footer.help": "q: wyjście",
+  "overlay.mode_picker": " Wybór trybu ",
+  "overlay.block_all_title": " ZABLOKUJ WSZYSTKO ",
+  "overlay.block_all_body": "CAŁY przychodzący i wychodzący ruch IP zostanie zablokowany. Kontynuować? [y/N]",
+  "overlay.delete_title": " Usuń regułę ",
+  "overlay.delete_body": "Usunąć „{name}”? [y/N]",
+  "editor.field_name": "Nazwa",
+  "editor.field_direction": "Kierunek",
+  "editor.field_protocol": "Protokół",
+  "editor.field_peer": "Zdalny host/CIDR",
+  "editor.field_port": "Port/zakres",
+  "editor.field_interface": "Interfejs",
+  "editor.field_enabled": "Włączona",
+  "editor.field_origin": "Pochodzenie",
+  "editor.help": "Reguła zezwala na pasujący ruch; dla reguły przychodzącej wybierz kierunek przychodzący. Pozostałe pakiety przychodzące są blokowane.",
+  "editor.edit_title": " Edytuj regułę ",
+  "editor.new_title": " Nowa reguła zezwalająca ",
+  "mode.block_all": "blokuj wszystko",
+  "mode.learning": "uczenie",
+  "mode.enforcing": "egzekwowanie reguł",
+  "direction.inbound": "wejście",
+  "direction.outbound": "wyjście",
+  "duration.subsecond": "<1 sek.",
+  "duration.seconds": "{value} sek.",
+  "duration.minutes": "{value} min.",
+  "duration.hours": "{value} godz.",
+  "control.policy_changed_title": " Polityka uległa zmianie ",
+  "control.policy_changed_body": "Polecenie nie zostało zastosowane i nie zostanie automatycznie ponowione. Powtórz działanie po odświeżeniu stanu.\n\n{message}",
+  "control.rejected_title": " Polecenie odrzucone ",
+  "control.rejected_body": "Demon potwierdził, że zmiana nie została zastosowana ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Wynik niepotwierdzony ",
+  "control.unconfirmed_body": "Nie otrzymano odpowiedzi demona: polecenie mogło zostać zastosowane przed zerwaniem połączenia. Nie ponawiaj go automatycznie; poczekaj na aktualną migawkę i sprawdź wynik.\n\n{error}",
+  "control.resync_failed": "\n\nNie udało się zażądać synchronizacji: {error}",
+  "control.resync_scheduled": "\n\nAktualna migawka zostanie wczytana automatycznie.",
+  "control.applied": "Polecenie zastosowano, wersja polityki {revision}",
+  "control.applied_rule": "Polecenie zastosowano do „{rule}”, wersja polityki {revision}",
+  "validation.name_empty": "Nazwa reguły nie może być pusta",
+  "validation.icmp_port": "Dla ICMP nie można określić portu",
+  "validation.invalid_interface": "Nieprawidłowy interfejs: {error}",
+  "validation.invalid_name": "Nieprawidłowa nazwa: {error}",
+  "validation.invalid_rule": "Nieprawidłowa reguła: {error}",
+  "validation.invalid_peer": "Nieprawidłowy adres IP lub CIDR: {error}",
+  "validation.port_missing": "Nie podano portu",
+  "validation.port_number": "Port musi być liczbą od 1 do 65535",
+  "validation.port_end_number": "Koniec zakresu musi być liczbą",
+  "validation.port_format": "Format portu: 443 lub 8000-8100",
+  "validation.invalid_port_range": "Nieprawidłowy zakres portów: {error}",
+  "notice.daemon_restarted": "Wykryto ponowne uruchomienie demona; stan wczytano ponownie, a niedokończone zmiany anulowano",
+  "notice.connection_lost": "Utracono połączenie; niedokończoną zmianę anulowano",
+  "notice.revisions_skipped": "Pominięto wersje {first}..{last}; stan zostanie odświeżony z migawki",
+  "notice.wait_snapshot": "Najpierw poczekaj na aktualną migawkę polityki",
+  "notice.base_revision_missing": "Zmianę anulowano: bazowa wersja polityki jest niedostępna",
+  "notice.no_rule_selected": "Nie wybrano żadnej reguły",
+  "notice.read_only": "Tryb tylko do odczytu: zmiany może wprowadzać wyłącznie root przez control.sock",
+  "status.counter_accepted_in": "zaakceptowane przychodzące",
+  "status.counter_accepted_out": "zaakceptowane wychodzące",
+  "status.counter_dropped_in": "odrzucone przychodzące",
+  "status.counter_dropped_out": "odrzucone wychodzące",
+  "status.counter_learned_out": "wyuczone wychodzące",
+  "event.mode_changed": "tryb: {previous} → {current}",
+  "event.rule_created": "utworzono regułę „{rule}”",
+  "event.rule_updated": "zaktualizowano regułę „{rule}”",
+  "event.rule_deleted": "usunięto regułę „{rule}”",
+  "event.rule_enabled": "reguła „{rule}”: {state}",
+  "event.enabled": "włączona",
+  "event.disabled": "wyłączona",
+  "event.counters": "liczniki: wejście +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; wyjście +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; wyuczone {learned_packets}/{learned_bytes}B",
+  "editor.field_application": "Dopasowanie aplikacji",
+  "editor.field_executable": "Ścieżka pliku wykonywalnego",
+  "editor.field_command_mode": "Dopasowanie wiersza poleceń",
+  "editor.field_arguments": "Argumenty (tablica JSON)",
+  "editor.field_uid": "Identyfikator użytkownika (UID)",
+  "editor.field_cgroup": "Grupa kontrolna (cgroup)",
+  "editor.command_any": "Dowolne argumenty",
+  "editor.command_exact": "Dokładne argumenty",
+  "editor.command_prefix": "Prefiks argumentów",
+  "editor.application_help": "Dopasowanie aplikacji jest dostępne tylko dla reguł wychodzących. Ścieżka pliku wykonywalnego jest wymagana. Demon automatycznie przypina wersję pliku; edycja jest odrzucana, jeśli wcześniej przypięta wersja uległa zmianie.",
+  "rules.column_application": "Aplikacja",
+  "rules.network_only": "tylko sieć",
+  "rules.application_redacted": "szczegóły aplikacji ukryte",
+  "rules.details_title": " Szczegóły aplikacji ",
+  "rules.details_executable": "Plik wykonywalny",
+  "rules.details_file_id": "urządzenie {device}, i-węzeł {inode}",
+  "rules.details_command": "Wiersz poleceń",
+  "rules.details_uid": "Identyfikator użytkownika (UID)",
+  "rules.details_cgroup": "Grupa kontrolna (cgroup)",
+  "validation.application_outbound": "Dopasowanie aplikacji jest dostępne tylko dla reguł wychodzących",
+  "validation.executable_required": "Po włączeniu dopasowania aplikacji wymagana jest ścieżka pliku wykonywalnego",
+  "validation.arguments_unused": "W trybie dowolnych argumentów pole argumentów musi być puste",
+  "validation.arguments_json": "Argumenty muszą być tablicą JSON",
+  "validation.arguments_strings": "Każdy argument musi być ciągiem znaków",
+  "validation.invalid_executable": "Nieprawidłowa ścieżka pliku wykonywalnego: {error}",
+  "validation.invalid_arguments": "Nieprawidłowe argumenty wiersza poleceń: {error}",
+  "validation.invalid_uid": "Identyfikator użytkownika musi być nieujemną liczbą całkowitą",
+  "validation.invalid_cgroup": "Nieprawidłowa grupa kontrolna: {error}",
+  "ipc.connect_error": "Nie udało się połączyć z gniazdem IPC {path}: {error}",
+  "ipc.control_root_required": "Żądania sterowania wymagają efektywnego UID 0 (root)",
+  "ipc.coordinator_unavailable": "Koordynator rewizji obserwatora niedostępny",
+  "ipc.daemon_rejected": "Daemon odrzucił żądanie ({code}): {message}",
+  "ipc.generation_exhausted": "Licznik generacji obserwatora wyczerpany",
+  "ipc.inconsistent_pages": "Polityka zmieniła się podczas czytania stron reguł; ponowne czytanie",
+  "ipc.inspect_error": "Nie udało się sprawdzić ścieżki IPC {path}: {error}",
+  "ipc.invalid_snapshot": "Daemon zwrócił nieprawidłowy migawki polityki: {error}",
+  "ipc.local_groups_error": "Nie udało się odczytać dodatkowych grup bieżącego procesu: {error}",
+  "ipc.not_observer_group_member": "Obserwacja wymaga roota lub członkostwa w grupie openshield",
+  "ipc.observer_group_error": "Nie udało się określić wymaganego grupy obserwatora openshield: {error}",
+  "ipc.peer_credentials_error": "Nie udało się odczytać poświadczeń demona na gnieździe IPC: {error}",
+  "ipc.protocol_error": "Błąd protokołu IPC: {error}",
+  "ipc.rule_count_mismatch": "Daemon zgłosił {advertised} reguł, ale zwrócił {received}",
+  "ipc.socket_path_changed": "Ścieżka gniazda IPC zmieniła się podczas łączenia: {path}",
+  "ipc.timeout_error": "Nie udało się skonfigurować limitu czasu IPC: {error}",
+  "ipc.unexpected_response": "Nieoczekiwana odpowiedź demona: {error}",
+  "ipc.untrusted_directory": "Niezaufany katalog nadrzędny IPC: {path}",
+  "ipc.untrusted_peer": "UID {uid} strony peer IPC nie należy do uprzywilejowanego demona",
+  "ipc.untrusted_socket": "Ścieżka IPC nie jest gniazdem Unix należąącym do roota: {path}"
 }

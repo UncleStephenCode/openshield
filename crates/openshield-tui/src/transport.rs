@@ -3,22 +3,26 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::geteuid;
+use nix::unistd::{Group, getegid, geteuid, getgroups};
 use openshield_core::{Event, MAX_RULES, Mode, Rule, Snapshot};
 use openshield_protocol::{
-    Ack, CONTROL_SOCKET_PATH, ControlRequest, FrameError, MAX_RULES_PER_PAGE, OBSERVE_SOCKET_PATH,
-    ReadRequest, Request, Response, read_response, write_request,
+    Ack, CONTROL_SOCKET_PATH, ControlRequest, FrameError, MAX_RULES_PER_PAGE, OBSERVE_GROUP_NAME,
+    OBSERVE_SOCKET_PATH, ReadRequest, Request, Response, read_response, write_request,
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::i18n::I18n;
 
 // The daemon may publish 256 learned RuleCreated events in one transaction.
 // Preserve that complete real-time burst plus connection, snapshot, and counter
@@ -28,6 +32,86 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROL_SOCKET_MODE: u32 = 0o600;
+const OBSERVE_SOCKET_MODE: u32 = 0o660;
+
+/// A portable loss counter. Some supported 32-bit Linux targets do not expose
+/// native 64-bit atomics, so they use the same bounded value behind a mutex.
+#[derive(Debug, Default)]
+struct DroppedCounter {
+    #[cfg(target_has_atomic = "64")]
+    value: AtomicU64,
+    #[cfg(not(target_has_atomic = "64"))]
+    value: Mutex<u64>,
+}
+
+impl DroppedCounter {
+    const fn new() -> Self {
+        Self {
+            #[cfg(target_has_atomic = "64")]
+            value: AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            value: Mutex::new(0),
+        }
+    }
+
+    fn add(&self, count: u64) {
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.value.fetch_add(count, Ordering::AcqRel);
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            let mut value = self
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *value = value.saturating_add(count);
+        }
+    }
+
+    fn take(&self) -> u64 {
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.value.swap(0, Ordering::AcqRel)
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            let mut value = self
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *value)
+        }
+    }
+
+    #[cfg(test)]
+    fn load(&self) -> u64 {
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.value.load(Ordering::Acquire)
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            *self
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketTrust {
+    Control,
+    Observe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketPathIdentity {
+    device: u64,
+    inode: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct SocketPaths {
@@ -104,6 +188,14 @@ enum OfferOutcome {
     Disconnected,
 }
 
+#[derive(Clone)]
+struct ObserverWorkerContext {
+    running: Arc<AtomicBool>,
+    revision: Arc<Mutex<RevisionEpoch>>,
+    dropped: Arc<DroppedCounter>,
+    i18n: I18n,
+}
+
 #[derive(Debug)]
 struct RevisionEpoch {
     revision: u64,
@@ -152,30 +244,32 @@ pub struct Observer {
 
 impl Observer {
     #[must_use]
-    pub fn start(paths: &SocketPaths) -> Self {
+    pub fn start(paths: &SocketPaths, i18n: &I18n) -> Self {
         let (sender, receiver) = mpsc::sync_channel(UPDATE_CHANNEL_CAPACITY);
         let running = Arc::new(AtomicBool::new(true));
         let revision = Arc::new(Mutex::new(RevisionEpoch::default()));
-        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(DroppedCounter::new());
         let snapshot_state = Arc::new(AtomicU8::new(0));
         let telemetry_state = Arc::new(AtomicU8::new(0));
+        let worker_context = ObserverWorkerContext {
+            running: Arc::clone(&running),
+            revision: Arc::clone(&revision),
+            dropped: Arc::clone(&dropped),
+            i18n: i18n.clone(),
+        };
 
         let snapshot_thread = spawn_snapshot_worker(
             paths.observe.clone(),
             paths.observe_is_test,
             sender.clone(),
-            Arc::clone(&running),
-            Arc::clone(&revision),
-            Arc::clone(&dropped),
+            worker_context.clone(),
             snapshot_state,
         );
         let event_thread = spawn_event_worker(
             paths.observe.clone(),
             paths.observe_is_test,
             sender,
-            Arc::clone(&running),
-            Arc::clone(&revision),
-            dropped,
+            worker_context,
             telemetry_state,
         );
 
@@ -212,6 +306,14 @@ pub enum IpcError {
     UntrustedDirectory(PathBuf),
     #[error("IPC path is not a root-owned Unix socket: {0}")]
     UntrustedSocket(PathBuf),
+    #[error("cannot resolve required observation group {OBSERVE_GROUP_NAME}: {0}")]
+    ObserverGroup(String),
+    #[error("the current user is neither root nor a member of group {OBSERVE_GROUP_NAME}")]
+    NotObserverGroupMember,
+    #[error("cannot read the current process supplementary groups: {0}")]
+    LocalGroups(#[source] nix::Error),
+    #[error("IPC socket pathname changed while connecting: {0}")]
+    SocketPathChanged(PathBuf),
     #[error("cannot connect to IPC socket {path}: {source}")]
     Connect { path: PathBuf, source: io::Error },
     #[error("cannot read daemon peer credentials: {0}")]
@@ -243,11 +345,100 @@ pub enum IpcError {
     GenerationExhausted,
 }
 
+impl IpcError {
+    #[must_use]
+    pub fn localized(&self, i18n: &I18n) -> String {
+        match self {
+            Self::Inspect { path, source } => {
+                let path = path.display().to_string();
+                let error = source.to_string();
+                i18n.format(
+                    "ipc.inspect_error",
+                    &[("path", path.as_str()), ("error", error.as_str())],
+                )
+            }
+            Self::UntrustedDirectory(path) => {
+                let path = path.display().to_string();
+                i18n.format("ipc.untrusted_directory", &[("path", path.as_str())])
+            }
+            Self::UntrustedSocket(path) => {
+                let path = path.display().to_string();
+                i18n.format("ipc.untrusted_socket", &[("path", path.as_str())])
+            }
+            Self::ObserverGroup(error) => {
+                i18n.format("ipc.observer_group_error", &[("error", error)])
+            }
+            Self::NotObserverGroupMember => i18n.tr("ipc.not_observer_group_member").to_owned(),
+            Self::LocalGroups(error) => {
+                let error = error.to_string();
+                i18n.format("ipc.local_groups_error", &[("error", error.as_str())])
+            }
+            Self::SocketPathChanged(path) => {
+                let path = path.display().to_string();
+                i18n.format("ipc.socket_path_changed", &[("path", path.as_str())])
+            }
+            Self::Connect { path, source } => {
+                let path = path.display().to_string();
+                let error = source.to_string();
+                i18n.format(
+                    "ipc.connect_error",
+                    &[("path", path.as_str()), ("error", error.as_str())],
+                )
+            }
+            Self::PeerCredentials(error) => {
+                let error = error.to_string();
+                i18n.format("ipc.peer_credentials_error", &[("error", error.as_str())])
+            }
+            Self::UntrustedPeer(uid) => {
+                let uid = uid.to_string();
+                i18n.format("ipc.untrusted_peer", &[("uid", uid.as_str())])
+            }
+            Self::NotPrivileged => i18n.tr("ipc.control_root_required").to_owned(),
+            Self::Timeout(error) => {
+                let error = error.to_string();
+                i18n.format("ipc.timeout_error", &[("error", error.as_str())])
+            }
+            Self::Frame(error) => {
+                let error = error.to_string();
+                i18n.format("ipc.protocol_error", &[("error", error.as_str())])
+            }
+            Self::Rejected { code, message } => {
+                let code = format!("{code:?}");
+                i18n.format(
+                    "ipc.daemon_rejected",
+                    &[("code", code.as_str()), ("message", message)],
+                )
+            }
+            Self::Unexpected(error) => i18n.format("ipc.unexpected_response", &[("error", error)]),
+            Self::InvalidSnapshot(error) => {
+                i18n.format("ipc.invalid_snapshot", &[("error", error)])
+            }
+            Self::InconsistentPages => i18n.tr("ipc.inconsistent_pages").to_owned(),
+            Self::RuleCountMismatch {
+                advertised,
+                received,
+            } => {
+                let advertised = advertised.to_string();
+                let received = received.to_string();
+                i18n.format(
+                    "ipc.rule_count_mismatch",
+                    &[
+                        ("advertised", advertised.as_str()),
+                        ("received", received.as_str()),
+                    ],
+                )
+            }
+            Self::RevisionCoordinator => i18n.tr("ipc.coordinator_unavailable").to_owned(),
+            Self::GenerationExhausted => i18n.tr("ipc.generation_exhausted").to_owned(),
+        }
+    }
+}
+
 pub fn send_control(paths: &SocketPaths, request: ControlRequest) -> Result<Ack, IpcError> {
     if !is_control_uid(geteuid().as_raw()) {
         return Err(IpcError::NotPrivileged);
     }
-    let mut stream = connect_verified(&paths.control, paths.control_is_test)?;
+    let mut stream = connect_verified(&paths.control, paths.control_is_test, SocketTrust::Control)?;
     set_request_timeouts(&stream)?;
     write_request(&mut stream, &Request::Control(request))?;
     match read_response(&mut stream)? {
@@ -270,12 +461,16 @@ fn spawn_snapshot_worker(
     path: PathBuf,
     testing_override: bool,
     sender: SyncSender<ObserverUpdate>,
-    running: Arc<AtomicBool>,
-    revision: Arc<Mutex<RevisionEpoch>>,
-    dropped: Arc<AtomicU64>,
+    context: ObserverWorkerContext,
     connection_state: Arc<AtomicU8>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let ObserverWorkerContext {
+            running,
+            revision,
+            dropped,
+            i18n,
+        } = context;
         let mut retry_delay = INITIAL_RECONNECT_DELAY;
         while running.load(Ordering::Acquire) {
             match refresh_snapshot(&path, testing_override, &sender, &revision, &dropped) {
@@ -312,7 +507,7 @@ fn spawn_snapshot_worker(
                         &connection_state,
                         WorkerKind::Snapshot,
                         false,
-                        error.to_string(),
+                        error.localized(&i18n),
                     );
                     if !wait_interruptibly(&running, retry_delay) {
                         return;
@@ -328,12 +523,16 @@ fn spawn_event_worker(
     path: PathBuf,
     testing_override: bool,
     sender: SyncSender<ObserverUpdate>,
-    running: Arc<AtomicBool>,
-    revision: Arc<Mutex<RevisionEpoch>>,
-    dropped: Arc<AtomicU64>,
+    context: ObserverWorkerContext,
     connection_state: Arc<AtomicU8>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let ObserverWorkerContext {
+            running,
+            revision,
+            dropped,
+            i18n,
+        } = context;
         let mut retry_delay = INITIAL_RECONNECT_DELAY;
         while running.load(Ordering::Acquire) {
             let result = subscribe_once(
@@ -362,7 +561,7 @@ fn spawn_event_worker(
                     &connection_state,
                     WorkerKind::Telemetry,
                     false,
-                    error.to_string(),
+                    error.localized(&i18n),
                 );
             }
             if !wait_interruptibly(&running, retry_delay) {
@@ -378,9 +577,9 @@ fn refresh_snapshot(
     testing_override: bool,
     sender: &SyncSender<ObserverUpdate>,
     revision: &Mutex<RevisionEpoch>,
-    dropped: &AtomicU64,
+    dropped: &DroppedCounter,
 ) -> Result<Option<OfferOutcome>, IpcError> {
-    let mut stream = connect_verified(path, testing_override)?;
+    let mut stream = connect_verified(path, testing_override, SocketTrust::Observe)?;
     set_request_timeouts(&stream)?;
     let first = fetch_status(&mut stream)?;
     let known_revision = {
@@ -411,7 +610,7 @@ fn refresh_snapshot(
 fn enqueue_snapshot(
     sender: &SyncSender<ObserverUpdate>,
     revision: &Mutex<RevisionEpoch>,
-    dropped: &AtomicU64,
+    dropped: &DroppedCounter,
     snapshot: Snapshot,
     restarted: bool,
 ) -> Result<Option<OfferOutcome>, IpcError> {
@@ -463,7 +662,7 @@ fn subscription_cursor(revision: &Mutex<RevisionEpoch>) -> Result<(u64, u64), Ip
 fn enqueue_event(
     sender: &SyncSender<ObserverUpdate>,
     revision: &Mutex<RevisionEpoch>,
-    dropped: &AtomicU64,
+    dropped: &DroppedCounter,
     subscribed_generation: u64,
     event: Event,
 ) -> Result<EventEnqueueOutcome, IpcError> {
@@ -635,10 +834,10 @@ fn subscribe_once(
     sender: &SyncSender<ObserverUpdate>,
     running: &AtomicBool,
     revision: &Mutex<RevisionEpoch>,
-    dropped: &AtomicU64,
+    dropped: &DroppedCounter,
     connection_state: &AtomicU8,
 ) -> Result<bool, IpcError> {
-    let mut stream = connect_verified(path, testing_override)?;
+    let mut stream = connect_verified(path, testing_override, SocketTrust::Observe)?;
     stream
         .set_write_timeout(Some(IPC_REQUEST_TIMEOUT))
         .map_err(IpcError::Timeout)?;
@@ -688,10 +887,16 @@ fn subscribe_once(
     Ok(false)
 }
 
-fn connect_verified(path: &Path, testing_override: bool) -> Result<UnixStream, IpcError> {
-    if !testing_override {
-        verify_default_socket_path(path)?;
-    }
+fn connect_verified(
+    path: &Path,
+    testing_override: bool,
+    trust: SocketTrust,
+) -> Result<UnixStream, IpcError> {
+    let identity_before = if testing_override {
+        None
+    } else {
+        Some(verify_default_socket_path(path, trust)?)
+    };
     let stream = UnixStream::connect(path).map_err(|source| IpcError::Connect {
         path: path.to_path_buf(),
         source,
@@ -702,11 +907,18 @@ fn connect_verified(path: &Path, testing_override: bool) -> Result<UnixStream, I
         if credentials.uid() != 0 {
             return Err(IpcError::UntrustedPeer(credentials.uid()));
         }
+        let identity_after = verify_default_socket_path(path, trust)?;
+        if identity_before != Some(identity_after) {
+            return Err(IpcError::SocketPathChanged(path.to_path_buf()));
+        }
     }
     Ok(stream)
 }
 
-fn verify_default_socket_path(path: &Path) -> Result<(), IpcError> {
+fn verify_default_socket_path(
+    path: &Path,
+    trust: SocketTrust,
+) -> Result<SocketPathIdentity, IpcError> {
     let parent = path
         .parent()
         .ok_or_else(|| IpcError::UntrustedDirectory(path.to_path_buf()))?;
@@ -730,7 +942,91 @@ fn verify_default_socket_path(path: &Path) -> Result<(), IpcError> {
     {
         return Err(IpcError::UntrustedSocket(path.to_path_buf()));
     }
-    Ok(())
+    let mode = metadata.mode() & 0o777;
+    let observer_gid = match trust {
+        SocketTrust::Control => 0,
+        SocketTrust::Observe => required_observer_gid()?,
+    };
+    if !socket_permissions_are_trusted(
+        metadata.uid() == 0,
+        metadata.gid(),
+        mode,
+        trust,
+        observer_gid,
+    ) {
+        return Err(IpcError::UntrustedSocket(path.to_path_buf()));
+    }
+    if trust == SocketTrust::Observe {
+        authorize_local_observer(observer_gid)?;
+    }
+    Ok(SocketPathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+const fn socket_permissions_are_trusted(
+    is_root_owned: bool,
+    socket_group: u32,
+    mode: u32,
+    trust: SocketTrust,
+    observer_gid: u32,
+) -> bool {
+    if !is_root_owned {
+        return false;
+    }
+    match trust {
+        SocketTrust::Control => mode == CONTROL_SOCKET_MODE,
+        SocketTrust::Observe => socket_group == observer_gid && mode == OBSERVE_SOCKET_MODE,
+    }
+}
+
+fn required_observer_gid() -> Result<u32, IpcError> {
+    static GROUP_GID: OnceLock<Result<u32, String>> = OnceLock::new();
+    let resolved = GROUP_GID.get_or_init(|| {
+        Group::from_name(OBSERVE_GROUP_NAME)
+            .map_err(|error| error.to_string())?
+            .map(|group| group.gid.as_raw())
+            .ok_or_else(|| "group does not exist".to_owned())
+    });
+    resolved
+        .as_ref()
+        .copied()
+        .map_err(|error| IpcError::ObserverGroup(error.clone()))
+}
+
+fn authorize_local_observer(observer_gid: u32) -> Result<(), IpcError> {
+    let uid = geteuid().as_raw();
+    if uid == 0 {
+        return Ok(());
+    }
+    let primary_gid = getegid().as_raw();
+    let supplementary = getgroups().map_err(IpcError::LocalGroups)?;
+    let supplementary: Vec<u32> = supplementary.iter().map(|group| group.as_raw()).collect();
+    if local_observer_is_authorized(uid, primary_gid, &supplementary, observer_gid) {
+        Ok(())
+    } else {
+        Err(IpcError::NotObserverGroupMember)
+    }
+}
+
+const fn local_observer_is_authorized(
+    uid: u32,
+    primary_gid: u32,
+    supplementary_groups: &[u32],
+    observer_gid: u32,
+) -> bool {
+    if uid == 0 || primary_gid == observer_gid {
+        return true;
+    }
+    let mut index = 0;
+    while index < supplementary_groups.len() {
+        if supplementary_groups[index] == observer_gid {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn set_request_timeouts(stream: &UnixStream) -> Result<(), IpcError> {
@@ -744,7 +1040,7 @@ fn set_request_timeouts(stream: &UnixStream) -> Result<(), IpcError> {
 
 fn report_connection(
     sender: &SyncSender<ObserverUpdate>,
-    dropped: &AtomicU64,
+    dropped: &DroppedCounter,
     state: &AtomicU8,
     worker: WorkerKind,
     connected: bool,
@@ -766,7 +1062,7 @@ fn report_connection(
             true
         }
         Err(TrySendError::Full(_)) => {
-            dropped.fetch_add(1, Ordering::AcqRel);
+            dropped.add(1);
             false
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -775,15 +1071,15 @@ fn report_connection(
 
 fn offer_update(
     sender: &SyncSender<ObserverUpdate>,
-    dropped: &AtomicU64,
+    dropped: &DroppedCounter,
     update: ObserverUpdate,
 ) -> OfferOutcome {
-    let pending = dropped.swap(0, Ordering::AcqRel);
+    let pending = dropped.take();
     if pending > 0 {
         match sender.try_send(ObserverUpdate::Dropped(pending)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                dropped.fetch_add(pending, Ordering::AcqRel);
+                dropped.add(pending);
             }
             Err(TrySendError::Disconnected(_)) => return OfferOutcome::Disconnected,
         }
@@ -792,7 +1088,7 @@ fn offer_update(
     match sender.try_send(update) {
         Ok(()) => OfferOutcome::Delivered,
         Err(TrySendError::Full(_)) => {
-            dropped.fetch_add(1, Ordering::AcqRel);
+            dropped.add(1);
             OfferOutcome::Dropped
         }
         Err(TrySendError::Disconnected(_)) => OfferOutcome::Disconnected,
@@ -844,6 +1140,26 @@ mod tests {
     }
 
     #[test]
+    fn ipc_errors_localize_the_category_and_preserve_raw_details()
+    -> Result<(), crate::i18n::LocaleError> {
+        let i18n = I18n::load(crate::i18n::Locale::Ru)?;
+        assert_eq!(
+            IpcError::NotObserverGroupMember.localized(&i18n),
+            "Наблюдение требует root или членства в группе openshield"
+        );
+
+        let error = IpcError::Connect {
+            path: PathBuf::from("/run/openshield/observe.sock"),
+            source: io::Error::new(io::ErrorKind::ConnectionRefused, "raw-detail"),
+        };
+        let localized = error.localized(&i18n);
+        assert!(localized.starts_with("Не удалось подключиться к IPC-сокету"));
+        assert!(localized.contains("/run/openshield/observe.sock"));
+        assert!(localized.contains("raw-detail"));
+        Ok(())
+    }
+
+    #[test]
     fn reconnect_backoff_is_bounded() {
         let mut delay = INITIAL_RECONNECT_DELAY;
         for _ in 0..20 {
@@ -860,10 +1176,67 @@ mod tests {
     }
 
     #[test]
+    fn observation_accepts_root_primary_and_supplementary_group_members_only() {
+        assert!(local_observer_is_authorized(0, 1000, &[], 991));
+        assert!(local_observer_is_authorized(1000, 991, &[], 991));
+        assert!(local_observer_is_authorized(
+            1000,
+            1000,
+            &[4, 991, 1000],
+            991
+        ));
+        assert!(!local_observer_is_authorized(
+            1000,
+            1000,
+            &[4, 27, 1000],
+            991
+        ));
+    }
+
+    #[test]
+    fn fixed_observation_socket_requires_exact_root_group_and_mode() {
+        assert!(socket_permissions_are_trusted(
+            true,
+            991,
+            0o660,
+            SocketTrust::Observe,
+            991
+        ));
+        assert!(!socket_permissions_are_trusted(
+            true,
+            991,
+            0o666,
+            SocketTrust::Observe,
+            991
+        ));
+        assert!(!socket_permissions_are_trusted(
+            true,
+            992,
+            0o660,
+            SocketTrust::Observe,
+            991
+        ));
+        assert!(!socket_permissions_are_trusted(
+            false,
+            991,
+            0o660,
+            SocketTrust::Observe,
+            991
+        ));
+        assert!(socket_permissions_are_trusted(
+            true,
+            0,
+            0o600,
+            SocketTrust::Control,
+            991
+        ));
+    }
+
+    #[test]
     fn telemetry_worker_reports_independent_health_transitions()
     -> Result<(), Box<dyn std::error::Error>> {
         let (sender, receiver) = mpsc::sync_channel(2);
-        let dropped = AtomicU64::new(0);
+        let dropped = DroppedCounter::new();
         let state = AtomicU8::new(0);
 
         assert!(report_connection(
@@ -899,7 +1272,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const LEARNING_BURST: usize = 256;
         let (sender, receiver) = mpsc::sync_channel(UPDATE_CHANNEL_CAPACITY);
-        let dropped = AtomicU64::new(0);
+        let dropped = DroppedCounter::new();
 
         sender.try_send(ObserverUpdate::Connected)?;
         sender.try_send(ObserverUpdate::TelemetryConnected)?;
@@ -916,7 +1289,7 @@ mod tests {
             );
         }
 
-        assert_eq!(dropped.load(Ordering::Acquire), 0);
+        assert_eq!(dropped.load(), 0);
         assert_eq!(receiver.try_iter().count(), LEARNING_BURST + 4);
         Ok(())
     }
@@ -925,7 +1298,7 @@ mod tests {
     fn lower_restart_resets_cursor_without_accepting_old_generation_events()
     -> Result<(), Box<dyn std::error::Error>> {
         let revision = Mutex::new(RevisionEpoch::default());
-        let dropped = AtomicU64::new(0);
+        let dropped = DroppedCounter::new();
         let (sender, receiver) = mpsc::sync_channel(8);
 
         assert_eq!(
@@ -987,7 +1360,7 @@ mod tests {
     fn unchanged_status_skips_pages_but_dropped_event_forces_resync()
     -> Result<(), Box<dyn std::error::Error>> {
         let revision = Mutex::new(RevisionEpoch::default());
-        let dropped = AtomicU64::new(0);
+        let dropped = DroppedCounter::new();
         let (sender, _receiver) = mpsc::sync_channel(1);
         assert_eq!(
             enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
@@ -1051,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn public_redacted_application_snapshot_remains_observable()
+    fn non_root_redacted_application_snapshot_remains_observable()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut specification = RuleSpec::new(
             RuleName::new("sensitive executable")?,
@@ -1068,6 +1441,9 @@ mod tests {
             Some(ExecutableFileId {
                 device: 8,
                 inode: 42,
+                size: 1_024,
+                ctime_seconds: 1_700_000_000,
+                ctime_nanoseconds: 123_456_789,
             }),
             None,
             Some(1_000),

@@ -1,83 +1,185 @@
 {
-  "cli.about":"Antarmuka terminal aman untuk OpenShield","main.terminal_required":"TUI memerlukan terminal interaktif","main.terminal_init_failed":"gagal menginisialisasi terminal","main.draw_failed":"gagal menggambar TUI","main.input_poll_failed":"galat saat menunggu masukan","main.input_read_failed":"galat saat membaca masukan","view.status":"Keadaan","view.rules":"Aturan","view.events":"Peristiwa","view.help":"Bantuan","common.unknown":"tidak diketahui","common.any":"apa pun","common.yes":"ya","common.no":"tidak","common.manual":"dibuat sendiri","common.learned":"pembelajaran","common.learned_immutable":"pembelajaran (asal tidak dapat diubah)",
-  "status.policy":"Kebijakan: ","status.telemetry":"Telemetri: ","status.access":"Akses: ","status.mode":"Modus: ","status.revision":"Revisi kebijakan: {revision}","status.rule_counts":"Aturan: {rules}; izin masuk aktif: {inbound}","status.inbound_policy":"Kebijakan masuk: DROP secara bawaan; hanya paket yang cocok dengan aturan izin aktif yang lewat.","status.age_unknown":"usia tidak diketahui","status.age":"usia {duration}","status.counters_title":"Pencacah nftables terbaru ({age}; paket / byte):","status.counters_waiting":"Pencacah nftables: menunggu pembaruan pertama…","status.observe_socket":"Pengamatan: {path}","status.control_socket":"Kontrol: {path}","status.title":" Status ",
-  "health.connecting":"menghubungkan…","health.connected":"terhubung","health.disconnected":"terputus ({reason})","health.telemetry_stale":"MENURUN: tidak ada pencacah baru selama {duration}","health.subscription_active":"langganan aktif","health.subscription_waiting":"langganan aktif, menunggu pencacah…","health.telemetry_disconnected":"MENURUN: aliran terputus ({reason})","access.read_only":"HANYA BACA (perubahan memerlukan root)","access.privileged":"KONTROL ISTIMEWA",
-  "rules.column_enabled":"Aktif","rules.column_direction":"Arah","rules.column_protocol":"Protokol","rules.column_peer":"Peer/jaringan","rules.column_port":"Porta","rules.column_interface":"Antarmuka","rules.column_name":"Nama","rules.column_origin":"Asal","rules.title":" Aturan izin ","events.title":" Peristiwa (terbaru dahulu) ","events.title_dropped":" Peristiwa (terbaru dahulu; dibuang kanal: {count}) ",
-  "help.navigation":"1/2/3/4   status / aturan / peristiwa / bantuan","help.next_tab":"Tab       tab berikutnya","help.select_rule":"↑/↓       pilih aturan","help.quit":"q         keluar","help.open_help":"?         bantuan","help.control_title":"Kontrol (hanya root):","help.select_mode":"m         pilih mode","help.rule_actions":"n/e/d     buat / sunting / hapus aturan","help.toggle_rule":"Space     aktifkan atau nonaktifkan aturan terpilih","help.editor":"Penyunting: Tab/Shift-Tab — bidang; ←/→ — pilihan; Enter — simpan; Esc — batal.","help.unprivileged":"Sesi tanpa hak istimewa: perintah perubahan dinonaktifkan.","help.title":" Bantuan ",
-  "footer.status":"m: mode   ?: bantuan   q: keluar","footer.rules_read_only":"↑/↓: pilih   hanya baca   ?: bantuan   q: keluar","footer.rules":"n: buat   e: sunting   d: hapus   Space: aktif/nonaktif","footer.events_live":"peristiwa waktu nyata   q: keluar","footer.events_offline":"peristiwa waktu nyata tidak tersedia   q: keluar","footer.help":"q: keluar","overlay.mode_picker":" Pilih mode ","overlay.block_all_title":" BLOKIR SEMUA ","overlay.block_all_body":"SEMUA lalu lintas IP masuk dan keluar akan diblokir. Lanjutkan? [y/N]","overlay.delete_title":" Hapus aturan ","overlay.delete_body":"Hapus “{name}”? [y/N]","editor.field_name":"Nama","editor.field_direction":"Arah","editor.field_protocol":"Protokol","editor.field_peer":"Peer jarak jauh/CIDR","editor.field_port":"Port/rentang","editor.field_interface":"Antarmuka","editor.field_enabled":"Aktif","editor.field_origin":"Asal","editor.help":"Aturan mengizinkan lalu lintas yang cocok; pilih masuk untuk aturan masuk. Semua paket masuk lainnya diblokir.","editor.edit_title":" Sunting aturan ","editor.new_title":" Aturan izin baru ",
-  "mode.block_all":"blokir semua","mode.learning":"pembelajaran","mode.enforcing":"terapkan aturan","direction.inbound":"masuk","direction.outbound":"keluar","duration.subsecond":"<1 dtk","duration.seconds":"{value} dtk","duration.minutes":"{value} mnt","duration.hours":"{value} jam"
-  ,"control.policy_changed_title":" Kebijakan berubah "
-  ,"control.policy_changed_body":"Perintah tidak diterapkan dan tidak akan dicoba ulang secara otomatis. Ulangi tindakan setelah keadaan dimuat ulang.\n\n{message}"
-  ,"control.rejected_title":" Perintah ditolak "
-  ,"control.rejected_body":"Daemon mengonfirmasi bahwa perubahan tidak diterapkan ({code}).\n\n{message}"
-  ,"control.unconfirmed_title":" Hasil belum dikonfirmasi "
-  ,"control.unconfirmed_body":"Tidak ada tanggapan dari daemon: perintah mungkin telah diterapkan sebelum koneksi terputus. Jangan mencobanya ulang secara otomatis; tunggu snapshot terkini lalu verifikasi.\n\n{error}"
-  ,"control.resync_failed":"\n\nTidak dapat meminta sinkronisasi: {error}"
-  ,"control.resync_scheduled":"\n\nSnapshot terkini akan dimuat secara otomatis."
-  ,"control.applied":"Perintah diterapkan, revisi {revision}"
-  ,"control.applied_rule":"Perintah diterapkan pada “{rule}”, revisi {revision}"
-  ,"validation.name_empty":"Nama aturan tidak boleh kosong"
-  ,"validation.icmp_port":"Porta tidak dapat ditentukan untuk ICMP"
-  ,"validation.invalid_interface":"Antarmuka tidak valid: {error}"
-  ,"validation.invalid_name":"Nama tidak valid: {error}"
-  ,"validation.invalid_rule":"Aturan tidak valid: {error}"
-  ,"validation.invalid_peer":"Alamat IP atau CIDR tidak valid: {error}"
-  ,"validation.port_missing":"Porta belum ditentukan"
-  ,"validation.port_number":"Porta harus berupa angka dari 1 hingga 65535"
-  ,"validation.port_end_number":"Akhir rentang harus berupa angka"
-  ,"validation.port_format":"Format porta: 443 atau 8000-8100"
-  ,"validation.invalid_port_range":"Rentang porta tidak valid: {error}"
-  ,"notice.daemon_restarted":"Daemon terdeteksi dimulai ulang; keadaan dimuat ulang dan perubahan yang belum selesai dibatalkan"
-  ,"notice.connection_lost":"Koneksi terputus; perubahan yang belum selesai dibatalkan"
-  ,"notice.revisions_skipped":"Revisi {first}..{last} terlewat; keadaan akan dimuat ulang dari snapshot"
-  ,"notice.wait_snapshot":"Tunggu snapshot kebijakan terkini terlebih dahulu"
-  ,"notice.base_revision_missing":"Perubahan dibatalkan: revisi kebijakan dasar tidak tersedia"
-  ,"notice.no_rule_selected":"Belum ada aturan yang dipilih"
-  ,"notice.read_only":"Modus hanya baca: perubahan hanya tersedia bagi root melalui control.sock"
-  ,"status.counter_accepted_in":"masuk diterima"
-  ,"status.counter_accepted_out":"keluar diterima"
-  ,"status.counter_dropped_in":"masuk dibuang"
-  ,"status.counter_dropped_out":"keluar dibuang"
-  ,"status.counter_learned_out":"keluar dipelajari"
-  ,"event.mode_changed":"modus: {previous} → {current}"
-  ,"event.rule_created":"aturan “{rule}” dibuat"
-  ,"event.rule_updated":"aturan “{rule}” diperbarui"
-  ,"event.rule_deleted":"aturan “{rule}” dihapus"
-  ,"event.rule_enabled":"aturan “{rule}”: {state}"
-  ,"event.enabled":"diaktifkan"
-  ,"event.disabled":"dinonaktifkan"
-  ,"event.counters":"pencacah: masuk +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; keluar +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; dipelajari {learned_packets}/{learned_bytes}B"
-  ,"editor.field_application":"Pencocokan aplikasi"
-  ,"editor.field_executable":"Jalur berkas eksekutabel"
-  ,"editor.field_device":"ID perangkat"
-  ,"editor.field_inode":"Nomor inode"
-  ,"editor.field_command_mode":"Pencocokan baris perintah"
-  ,"editor.field_arguments":"Argumen (larik JSON)"
-  ,"editor.field_uid":"ID pengguna (UID)"
-  ,"editor.field_cgroup":"Grup kontrol (cgroup)"
-  ,"editor.command_any":"Sembarang argumen"
-  ,"editor.command_exact":"Argumen persis"
-  ,"editor.command_prefix":"Awalan argumen"
-  ,"editor.application_help":"Pencocokan aplikasi hanya tersedia untuk aturan keluar. Jalur berkas eksekutabel wajib diisi; perangkat dan inode harus diberikan bersama-sama."
-  ,"rules.column_application":"Aplikasi"
-  ,"rules.network_only":"hanya jaringan"
-  ,"rules.application_redacted":"detail aplikasi disembunyikan"
-  ,"rules.details_title":" Detail aplikasi "
-  ,"rules.details_executable":"Berkas eksekutabel"
-  ,"rules.details_file_id":"perangkat {device}, inode {inode}"
-  ,"rules.details_command":"Baris perintah"
-  ,"rules.details_uid":"ID pengguna (UID)"
-  ,"rules.details_cgroup":"Grup kontrol (cgroup)"
-  ,"validation.application_outbound":"Pencocokan aplikasi hanya tersedia untuk aturan keluar"
-  ,"validation.executable_required":"Jalur berkas eksekutabel wajib diisi saat pencocokan aplikasi diaktifkan"
-  ,"validation.file_id_pair":"Perangkat dan inode harus diberikan bersama-sama"
-  ,"validation.invalid_device":"ID perangkat harus berupa bilangan bulat nonnegatif"
-  ,"validation.invalid_inode":"Inode harus berupa bilangan bulat positif"
-  ,"validation.arguments_unused":"Kolom argumen harus kosong dalam mode sembarang argumen"
-  ,"validation.arguments_json":"Argumen harus berupa larik JSON"
-  ,"validation.arguments_strings":"Setiap argumen harus berupa string"
-  ,"validation.invalid_executable":"Jalur berkas eksekutabel tidak valid: {error}"
-  ,"validation.invalid_arguments":"Argumen baris perintah tidak valid: {error}"
-  ,"validation.invalid_uid":"ID pengguna harus berupa bilangan bulat nonnegatif"
-  ,"validation.invalid_cgroup":"Grup kontrol tidak valid: {error}"
+  "cli.about": "Antarmuka terminal aman untuk OpenShield",
+  "main.terminal_required": "TUI memerlukan terminal interaktif",
+  "main.terminal_init_failed": "gagal menginisialisasi terminal",
+  "main.draw_failed": "gagal menggambar TUI",
+  "main.input_poll_failed": "galat saat menunggu masukan",
+  "main.input_read_failed": "galat saat membaca masukan",
+  "view.status": "Keadaan",
+  "view.rules": "Aturan",
+  "view.events": "Peristiwa",
+  "view.help": "Bantuan",
+  "common.unknown": "tidak diketahui",
+  "common.any": "apa pun",
+  "common.yes": "ya",
+  "common.no": "tidak",
+  "common.manual": "dibuat sendiri",
+  "common.learned": "pembelajaran",
+  "common.learned_immutable": "pembelajaran (asal tidak dapat diubah)",
+  "status.policy": "Kebijakan: ",
+  "status.telemetry": "Telemetri: ",
+  "status.access": "Akses: ",
+  "status.mode": "Modus: ",
+  "status.revision": "Revisi kebijakan: {revision}",
+  "status.rule_counts": "Aturan: {rules}; izin masuk aktif: {inbound}",
+  "status.inbound_policy": "Kebijakan masuk: DROP secara bawaan; hanya paket yang cocok dengan aturan izin aktif yang lewat.",
+  "status.age_unknown": "usia tidak diketahui",
+  "status.age": "usia {duration}",
+  "status.counters_title": "Pencacah firewall terbaru ({age}; paket / byte):",
+  "status.counters_waiting": "Pencacah firewall: menunggu pembaruan pertama…",
+  "status.observe_socket": "Pengamatan: {path}",
+  "status.control_socket": "Kontrol: {path}",
+  "status.title": " Status ",
+  "health.connecting": "menghubungkan…",
+  "health.connected": "terhubung",
+  "health.disconnected": "terputus ({reason})",
+  "health.telemetry_stale": "MENURUN: tidak ada pencacah baru selama {duration}",
+  "health.subscription_active": "langganan aktif",
+  "health.subscription_waiting": "langganan aktif, menunggu pencacah…",
+  "health.telemetry_disconnected": "MENURUN: aliran terputus ({reason})",
+  "access.read_only": "HANYA BACA (perubahan memerlukan root)",
+  "access.privileged": "KONTROL ISTIMEWA",
+  "rules.column_enabled": "Aktif",
+  "rules.column_direction": "Arah",
+  "rules.column_protocol": "Protokol",
+  "rules.column_peer": "Peer/jaringan",
+  "rules.column_port": "Porta",
+  "rules.column_interface": "Antarmuka",
+  "rules.column_name": "Nama",
+  "rules.column_origin": "Asal",
+  "rules.title": " Aturan izin ",
+  "events.title": " Peristiwa (terbaru dahulu) ",
+  "events.title_dropped": " Peristiwa (terbaru dahulu; dibuang kanal: {count}) ",
+  "help.navigation": "1/2/3/4   status / aturan / peristiwa / bantuan",
+  "help.next_tab": "Tab       tab berikutnya",
+  "help.select_rule": "↑/↓       pilih aturan",
+  "help.quit": "q         keluar",
+  "help.open_help": "?         bantuan",
+  "help.control_title": "Kontrol (hanya root):",
+  "help.select_mode": "m         pilih mode",
+  "help.rule_actions": "n/e/d     buat / sunting / hapus aturan",
+  "help.toggle_rule": "Space     aktifkan atau nonaktifkan aturan terpilih",
+  "help.editor": "Penyunting: Tab/Shift-Tab — bidang; ←/→ — pilihan; Enter — simpan; Esc — batal.",
+  "help.unprivileged": "Pengamatan memerlukan root atau keanggotaan grup openshield; perintah perubahan memerlukan root.",
+  "help.title": " Bantuan ",
+  "footer.status": "m: mode   ?: bantuan   q: keluar",
+  "footer.rules_read_only": "↑/↓: pilih   hanya baca   ?: bantuan   q: keluar",
+  "footer.rules": "n: buat   e: sunting   d: hapus   Space: aktif/nonaktif",
+  "footer.events_live": "peristiwa waktu nyata   q: keluar",
+  "footer.events_offline": "peristiwa waktu nyata tidak tersedia   q: keluar",
+  "footer.help": "q: keluar",
+  "overlay.mode_picker": " Pilih mode ",
+  "overlay.block_all_title": " BLOKIR SEMUA ",
+  "overlay.block_all_body": "SEMUA lalu lintas IP masuk dan keluar akan diblokir. Lanjutkan? [y/N]",
+  "overlay.delete_title": " Hapus aturan ",
+  "overlay.delete_body": "Hapus “{name}”? [y/N]",
+  "editor.field_name": "Nama",
+  "editor.field_direction": "Arah",
+  "editor.field_protocol": "Protokol",
+  "editor.field_peer": "Peer jarak jauh/CIDR",
+  "editor.field_port": "Port/rentang",
+  "editor.field_interface": "Antarmuka",
+  "editor.field_enabled": "Aktif",
+  "editor.field_origin": "Asal",
+  "editor.help": "Aturan mengizinkan lalu lintas yang cocok; pilih masuk untuk aturan masuk. Semua paket masuk lainnya diblokir.",
+  "editor.edit_title": " Sunting aturan ",
+  "editor.new_title": " Aturan izin baru ",
+  "mode.block_all": "blokir semua",
+  "mode.learning": "pembelajaran",
+  "mode.enforcing": "terapkan aturan",
+  "direction.inbound": "masuk",
+  "direction.outbound": "keluar",
+  "duration.subsecond": "<1 dtk",
+  "duration.seconds": "{value} dtk",
+  "duration.minutes": "{value} mnt",
+  "duration.hours": "{value} jam",
+  "control.policy_changed_title": " Kebijakan berubah ",
+  "control.policy_changed_body": "Perintah tidak diterapkan dan tidak akan dicoba ulang secara otomatis. Ulangi tindakan setelah keadaan dimuat ulang.\n\n{message}",
+  "control.rejected_title": " Perintah ditolak ",
+  "control.rejected_body": "Daemon mengonfirmasi bahwa perubahan tidak diterapkan ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Hasil belum dikonfirmasi ",
+  "control.unconfirmed_body": "Tidak ada tanggapan dari daemon: perintah mungkin telah diterapkan sebelum koneksi terputus. Jangan mencobanya ulang secara otomatis; tunggu snapshot terkini lalu verifikasi.\n\n{error}",
+  "control.resync_failed": "\n\nTidak dapat meminta sinkronisasi: {error}",
+  "control.resync_scheduled": "\n\nSnapshot terkini akan dimuat secara otomatis.",
+  "control.applied": "Perintah diterapkan, revisi {revision}",
+  "control.applied_rule": "Perintah diterapkan pada “{rule}”, revisi {revision}",
+  "validation.name_empty": "Nama aturan tidak boleh kosong",
+  "validation.icmp_port": "Porta tidak dapat ditentukan untuk ICMP",
+  "validation.invalid_interface": "Antarmuka tidak valid: {error}",
+  "validation.invalid_name": "Nama tidak valid: {error}",
+  "validation.invalid_rule": "Aturan tidak valid: {error}",
+  "validation.invalid_peer": "Alamat IP atau CIDR tidak valid: {error}",
+  "validation.port_missing": "Porta belum ditentukan",
+  "validation.port_number": "Porta harus berupa angka dari 1 hingga 65535",
+  "validation.port_end_number": "Akhir rentang harus berupa angka",
+  "validation.port_format": "Format porta: 443 atau 8000-8100",
+  "validation.invalid_port_range": "Rentang porta tidak valid: {error}",
+  "notice.daemon_restarted": "Daemon terdeteksi dimulai ulang; keadaan dimuat ulang dan perubahan yang belum selesai dibatalkan",
+  "notice.connection_lost": "Koneksi terputus; perubahan yang belum selesai dibatalkan",
+  "notice.revisions_skipped": "Revisi {first}..{last} terlewat; keadaan akan dimuat ulang dari snapshot",
+  "notice.wait_snapshot": "Tunggu snapshot kebijakan terkini terlebih dahulu",
+  "notice.base_revision_missing": "Perubahan dibatalkan: revisi kebijakan dasar tidak tersedia",
+  "notice.no_rule_selected": "Belum ada aturan yang dipilih",
+  "notice.read_only": "Modus hanya baca: perubahan hanya tersedia bagi root melalui control.sock",
+  "status.counter_accepted_in": "masuk diterima",
+  "status.counter_accepted_out": "keluar diterima",
+  "status.counter_dropped_in": "masuk dibuang",
+  "status.counter_dropped_out": "keluar dibuang",
+  "status.counter_learned_out": "keluar dipelajari",
+  "event.mode_changed": "modus: {previous} → {current}",
+  "event.rule_created": "aturan “{rule}” dibuat",
+  "event.rule_updated": "aturan “{rule}” diperbarui",
+  "event.rule_deleted": "aturan “{rule}” dihapus",
+  "event.rule_enabled": "aturan “{rule}”: {state}",
+  "event.enabled": "diaktifkan",
+  "event.disabled": "dinonaktifkan",
+  "event.counters": "pencacah: masuk +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; keluar +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; dipelajari {learned_packets}/{learned_bytes}B",
+  "editor.field_application": "Pencocokan aplikasi",
+  "editor.field_executable": "Jalur berkas eksekutabel",
+  "editor.field_command_mode": "Pencocokan baris perintah",
+  "editor.field_arguments": "Argumen (larik JSON)",
+  "editor.field_uid": "ID pengguna (UID)",
+  "editor.field_cgroup": "Grup kontrol (cgroup)",
+  "editor.command_any": "Sembarang argumen",
+  "editor.command_exact": "Argumen persis",
+  "editor.command_prefix": "Awalan argumen",
+  "editor.application_help": "Pencocokan aplikasi hanya tersedia untuk aturan keluar. Jalur berkas eksekutabel wajib diisi. Daemon menyematkan versi berkas secara otomatis; penyuntingan ditolak jika versi yang telah disematkan berubah.",
+  "rules.column_application": "Aplikasi",
+  "rules.network_only": "hanya jaringan",
+  "rules.application_redacted": "detail aplikasi disembunyikan",
+  "rules.details_title": " Detail aplikasi ",
+  "rules.details_executable": "Berkas eksekutabel",
+  "rules.details_file_id": "perangkat {device}, inode {inode}",
+  "rules.details_command": "Baris perintah",
+  "rules.details_uid": "ID pengguna (UID)",
+  "rules.details_cgroup": "Grup kontrol (cgroup)",
+  "validation.application_outbound": "Pencocokan aplikasi hanya tersedia untuk aturan keluar",
+  "validation.executable_required": "Jalur berkas eksekutabel wajib diisi saat pencocokan aplikasi diaktifkan",
+  "validation.arguments_unused": "Kolom argumen harus kosong dalam mode sembarang argumen",
+  "validation.arguments_json": "Argumen harus berupa larik JSON",
+  "validation.arguments_strings": "Setiap argumen harus berupa string",
+  "validation.invalid_executable": "Jalur berkas eksekutabel tidak valid: {error}",
+  "validation.invalid_arguments": "Argumen baris perintah tidak valid: {error}",
+  "validation.invalid_uid": "ID pengguna harus berupa bilangan bulat nonnegatif",
+  "validation.invalid_cgroup": "Grup kontrol tidak valid: {error}",
+  "ipc.connect_error": "Gagal terhubung ke soket IPC {path}: {error}",
+  "ipc.control_root_required": "Permintaan kontrol memerlukan UID efektif 0 (root)",
+  "ipc.coordinator_unavailable": "Koordinator revisi pengamat tidak tersedia",
+  "ipc.daemon_rejected": "Daemon menolak permintaan ({code}): {message}",
+  "ipc.generation_exhausted": "Penghitung generasi pengamat habis",
+  "ipc.inconsistent_pages": "Kebijakan berubah selama pembacaan halaman aturan; membaca ulang",
+  "ipc.inspect_error": "Gagal memeriksa jalur IPC {path}: {error}",
+  "ipc.invalid_snapshot": "Daemon mengembalikan snapshot kebijakan yang tidak valid: {error}",
+  "ipc.local_groups_error": "Gagal membaca grup tambahan proses saat ini: {error}",
+  "ipc.not_observer_group_member": "Pengamatan memerlukan root atau keanggotaan grup openshield",
+  "ipc.observer_group_error": "Gagal menentukan grup pengamat openshield wajib: {error}",
+  "ipc.peer_credentials_error": "Gagal membaca kredensial daemon pada soket IPC: {error}",
+  "ipc.protocol_error": "Kesalahan protokol IPC: {error}",
+  "ipc.rule_count_mismatch": "Daemon menyatakan {advertised} aturan, tetapi mengembalikan {received}",
+  "ipc.socket_path_changed": "Jalur soket IPC berubah selama koneksi: {path}",
+  "ipc.timeout_error": "Gagal mengatur waktu tunggu IPC: {error}",
+  "ipc.unexpected_response": "Respons daemon tidak terduga: {error}",
+  "ipc.untrusted_directory": "Direktori induk IPC tidak tepercaya: {path}",
+  "ipc.untrusted_peer": "UID {uid} pihak peer IPC tidak milik daemon berwenang",
+  "ipc.untrusted_socket": "Jalur IPC bukan soket Unix yang dimiliki root: {path}"
 }

@@ -1,83 +1,185 @@
 {
-  "cli.about":"Giao diện đầu cuối an toàn cho OpenShield","main.terminal_required":"TUI cần thiết bị đầu cuối tương tác","main.terminal_init_failed":"không thể khởi tạo đầu cuối","main.draw_failed":"không thể hiển thị TUI","main.input_poll_failed":"lỗi khi chờ nhập","main.input_read_failed":"lỗi khi đọc dữ liệu nhập","view.status":"Trạng thái","view.rules":"Quy tắc","view.events":"Sự kiện","view.help":"Trợ giúp","common.unknown":"không rõ","common.any":"bất kỳ","common.yes":"có","common.no":"không","common.manual":"thủ công","common.learned":"học","common.learned_immutable":"học (nguồn không đổi)",
-  "status.policy":"Chính sách: ","status.telemetry":"Dữ liệu đo từ xa: ","status.access":"Truy cập: ","status.mode":"Chế độ: ","status.revision":"Bản sửa đổi chính sách: {revision}","status.rule_counts":"Quy tắc: {rules}; quy tắc cho phép luồng vào đang hoạt động: {inbound}","status.inbound_policy":"Chính sách vào: mặc định DROP; chỉ gói khớp quy tắc cho phép mới đi qua.","status.age_unknown":"không rõ thời điểm","status.age":"cách đây {duration}","status.counters_title":"Bộ đếm nftables mới nhất ({age}; gói / byte):","status.counters_waiting":"Bộ đếm nftables: chờ cập nhật đầu tiên…","status.observe_socket":"Quan sát: {path}","status.control_socket":"Điều khiển: {path}","status.title":" Trạng thái ",
-  "health.connecting":"đang kết nối…","health.connected":"đã kết nối","health.disconnected":"mất kết nối ({reason})","health.telemetry_stale":"SUY GIẢM: không có bộ đếm mới trong {duration}","health.subscription_active":"đăng ký đang hoạt động","health.subscription_waiting":"đăng ký đang hoạt động, chờ bộ đếm…","health.telemetry_disconnected":"SUY GIẢM: luồng đã ngắt ({reason})","access.read_only":"CHỈ ĐỌC (thay đổi cần root)","access.privileged":"ĐIỀU KHIỂN ĐẶC QUYỀN",
-  "rules.column_enabled":"Bật","rules.column_direction":"Hướng","rules.column_protocol":"G.thức","rules.column_peer":"Nút/mạng","rules.column_port":"Cổng","rules.column_interface":"Giao diện","rules.column_name":"Tên","rules.column_origin":"Nguồn","rules.title":" Quy tắc cho phép ","events.title":" Sự kiện (mới nhất trước) ","events.title_dropped":" Sự kiện (mới nhất trước; kênh đã bỏ: {count}) ",
-  "help.navigation":"1/2/3/4   trạng thái / quy tắc / sự kiện / trợ giúp","help.next_tab":"Tab       thẻ tiếp theo","help.select_rule":"↑/↓       chọn quy tắc","help.quit":"q         thoát","help.open_help":"?         trợ giúp","help.control_title":"Điều khiển (chỉ root):","help.select_mode":"m         chọn chế độ","help.rule_actions":"n/e/d     tạo / sửa / xóa quy tắc","help.toggle_rule":"Space     bật hoặc tắt quy tắc đã chọn","help.editor":"Trình sửa: Tab/Shift-Tab — trường; ←/→ — chọn; Enter — lưu; Esc — hủy.","help.unprivileged":"Phiên không đặc quyền: các lệnh thay đổi được chủ ý vô hiệu hóa.","help.title":" Trợ giúp ",
-  "footer.status":"m: chế độ   ?: trợ giúp   q: thoát","footer.rules_read_only":"↑/↓: chọn   chỉ đọc   ?: trợ giúp   q: thoát","footer.rules":"n: tạo   e: sửa   d: xóa   Space: bật/tắt","footer.events_live":"sự kiện thời gian thực   q: thoát","footer.events_offline":"sự kiện thời gian thực không khả dụng   q: thoát","footer.help":"q: thoát","overlay.mode_picker":" Chọn chế độ ","overlay.block_all_title":" CHẶN TẤT CẢ ","overlay.block_all_body":"TẤT CẢ lưu lượng IP vào và ra sẽ bị chặn. Tiếp tục? [y/N]","overlay.delete_title":" Xóa quy tắc ","overlay.delete_body":"Xóa “{name}”? [y/N]","editor.field_name":"Tên","editor.field_direction":"Hướng","editor.field_protocol":"Giao thức","editor.field_peer":"Nút từ xa/CIDR","editor.field_port":"Cổng/phạm vi","editor.field_interface":"Giao diện","editor.field_enabled":"Đã bật","editor.field_origin":"Nguồn","editor.help":"Quy tắc cho phép lưu lượng khớp; hãy chọn hướng vào cho quy tắc vào. Mọi gói vào khác đều bị chặn.","editor.edit_title":" Sửa quy tắc ","editor.new_title":" Quy tắc cho phép mới ",
-  "mode.block_all":"chặn tất cả","mode.learning":"học","mode.enforcing":"thực thi quy tắc","direction.inbound":"vào","direction.outbound":"ra","duration.subsecond":"<1 giây","duration.seconds":"{value} giây","duration.minutes":"{value} phút","duration.hours":"{value} giờ"
-  ,"control.policy_changed_title":" Chính sách đã thay đổi "
-  ,"control.policy_changed_body":"Lệnh chưa được áp dụng và sẽ không được tự động thử lại. Hãy lặp lại thao tác sau khi trạng thái được làm mới.\n\n{message}"
-  ,"control.rejected_title":" Lệnh bị từ chối "
-  ,"control.rejected_body":"Trình nền xác nhận rằng thay đổi chưa được áp dụng ({code}).\n\n{message}"
-  ,"control.unconfirmed_title":" Chưa xác nhận được kết quả "
-  ,"control.unconfirmed_body":"Không nhận được phản hồi từ trình nền: lệnh có thể đã được áp dụng trước khi kết nối bị lỗi. Không tự động thử lại; hãy chờ ảnh chụp trạng thái hiện tại rồi kiểm tra kết quả.\n\n{error}"
-  ,"control.resync_failed":"\n\nKhông thể yêu cầu đồng bộ hóa: {error}"
-  ,"control.resync_scheduled":"\n\nẢnh chụp trạng thái hiện tại sẽ được tự động tải."
-  ,"control.applied":"Đã áp dụng lệnh, bản sửa đổi {revision}"
-  ,"control.applied_rule":"Đã áp dụng lệnh cho “{rule}”, bản sửa đổi {revision}"
-  ,"validation.name_empty":"Tên quy tắc không được để trống"
-  ,"validation.icmp_port":"Không thể chỉ định cổng cho ICMP"
-  ,"validation.invalid_interface":"Giao diện không hợp lệ: {error}"
-  ,"validation.invalid_name":"Tên không hợp lệ: {error}"
-  ,"validation.invalid_rule":"Quy tắc không hợp lệ: {error}"
-  ,"validation.invalid_peer":"Địa chỉ IP hoặc CIDR không hợp lệ: {error}"
-  ,"validation.port_missing":"Chưa nhập cổng"
-  ,"validation.port_number":"Cổng phải là số từ 1 đến 65535"
-  ,"validation.port_end_number":"Giá trị cuối phạm vi phải là số"
-  ,"validation.port_format":"Định dạng cổng: 443 hoặc 8000-8100"
-  ,"validation.invalid_port_range":"Phạm vi cổng không hợp lệ: {error}"
-  ,"notice.daemon_restarted":"Phát hiện trình nền khởi động lại; trạng thái đã được tải lại và các thay đổi chưa hoàn tất đã bị hủy"
-  ,"notice.connection_lost":"Mất kết nối; thay đổi chưa hoàn tất đã bị hủy"
-  ,"notice.revisions_skipped":"Đã bỏ lỡ các bản sửa đổi {first}..{last}; trạng thái sẽ được làm mới từ ảnh chụp"
-  ,"notice.wait_snapshot":"Trước tiên, hãy chờ ảnh chụp chính sách hiện tại"
-  ,"notice.base_revision_missing":"Đã hủy thay đổi: không có bản sửa đổi chính sách cơ sở"
-  ,"notice.no_rule_selected":"Chưa chọn quy tắc nào"
-  ,"notice.read_only":"Chế độ chỉ đọc: chỉ root mới có thể thay đổi thông qua control.sock"
-  ,"status.counter_accepted_in":"luồng vào được chấp nhận"
-  ,"status.counter_accepted_out":"luồng ra được chấp nhận"
-  ,"status.counter_dropped_in":"luồng vào bị loại bỏ"
-  ,"status.counter_dropped_out":"luồng ra bị loại bỏ"
-  ,"status.counter_learned_out":"luồng ra đã học"
-  ,"event.mode_changed":"chế độ: {previous} → {current}"
-  ,"event.rule_created":"đã tạo quy tắc “{rule}”"
-  ,"event.rule_updated":"đã cập nhật quy tắc “{rule}”"
-  ,"event.rule_deleted":"đã xóa quy tắc “{rule}”"
-  ,"event.rule_enabled":"quy tắc “{rule}”: {state}"
-  ,"event.enabled":"đã bật"
-  ,"event.disabled":"đã tắt"
-  ,"event.counters":"bộ đếm: vào +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; ra +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; đã học {learned_packets}/{learned_bytes}B"
-  ,"editor.field_application":"Đối sánh ứng dụng"
-  ,"editor.field_executable":"Đường dẫn tệp thực thi"
-  ,"editor.field_device":"ID thiết bị"
-  ,"editor.field_inode":"Số inode"
-  ,"editor.field_command_mode":"Đối sánh dòng lệnh"
-  ,"editor.field_arguments":"Đối số (mảng JSON)"
-  ,"editor.field_uid":"ID người dùng (UID)"
-  ,"editor.field_cgroup":"Nhóm điều khiển (cgroup)"
-  ,"editor.command_any":"Mọi đối số"
-  ,"editor.command_exact":"Khớp chính xác đối số"
-  ,"editor.command_prefix":"Tiền tố đối số"
-  ,"editor.application_help":"Đối sánh ứng dụng chỉ dùng được cho quy tắc hướng ra. Bắt buộc phải có đường dẫn tệp thực thi; thiết bị và inode phải được chỉ định cùng nhau."
-  ,"rules.column_application":"Ứng dụng"
-  ,"rules.network_only":"chỉ mạng"
-  ,"rules.application_redacted":"đã ẩn chi tiết ứng dụng"
-  ,"rules.details_title":" Chi tiết ứng dụng "
-  ,"rules.details_executable":"Tệp thực thi"
-  ,"rules.details_file_id":"thiết bị {device}, inode {inode}"
-  ,"rules.details_command":"Dòng lệnh"
-  ,"rules.details_uid":"ID người dùng (UID)"
-  ,"rules.details_cgroup":"Nhóm điều khiển (cgroup)"
-  ,"validation.application_outbound":"Đối sánh ứng dụng chỉ dùng được cho quy tắc hướng ra"
-  ,"validation.executable_required":"Cần có đường dẫn tệp thực thi khi bật đối sánh ứng dụng"
-  ,"validation.file_id_pair":"Thiết bị và inode phải được chỉ định cùng nhau"
-  ,"validation.invalid_device":"ID thiết bị phải là số nguyên không âm"
-  ,"validation.invalid_inode":"Inode phải là số nguyên dương"
-  ,"validation.arguments_unused":"Trường đối số phải để trống trong chế độ mọi đối số"
-  ,"validation.arguments_json":"Đối số phải là một mảng JSON"
-  ,"validation.arguments_strings":"Mỗi đối số phải là một chuỗi"
-  ,"validation.invalid_executable":"Đường dẫn tệp thực thi không hợp lệ: {error}"
-  ,"validation.invalid_arguments":"Đối số dòng lệnh không hợp lệ: {error}"
-  ,"validation.invalid_uid":"ID người dùng phải là số nguyên không âm"
-  ,"validation.invalid_cgroup":"Nhóm điều khiển không hợp lệ: {error}"
+  "cli.about": "Giao diện đầu cuối an toàn cho OpenShield",
+  "main.terminal_required": "TUI cần thiết bị đầu cuối tương tác",
+  "main.terminal_init_failed": "không thể khởi tạo đầu cuối",
+  "main.draw_failed": "không thể hiển thị TUI",
+  "main.input_poll_failed": "lỗi khi chờ nhập",
+  "main.input_read_failed": "lỗi khi đọc dữ liệu nhập",
+  "view.status": "Trạng thái",
+  "view.rules": "Quy tắc",
+  "view.events": "Sự kiện",
+  "view.help": "Trợ giúp",
+  "common.unknown": "không rõ",
+  "common.any": "bất kỳ",
+  "common.yes": "có",
+  "common.no": "không",
+  "common.manual": "thủ công",
+  "common.learned": "học",
+  "common.learned_immutable": "học (nguồn không đổi)",
+  "status.policy": "Chính sách: ",
+  "status.telemetry": "Dữ liệu đo từ xa: ",
+  "status.access": "Truy cập: ",
+  "status.mode": "Chế độ: ",
+  "status.revision": "Bản sửa đổi chính sách: {revision}",
+  "status.rule_counts": "Quy tắc: {rules}; quy tắc cho phép luồng vào đang hoạt động: {inbound}",
+  "status.inbound_policy": "Chính sách vào: mặc định DROP; chỉ gói khớp quy tắc cho phép mới đi qua.",
+  "status.age_unknown": "không rõ thời điểm",
+  "status.age": "cách đây {duration}",
+  "status.counters_title": "Bộ đếm tường lửa mới nhất ({age}; gói / byte):",
+  "status.counters_waiting": "Bộ đếm tường lửa: chờ bản cập nhật đầu tiên…",
+  "status.observe_socket": "Quan sát: {path}",
+  "status.control_socket": "Điều khiển: {path}",
+  "status.title": " Trạng thái ",
+  "health.connecting": "đang kết nối…",
+  "health.connected": "đã kết nối",
+  "health.disconnected": "mất kết nối ({reason})",
+  "health.telemetry_stale": "SUY GIẢM: không có bộ đếm mới trong {duration}",
+  "health.subscription_active": "đăng ký đang hoạt động",
+  "health.subscription_waiting": "đăng ký đang hoạt động, chờ bộ đếm…",
+  "health.telemetry_disconnected": "SUY GIẢM: luồng đã ngắt ({reason})",
+  "access.read_only": "CHỈ ĐỌC (thay đổi cần root)",
+  "access.privileged": "ĐIỀU KHIỂN ĐẶC QUYỀN",
+  "rules.column_enabled": "Bật",
+  "rules.column_direction": "Hướng",
+  "rules.column_protocol": "G.thức",
+  "rules.column_peer": "Nút/mạng",
+  "rules.column_port": "Cổng",
+  "rules.column_interface": "Giao diện",
+  "rules.column_name": "Tên",
+  "rules.column_origin": "Nguồn",
+  "rules.title": " Quy tắc cho phép ",
+  "events.title": " Sự kiện (mới nhất trước) ",
+  "events.title_dropped": " Sự kiện (mới nhất trước; kênh đã bỏ: {count}) ",
+  "help.navigation": "1/2/3/4   trạng thái / quy tắc / sự kiện / trợ giúp",
+  "help.next_tab": "Tab       thẻ tiếp theo",
+  "help.select_rule": "↑/↓       chọn quy tắc",
+  "help.quit": "q         thoát",
+  "help.open_help": "?         trợ giúp",
+  "help.control_title": "Điều khiển (chỉ root):",
+  "help.select_mode": "m         chọn chế độ",
+  "help.rule_actions": "n/e/d     tạo / sửa / xóa quy tắc",
+  "help.toggle_rule": "Space     bật hoặc tắt quy tắc đã chọn",
+  "help.editor": "Trình sửa: Tab/Shift-Tab — trường; ←/→ — chọn; Enter — lưu; Esc — hủy.",
+  "help.unprivileged": "Việc quan sát yêu cầu root hoặc tư cách thành viên nhóm openshield; các lệnh thay đổi yêu cầu root.",
+  "help.title": " Trợ giúp ",
+  "footer.status": "m: chế độ   ?: trợ giúp   q: thoát",
+  "footer.rules_read_only": "↑/↓: chọn   chỉ đọc   ?: trợ giúp   q: thoát",
+  "footer.rules": "n: tạo   e: sửa   d: xóa   Space: bật/tắt",
+  "footer.events_live": "sự kiện thời gian thực   q: thoát",
+  "footer.events_offline": "sự kiện thời gian thực không khả dụng   q: thoát",
+  "footer.help": "q: thoát",
+  "overlay.mode_picker": " Chọn chế độ ",
+  "overlay.block_all_title": " CHẶN TẤT CẢ ",
+  "overlay.block_all_body": "TẤT CẢ lưu lượng IP vào và ra sẽ bị chặn. Tiếp tục? [y/N]",
+  "overlay.delete_title": " Xóa quy tắc ",
+  "overlay.delete_body": "Xóa “{name}”? [y/N]",
+  "editor.field_name": "Tên",
+  "editor.field_direction": "Hướng",
+  "editor.field_protocol": "Giao thức",
+  "editor.field_peer": "Nút từ xa/CIDR",
+  "editor.field_port": "Cổng/phạm vi",
+  "editor.field_interface": "Giao diện",
+  "editor.field_enabled": "Đã bật",
+  "editor.field_origin": "Nguồn",
+  "editor.help": "Quy tắc cho phép lưu lượng khớp; hãy chọn hướng vào cho quy tắc vào. Mọi gói vào khác đều bị chặn.",
+  "editor.edit_title": " Sửa quy tắc ",
+  "editor.new_title": " Quy tắc cho phép mới ",
+  "mode.block_all": "chặn tất cả",
+  "mode.learning": "học",
+  "mode.enforcing": "thực thi quy tắc",
+  "direction.inbound": "vào",
+  "direction.outbound": "ra",
+  "duration.subsecond": "<1 giây",
+  "duration.seconds": "{value} giây",
+  "duration.minutes": "{value} phút",
+  "duration.hours": "{value} giờ",
+  "control.policy_changed_title": " Chính sách đã thay đổi ",
+  "control.policy_changed_body": "Lệnh chưa được áp dụng và sẽ không được tự động thử lại. Hãy lặp lại thao tác sau khi trạng thái được làm mới.\n\n{message}",
+  "control.rejected_title": " Lệnh bị từ chối ",
+  "control.rejected_body": "Trình nền xác nhận rằng thay đổi chưa được áp dụng ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Chưa xác nhận được kết quả ",
+  "control.unconfirmed_body": "Không nhận được phản hồi từ trình nền: lệnh có thể đã được áp dụng trước khi kết nối bị lỗi. Không tự động thử lại; hãy chờ ảnh chụp trạng thái hiện tại rồi kiểm tra kết quả.\n\n{error}",
+  "control.resync_failed": "\n\nKhông thể yêu cầu đồng bộ hóa: {error}",
+  "control.resync_scheduled": "\n\nẢnh chụp trạng thái hiện tại sẽ được tự động tải.",
+  "control.applied": "Đã áp dụng lệnh, bản sửa đổi {revision}",
+  "control.applied_rule": "Đã áp dụng lệnh cho “{rule}”, bản sửa đổi {revision}",
+  "validation.name_empty": "Tên quy tắc không được để trống",
+  "validation.icmp_port": "Không thể chỉ định cổng cho ICMP",
+  "validation.invalid_interface": "Giao diện không hợp lệ: {error}",
+  "validation.invalid_name": "Tên không hợp lệ: {error}",
+  "validation.invalid_rule": "Quy tắc không hợp lệ: {error}",
+  "validation.invalid_peer": "Địa chỉ IP hoặc CIDR không hợp lệ: {error}",
+  "validation.port_missing": "Chưa nhập cổng",
+  "validation.port_number": "Cổng phải là số từ 1 đến 65535",
+  "validation.port_end_number": "Giá trị cuối phạm vi phải là số",
+  "validation.port_format": "Định dạng cổng: 443 hoặc 8000-8100",
+  "validation.invalid_port_range": "Phạm vi cổng không hợp lệ: {error}",
+  "notice.daemon_restarted": "Phát hiện trình nền khởi động lại; trạng thái đã được tải lại và các thay đổi chưa hoàn tất đã bị hủy",
+  "notice.connection_lost": "Mất kết nối; thay đổi chưa hoàn tất đã bị hủy",
+  "notice.revisions_skipped": "Đã bỏ lỡ các bản sửa đổi {first}..{last}; trạng thái sẽ được làm mới từ ảnh chụp",
+  "notice.wait_snapshot": "Trước tiên, hãy chờ ảnh chụp chính sách hiện tại",
+  "notice.base_revision_missing": "Đã hủy thay đổi: không có bản sửa đổi chính sách cơ sở",
+  "notice.no_rule_selected": "Chưa chọn quy tắc nào",
+  "notice.read_only": "Chế độ chỉ đọc: chỉ root mới có thể thay đổi thông qua control.sock",
+  "status.counter_accepted_in": "luồng vào được chấp nhận",
+  "status.counter_accepted_out": "luồng ra được chấp nhận",
+  "status.counter_dropped_in": "luồng vào bị loại bỏ",
+  "status.counter_dropped_out": "luồng ra bị loại bỏ",
+  "status.counter_learned_out": "luồng ra đã học",
+  "event.mode_changed": "chế độ: {previous} → {current}",
+  "event.rule_created": "đã tạo quy tắc “{rule}”",
+  "event.rule_updated": "đã cập nhật quy tắc “{rule}”",
+  "event.rule_deleted": "đã xóa quy tắc “{rule}”",
+  "event.rule_enabled": "quy tắc “{rule}”: {state}",
+  "event.enabled": "đã bật",
+  "event.disabled": "đã tắt",
+  "event.counters": "bộ đếm: vào +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; ra +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; đã học {learned_packets}/{learned_bytes}B",
+  "editor.field_application": "Đối sánh ứng dụng",
+  "editor.field_executable": "Đường dẫn tệp thực thi",
+  "editor.field_command_mode": "Đối sánh dòng lệnh",
+  "editor.field_arguments": "Đối số (mảng JSON)",
+  "editor.field_uid": "ID người dùng (UID)",
+  "editor.field_cgroup": "Nhóm điều khiển (cgroup)",
+  "editor.command_any": "Mọi đối số",
+  "editor.command_exact": "Khớp chính xác đối số",
+  "editor.command_prefix": "Tiền tố đối số",
+  "editor.application_help": "Đối sánh ứng dụng chỉ dùng được cho quy tắc hướng ra. Bắt buộc phải có đường dẫn tệp thực thi. Trình nền tự động ghim phiên bản tệp; thao tác chỉnh sửa bị từ chối nếu phiên bản đã ghim trước đó thay đổi.",
+  "rules.column_application": "Ứng dụng",
+  "rules.network_only": "chỉ mạng",
+  "rules.application_redacted": "đã ẩn chi tiết ứng dụng",
+  "rules.details_title": " Chi tiết ứng dụng ",
+  "rules.details_executable": "Tệp thực thi",
+  "rules.details_file_id": "thiết bị {device}, inode {inode}",
+  "rules.details_command": "Dòng lệnh",
+  "rules.details_uid": "ID người dùng (UID)",
+  "rules.details_cgroup": "Nhóm điều khiển (cgroup)",
+  "validation.application_outbound": "Đối sánh ứng dụng chỉ dùng được cho quy tắc hướng ra",
+  "validation.executable_required": "Cần có đường dẫn tệp thực thi khi bật đối sánh ứng dụng",
+  "validation.arguments_unused": "Trường đối số phải để trống trong chế độ mọi đối số",
+  "validation.arguments_json": "Đối số phải là một mảng JSON",
+  "validation.arguments_strings": "Mỗi đối số phải là một chuỗi",
+  "validation.invalid_executable": "Đường dẫn tệp thực thi không hợp lệ: {error}",
+  "validation.invalid_arguments": "Đối số dòng lệnh không hợp lệ: {error}",
+  "validation.invalid_uid": "ID người dùng phải là số nguyên không âm",
+  "validation.invalid_cgroup": "Nhóm điều khiển không hợp lệ: {error}",
+  "ipc.connect_error": "Không thể kết nối đến socket IPC {path}: {error}",
+  "ipc.control_root_required": "Yêu cầu điều khiển cần UID hiệu dụng 0 (root)",
+  "ipc.coordinator_unavailable": "Trình điều phối sửa đổi quan sát viên không khả dụng",
+  "ipc.daemon_rejected": "Daemon đã từ chối yêu cầu ({code}): {message}",
+  "ipc.generation_exhausted": "Bộ đếm thế hệ quan sát viên đã cạn",
+  "ipc.inconsistent_pages": "Chính sách đã thay đổi trong khi đọc trang quy tắc; đang đọc lại",
+  "ipc.inspect_error": "Không thể kiểm tra đường dẫn IPC {path}: {error}",
+  "ipc.invalid_snapshot": "Daemon trả về bản chụp chính sách không hợp lệ: {error}",
+  "ipc.local_groups_error": "Không thể đọc các nhóm bổ sung của tiến trình hiện tại: {error}",
+  "ipc.not_observer_group_member": "Quan sát yêu cầu root hoặc thành viên nhóm openshield",
+  "ipc.observer_group_error": "Không thể xác định nhóm quan sát viên openshield bắt buộc: {error}",
+  "ipc.peer_credentials_error": "Không thể đọc thông tin xác thực daemon trên socket IPC: {error}",
+  "ipc.protocol_error": "Lỗi giao thức IPC: {error}",
+  "ipc.rule_count_mismatch": "Daemon khai báo {advertised} quy tắc, nhưng trả về {received}",
+  "ipc.socket_path_changed": "Đường dẫn socket IPC đã thay đổi trong khi kết nối: {path}",
+  "ipc.timeout_error": "Không thể đặt thời gian chờ IPC: {error}",
+  "ipc.unexpected_response": "Phản hồi không mong đợi từ daemon: {error}",
+  "ipc.untrusted_directory": "Thư mục cha IPC không đáng tin cậy: {path}",
+  "ipc.untrusted_peer": "UID {uid} của peer IPC không thuộc về daemon có đặc quyền",
+  "ipc.untrusted_socket": "Đường dẫn IPC không phải là socket Unix thuộc sở hữu của root: {path}"
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,12 +15,13 @@ use nix::sys::socket::{
 };
 use openshield_core::{
     APPLICATION_QUEUE_NUMBER, InterfaceName, LearnedApplicationEndpoint, LearnedEndpoint, Mode,
-    TransportProtocol, application_pending_mark,
+    TransportProtocol, application_handoff_mark, application_pending_mark,
 };
 use tracing::{error, info, warn};
 
-use crate::application::{OutboundConnection, ProcfsResolver, matching_application_rule};
-use crate::engine::SharedEngine;
+use crate::application::{OutboundConnection, ProcfsResolver};
+use crate::backend::QueueVerdictStrategy;
+use crate::engine::{LearningQueueAdmission, SharedEngine};
 
 const NFNL_SUBSYS_QUEUE: u16 = 3;
 const NFQNL_MSG_PACKET: u16 = 0;
@@ -42,6 +44,7 @@ const NFQA_CFG_FLAGS: u16 = 5;
 const NFQA_CFG_F_UID_GID: u32 = 1 << 3;
 const NF_DROP: u32 = 0;
 const NF_ACCEPT: u32 = 1;
+const NF_REPEAT: u32 = 4;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLMSG_ERROR: u16 = 2;
@@ -77,7 +80,11 @@ impl QueueRuntime {
     }
 }
 
-pub fn spawn(engine: &SharedEngine, shutdown: &Arc<AtomicBool>) -> Result<QueueRuntime> {
+pub fn spawn(
+    engine: &SharedEngine,
+    shutdown: &Arc<AtomicBool>,
+    verdict_strategy: QueueVerdictStrategy,
+) -> Result<QueueRuntime> {
     let queue = QueueSocket::open(APPLICATION_QUEUE_NUMBER)
         .context("cannot bind the fail-closed application packet queue")?;
     let (learning_sender, learning_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
@@ -93,7 +100,13 @@ pub fn spawn(engine: &SharedEngine, shutdown: &Arc<AtomicBool>) -> Result<QueueR
     let packet_thread = match thread::Builder::new()
         .name("openshield-nfqueue".to_owned())
         .spawn(move || {
-            packet_loop(queue, &packet_engine, &packet_shutdown, &learning_sender);
+            packet_loop(
+                queue,
+                &packet_engine,
+                &packet_shutdown,
+                &learning_sender,
+                verdict_strategy,
+            );
         }) {
         Ok(thread) => thread,
         Err(error) => {
@@ -114,6 +127,7 @@ fn packet_loop(
     engine: &SharedEngine,
     shutdown: &AtomicBool,
     learning: &SyncSender<LearningObservation>,
+    verdict_strategy: QueueVerdictStrategy,
 ) {
     let resolver = ProcfsResolver::new();
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_BYTES];
@@ -147,7 +161,13 @@ fn packet_loop(
                         continue;
                     };
                     let decision = decide_packet(message.payload, engine, &resolver, learning);
-                    let returned = return_packet_verdict(&mut queue, packet_id, decision, engine);
+                    let returned = return_packet_verdict(
+                        &mut queue,
+                        packet_id,
+                        decision,
+                        engine,
+                        verdict_strategy,
+                    );
                     let (accepted, decision_error) = match returned {
                         Ok(returned) => returned,
                         Err(error) => {
@@ -179,6 +199,7 @@ fn return_packet_verdict(
     packet_id: u32,
     decision: Result<PacketAuthorization>,
     engine: &SharedEngine,
+    verdict_strategy: QueueVerdictStrategy,
 ) -> Result<(bool, Option<anyhow::Error>)> {
     let authorization = match decision {
         Ok(authorization) => authorization,
@@ -192,7 +213,7 @@ fn return_packet_verdict(
         queue.verdict(packet_id, NF_DROP)?;
         return Ok((false, Some(error)));
     };
-    let current = match guard.decision_snapshot() {
+    let (current_mode, current_flow_generation) = match guard.application_decision_identity() {
         Ok(current) => current,
         Err(error) => {
             drop(guard);
@@ -200,8 +221,8 @@ fn return_packet_verdict(
             return Ok((false, Some(anyhow!(error.message))));
         }
     };
-    if current.mode != authorization.mode
-        || current.flow_generation != authorization.flow_generation
+    if current_mode != authorization.mode
+        || current_flow_generation != authorization.flow_generation
     {
         drop(guard);
         queue.verdict(packet_id, NF_DROP)?;
@@ -215,10 +236,20 @@ fn return_packet_verdict(
 
     // Netfilter processes the verdict and reinjects the packet synchronously
     // inside sendto(2). Retaining the engine guard until it returns prevents
-    // an atomic policy reload between this final recheck and the later nft
-    // authorization chain. The pending mark is deliberately left unchanged,
-    // avoiding the route recalculation triggered by NFQA_MARK.
-    let verdict = queue.verdict(packet_id, NF_ACCEPT);
+    // an atomic policy reload between this final recheck and the kernel
+    // authorization path. nftables continues in its later base chain after
+    // NF_ACCEPT and deliberately keeps the pending mark unchanged. iptables
+    // NF_ACCEPT would terminate the filter hook, so that backend uses
+    // NF_REPEAT plus a kernel verdict mark; its first repeated filter rule
+    // consumes the handoff after mangle/OUTPUT has already sanitized SO_MARK.
+    let verdict = match verdict_strategy {
+        QueueVerdictStrategy::Accept => queue.verdict(packet_id, NF_ACCEPT),
+        QueueVerdictStrategy::RepeatWithHandoffMark => queue.verdict_with_mark(
+            packet_id,
+            NF_REPEAT,
+            application_handoff_mark(authorization.packet_mark),
+        ),
+    };
     drop(guard);
     verdict?;
     Ok((true, None))
@@ -234,7 +265,7 @@ fn decide_packet(
     let snapshot = engine
         .lock()
         .map_err(|_| anyhow!("policy engine mutex is poisoned"))?
-        .decision_snapshot()
+        .application_decision_snapshot()
         .map_err(|error| anyhow!(error.message))?;
     ensure!(
         snapshot.mode != Mode::BlockAll,
@@ -250,9 +281,9 @@ fn decide_packet(
         .context("cannot establish race-checked process identity")?;
     let accepted = match snapshot.mode {
         Mode::BlockAll => false,
-        Mode::Enforcing => {
-            matching_application_rule(&snapshot, &packet.connection, &identity).is_some()
-        }
+        Mode::Enforcing => snapshot
+            .matching_rule(&packet.connection, &identity)
+            .is_some(),
         Mode::Learning => {
             let selector = identity
                 .learned_selector()
@@ -272,16 +303,32 @@ fn decide_packet(
                 application: selector,
             };
             learned.validate()?;
-            let observation = LearningObservation {
-                flow_generation: snapshot.flow_generation,
-                endpoint: learned,
-            };
-            match learning.try_send(observation) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => bail!("bounded learning queue is full"),
-                Err(TrySendError::Disconnected(_)) => {
-                    bail!("application-learning worker is unavailable")
+            let admission = engine
+                .lock()
+                .map_err(|_| anyhow!("policy engine mutex is poisoned during learning admission"))?
+                .application_learning_queue_admission(
+                    snapshot.mode,
+                    snapshot.flow_generation,
+                    &learned,
+                )
+                .map_err(|error| anyhow!(error.message))?;
+            match admission {
+                LearningQueueAdmission::Enqueue => {
+                    let observation = LearningObservation {
+                        flow_generation: snapshot.flow_generation,
+                        endpoint: learned,
+                    };
+                    match learning.try_send(observation) {
+                        Ok(()) => true,
+                        Err(TrySendError::Full(_)) => bail!("bounded learning queue is full"),
+                        Err(TrySendError::Disconnected(_)) => {
+                            bail!("application-learning worker is unavailable")
+                        }
+                    }
                 }
+                LearningQueueAdmission::AlreadyKnown
+                | LearningQueueAdmission::Saturated
+                | LearningQueueAdmission::PersistencePaused => true,
             }
         }
     };
@@ -289,6 +336,7 @@ fn decide_packet(
     Ok(PacketAuthorization {
         mode: snapshot.mode,
         flow_generation: snapshot.flow_generation,
+        packet_mark: packet.packet_mark,
     })
 }
 
@@ -303,17 +351,7 @@ fn learning_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
-        let generation = first.flow_generation;
-        let mut endpoints = vec![first.endpoint];
-        while endpoints.len() < LEARNING_BATCH_SIZE {
-            match receiver.try_recv() {
-                Ok(observation) if observation.flow_generation == generation => {
-                    endpoints.push(observation.endpoint);
-                }
-                Ok(_stale) => {}
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
-        }
+        let (generation, endpoints) = collect_learning_batch(first, receiver);
         let result = engine
             .lock()
             .map_err(|_| anyhow!("policy engine mutex is poisoned during application learning"))
@@ -335,6 +373,31 @@ fn learning_loop(
     }
 }
 
+fn collect_learning_batch(
+    first: LearningObservation,
+    receiver: &Receiver<LearningObservation>,
+) -> (u32, Vec<LearnedApplicationEndpoint>) {
+    let generation = first.flow_generation;
+    let mut known = HashSet::with_capacity(LEARNING_BATCH_SIZE);
+    known.insert(first.endpoint.clone());
+    let mut endpoints = vec![first.endpoint];
+    let mut drained = 1_usize;
+    while drained < LEARNING_BATCH_SIZE {
+        match receiver.try_recv() {
+            Ok(observation) => {
+                drained += 1;
+                if observation.flow_generation == generation
+                    && known.insert(observation.endpoint.clone())
+                {
+                    endpoints.push(observation.endpoint);
+                }
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    (generation, endpoints)
+}
+
 fn quarantine_engine(engine: &SharedEngine) {
     if let Ok(mut engine) = engine.lock() {
         engine.quarantine_after_runtime_failure();
@@ -351,6 +414,7 @@ struct LearningObservation {
 struct PacketAuthorization {
     mode: Mode,
     flow_generation: u32,
+    packet_mark: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -639,7 +703,13 @@ impl QueueSocket {
         let socket = socket(
             AddressFamily::Netlink,
             SockType::Raw,
-            SockFlag::SOCK_CLOEXEC,
+            // Verdict delivery happens while the policy-engine guard is held
+            // so a restrictive policy reload cannot race packet reinjection.
+            // A blocking netlink send would therefore let kernel-buffer
+            // pressure freeze all control operations.  Fail closed on EAGAIN
+            // instead: the caller quarantines the engine and closing the
+            // queue causes outstanding packets to be denied.
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
             SockProtocol::NetlinkNetFilter,
         )
         .context("cannot create NETLINK_NETFILTER socket")?;
@@ -722,7 +792,7 @@ impl QueueSocket {
             );
             let size = match recv(self.socket.as_raw_fd(), &mut buffer, MsgFlags::MSG_TRUNC) {
                 Ok(size) => size,
-                Err(Errno::EINTR | Errno::ENOBUFS) => continue,
+                Err(Errno::EINTR | Errno::EAGAIN | Errno::ENOBUFS) => continue,
                 Err(error) => {
                     return Err(error)
                         .context("cannot receive NFQUEUE configuration acknowledgement");
@@ -770,7 +840,7 @@ impl QueueSocket {
         let mut descriptor = [PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
         let ready = match poll(&mut descriptor, RECEIVE_POLL_MILLIS) {
             Ok(ready) => ready,
-            Err(Errno::EINTR) => return Ok(QueueReceive::Idle),
+            Err(Errno::EINTR | Errno::EAGAIN) => return Ok(QueueReceive::Idle),
             Err(error) => return Err(error).context("cannot poll NFQUEUE socket"),
         };
         if ready == 0 {
@@ -795,8 +865,16 @@ impl QueueSocket {
     }
 
     fn verdict(&mut self, packet_id: u32, verdict: u32) -> Result<()> {
+        self.send_verdict(packet_id, verdict, None)
+    }
+
+    fn verdict_with_mark(&mut self, packet_id: u32, verdict: u32, mark: u32) -> Result<()> {
+        self.send_verdict(packet_id, verdict, Some(mark))
+    }
+
+    fn send_verdict(&mut self, packet_id: u32, verdict: u32, mark: Option<u32>) -> Result<()> {
         let sequence = self.next_sequence();
-        let message = build_verdict_message(sequence, self.queue_number, packet_id, verdict)?;
+        let message = build_verdict_message(sequence, self.queue_number, packet_id, verdict, mark)?;
         let sent = sendto(
             self.socket.as_raw_fd(),
             &message,
@@ -827,18 +905,34 @@ fn build_verdict_message(
     queue_number: u16,
     packet_id: u32,
     verdict: u32,
+    mark: Option<u32>,
 ) -> Result<Vec<u8>> {
     let mut verdict_header = Vec::with_capacity(8);
     verdict_header.extend_from_slice(&verdict.to_be_bytes());
     verdict_header.extend_from_slice(&packet_id.to_be_bytes());
-    build_message(
-        queue_message_type(NFQNL_MSG_VERDICT),
-        NLM_F_REQUEST,
-        sequence,
-        NFNETLINK_FAMILY_UNSPEC,
-        queue_number,
-        &[(NFQA_VERDICT_HDR, verdict_header.as_slice())],
-    )
+    if let Some(mark) = mark {
+        let mark = mark.to_be_bytes();
+        build_message(
+            queue_message_type(NFQNL_MSG_VERDICT),
+            NLM_F_REQUEST,
+            sequence,
+            NFNETLINK_FAMILY_UNSPEC,
+            queue_number,
+            &[
+                (NFQA_VERDICT_HDR, verdict_header.as_slice()),
+                (NFQA_MARK, mark.as_slice()),
+            ],
+        )
+    } else {
+        build_message(
+            queue_message_type(NFQNL_MSG_VERDICT),
+            NLM_F_REQUEST,
+            sequence,
+            NFNETLINK_FAMILY_UNSPEC,
+            queue_number,
+            &[(NFQA_VERDICT_HDR, verdict_header.as_slice())],
+        )
+    }
 }
 
 impl Drop for QueueSocket {
@@ -947,6 +1041,11 @@ impl<'a> Iterator for NetlinkMessages<'a> {
         };
         let aligned = match align4(length) {
             Ok(aligned) if aligned <= remaining.len() => aligned,
+            // Netlink alignment is required between multipart messages, but
+            // the kernel may omit the final message's trailing padding from a
+            // datagram. Accept only an exact terminal boundary; one or more
+            // stray/truncated padding bytes still fail closed below.
+            Ok(_) if length == remaining.len() => length,
             _ => {
                 self.offset = self.bytes.len();
                 return Some(Err(anyhow!("netlink message alignment is invalid")));
@@ -1005,6 +1104,9 @@ impl<'a> Iterator for Attributes<'a> {
         }
         let aligned = match align4(length) {
             Ok(aligned) if aligned <= remaining.len() => aligned,
+            // As with the containing netlink message, a final attribute may
+            // end exactly at the datagram boundary without its alignment pad.
+            Ok(_) if length == remaining.len() => length,
             _ => {
                 self.offset = self.bytes.len();
                 return Some(Err(anyhow!("netlink attribute alignment is invalid")));
@@ -1062,7 +1164,73 @@ impl ErrorThrottle {
 mod tests {
     use std::error::Error;
 
+    use openshield_core::{ApplicationPath, ApplicationSelector, ExecutableFileId, PortRange};
+
     use super::*;
+
+    fn learning_observation(generation: u32, address_offset: u32) -> Result<LearningObservation> {
+        Ok(LearningObservation {
+            flow_generation: generation,
+            endpoint: LearnedApplicationEndpoint {
+                endpoint: LearnedEndpoint {
+                    address: std::net::Ipv4Addr::from(0x0a00_0001_u32 + address_offset).into(),
+                    protocol: TransportProtocol::Tcp,
+                    port: Some(PortRange::single(443)?),
+                    interface: Some(InterfaceName::new("eth0")?),
+                },
+                application: ApplicationSelector::new(
+                    Some(ApplicationPath::new("/usr/bin/openshield-nfqueue-test")?),
+                    Some(ExecutableFileId {
+                        device: 8,
+                        inode: 42,
+                        size: 1_024,
+                        ctime_seconds: 1_700_000_000,
+                        ctime_nanoseconds: 0,
+                    }),
+                    None,
+                    Some(1_000),
+                    None,
+                )?,
+            },
+        })
+    }
+
+    #[test]
+    fn learning_batch_coalesces_duplicates_and_discards_stale_generations()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+        let first = learning_observation(7, 1)?;
+        sender.try_send(first.clone())?;
+        sender.try_send(learning_observation(7, 2)?)?;
+        sender.try_send(learning_observation(8, 3)?)?;
+
+        let (generation, endpoints) = collect_learning_batch(first, &receiver);
+        assert_eq!(generation, 7);
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(
+            endpoints[0].endpoint.address,
+            "10.0.0.2".parse::<std::net::IpAddr>()?
+        );
+        assert_eq!(
+            endpoints[1].endpoint.address,
+            "10.0.0.3".parse::<std::net::IpAddr>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_storm_does_not_make_one_batch_drain_without_bound() -> Result<(), Box<dyn Error>> {
+        let (sender, receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
+        let first = learning_observation(7, 1)?;
+        for _ in 0..LEARNING_BATCH_SIZE {
+            sender.try_send(first.clone())?;
+        }
+
+        let (_generation, endpoints) = collect_learning_batch(first, &receiver);
+        assert_eq!(endpoints.len(), 1);
+        assert!(receiver.try_recv().is_ok());
+        Ok(())
+    }
 
     #[test]
     fn message_and_attribute_parsers_reject_truncation() {
@@ -1076,6 +1244,43 @@ mod tests {
                 .next()
                 .is_some_and(|item| item.is_err())
         );
+    }
+
+    #[test]
+    fn parsers_accept_only_exact_unpadded_terminal_items() -> Result<(), Box<dyn Error>> {
+        let mut message = vec![0_u8; NETLINK_HEADER_BYTES + 1];
+        let message_length = u32::try_from(message.len())?;
+        message[..4].copy_from_slice(&message_length.to_ne_bytes());
+        message[4..6].copy_from_slice(&7_u16.to_ne_bytes());
+        let parsed = NetlinkMessages::new(&message)
+            .next()
+            .ok_or("missing unpadded message")??;
+        assert_eq!(parsed.payload, &[0]);
+
+        message.push(0);
+        assert!(
+            NetlinkMessages::new(&message)
+                .next()
+                .is_some_and(|item| item.is_err())
+        );
+
+        let mut attribute = vec![0_u8; ATTRIBUTE_HEADER_BYTES + 1];
+        let attribute_length = u16::try_from(attribute.len())?;
+        attribute[..2].copy_from_slice(&attribute_length.to_ne_bytes());
+        attribute[2..4].copy_from_slice(&9_u16.to_ne_bytes());
+        let parsed = Attributes::new(&attribute)
+            .next()
+            .ok_or("missing unpadded attribute")??;
+        assert_eq!(parsed.kind, 9);
+        assert_eq!(parsed.payload, &[0]);
+
+        attribute.push(0);
+        assert!(
+            Attributes::new(&attribute)
+                .next()
+                .is_some_and(|item| item.is_err())
+        );
+        Ok(())
     }
 
     #[test]
@@ -1172,10 +1377,9 @@ mod tests {
     }
 
     #[test]
-    fn accept_and_drop_verdicts_do_not_trigger_mark_based_rerouting() -> Result<(), Box<dyn Error>>
-    {
+    fn nft_accept_and_drop_verdicts_do_not_carry_a_mark() -> Result<(), Box<dyn Error>> {
         for verdict in [NF_DROP, NF_ACCEPT] {
-            let message = build_verdict_message(1, APPLICATION_QUEUE_NUMBER, 7, verdict)?;
+            let message = build_verdict_message(1, APPLICATION_QUEUE_NUMBER, 7, verdict, None)?;
             let netlink = NetlinkMessages::new(&message)
                 .next()
                 .ok_or("missing verdict message")??;
@@ -1194,6 +1398,29 @@ mod tests {
                 .transpose()?;
             assert_eq!(mark, None);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn iptables_repeat_verdict_carries_the_handoff_mark() -> Result<(), Box<dyn Error>> {
+        let mark = application_handoff_mark(0x0012_3456);
+        let message = build_verdict_message(1, APPLICATION_QUEUE_NUMBER, 7, NF_REPEAT, Some(mark))?;
+        let netlink = NetlinkMessages::new(&message)
+            .next()
+            .ok_or("missing verdict message")??;
+        let attributes =
+            Attributes::new(&netlink.payload[NFGENMSG_BYTES..]).collect::<Result<Vec<_>>>()?;
+        let header = attributes
+            .iter()
+            .find(|attribute| attribute.kind == NFQA_VERDICT_HDR)
+            .ok_or("missing verdict header")?;
+        assert_eq!(network_u32(&header.payload[..4])?, NF_REPEAT);
+        assert_eq!(network_u32(&header.payload[4..])?, 7);
+        let returned_mark = attributes
+            .iter()
+            .find(|attribute| attribute.kind == NFQA_MARK)
+            .ok_or("missing verdict mark")?;
+        assert_eq!(network_u32(returned_mark.payload)?, mark);
         Ok(())
     }
 

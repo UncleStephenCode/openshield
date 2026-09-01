@@ -441,6 +441,9 @@ mod tests {
             Some(ExecutableFileId {
                 device: 1,
                 inode: 1,
+                size: 1,
+                ctime_seconds: 1,
+                ctime_nanoseconds: 1,
             }),
             Some(CommandLineSelector::new(
                 CommandLineMatch::Exact,

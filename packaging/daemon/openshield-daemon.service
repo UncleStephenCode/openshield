@@ -1,7 +1,8 @@
 [Unit]
-Description=OpenShield nftables firewall daemon
+Description=OpenShield host firewall daemon
 Documentation=https://github.com/UncleStephenCode/openshield
-After=local-fs.target
+After=local-fs.target systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
 Before=network-pre.target
 Wants=network-pre.target
 
@@ -12,6 +13,10 @@ User=root
 Group=root
 ExecStartPre=/usr/bin/openshield-daemon --install-fail-closed
 ExecStart=/usr/bin/openshield-daemon
+# The daemon performs the same non-persistent quarantine during graceful
+# shutdown. This is the backup for crashes and forced termination; it runs only
+# after the main process released the singleton lock.
+ExecStopPost=/usr/bin/openshield-daemon --install-fail-closed
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
@@ -45,10 +50,14 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-ReadWritePaths=/run/openshield /var/lib/openshield
+# openshield.conf pre-creates the last path as root:root 0600. Keeping the
+# standard lock lets old and new xtables processes serialize with each other.
+ReadWritePaths=/run/openshield /var/lib/openshield /run/xtables.lock
 
-# Runtime attack-surface reduction. AF_NETLINK is required by nft(8).
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# Runtime attack-surface reduction. nft/NFQUEUE use AF_NETLINK; the legacy
+# iptables fallback probes and updates IPv4/IPv6 filter tables through the
+# corresponding socket families.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

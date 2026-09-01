@@ -15,6 +15,7 @@ pub const COUNTER_ACCEPTED_OUT: &str = "accepted_out";
 pub const COUNTER_DROPPED_IN: &str = "dropped_in";
 pub const COUNTER_DROPPED_OUT: &str = "dropped_out";
 pub const COUNTER_LEARNED_OUT: &str = "learned_out";
+pub const NFT_OWNERSHIP_COUNTER: &str = "openshield_owner_v1";
 pub const APPLICATION_QUEUE_NUMBER: u16 = 1_337;
 const APPLICATION_MARK_GENERATION_MASK: u32 = MAX_FLOW_GENERATION;
 const APPLICATION_MARK_DOMAIN_MASK: u32 = 0xc000_0000;
@@ -22,11 +23,33 @@ const APPLICATION_MARK_PAYLOAD_MASK: u32 = 0x3fff_ffff;
 const APPLICATION_PENDING_DOMAIN: u32 = 0x8000_0000;
 const APPLICATION_HANDOFF_DOMAIN: u32 = 0xc000_0000;
 const APPLICATION_FLOW_DOMAIN: u32 = 0x4000_0000;
+// OpenShield owns the low 31 connmark bits. Keep bit 31 available to an
+// existing host firewall and mask it out of every generation comparison.
+const APPLICATION_CONNMARK_MASK: u32 = 0x7fff_ffff;
+const APPLICATION_CONNMARK_FOREIGN_MASK: u32 = 0x8000_0000;
+
+const APPLICATION_REPLY_PROTOCOL_MATCHES: [&str; 4] = [
+    "meta l4proto tcp",
+    "meta l4proto udp",
+    "meta nfproto ipv4 meta l4proto icmp",
+    "meta nfproto ipv6 meta l4proto icmpv6",
+];
+const APPLICATION_NON_TCP_PROTOCOL_MATCHES: [&str; 3] = [
+    "meta l4proto udp",
+    "meta nfproto ipv4 meta l4proto icmp",
+    "meta nfproto ipv6 meta l4proto icmpv6",
+];
 
 /// Adds the private pending domain while retaining the unreserved packet-mark bits.
 #[must_use]
 pub const fn application_pending_mark(packet_mark: u32) -> u32 {
     APPLICATION_PENDING_DOMAIN | (packet_mark & APPLICATION_MARK_PAYLOAD_MASK)
+}
+
+/// Adds the private post-NFQUEUE handoff domain while retaining unreserved bits.
+#[must_use]
+pub const fn application_handoff_mark(packet_mark: u32) -> u32 {
+    APPLICATION_HANDOFF_DOMAIN | (packet_mark & APPLICATION_MARK_PAYLOAD_MASK)
 }
 
 /// Conntrack mark that binds both directions of an authorized application flow.
@@ -95,24 +118,32 @@ impl NftablesCompiler {
         // observation can enforce one exact structure. In BlockAll, the
         // earlier output chain drops every packet before this chain.
         append_application_authorization_chain(&mut script, snapshot);
-        append_forward_chain(&mut script);
+        append_forward_chain(&mut script, snapshot.mode);
         script.push_str("}\n");
 
         Ok(NftablesPolicy { script })
     }
 }
 
-fn append_forward_chain(script: &mut String) {
-    // Forwarded packets are not covered by input/output hooks. Keep forwarding
-    // fail-closed in every mode until an explicit, separately authenticated
-    // forwarding-rule API exists.
+fn append_forward_chain(script: &mut String, mode: Mode) {
+    // BlockAll covers forwarded traffic as well as host traffic. Other modes
+    // leave forwarding to the existing host firewall until OpenShield exposes
+    // an explicit forwarding-rule API. An nft `accept` verdict remains subject
+    // to later base chains on the same hook.
     script.push_str(
-        "  chain forward {\n    type filter hook forward priority filter; policy drop;\n    counter drop\n  }\n",
+        "  chain forward {\n    type filter hook forward priority filter; policy drop;\n",
     );
+    if mode == Mode::BlockAll {
+        script.push_str("    counter drop\n");
+    } else {
+        script.push_str("    accept\n");
+    }
+    script.push_str("  }\n");
 }
 
 fn append_named_counters(script: &mut String) {
     for name in [
+        NFT_OWNERSHIP_COUNTER,
         COUNTER_ACCEPTED_IN,
         COUNTER_ACCEPTED_OUT,
         COUNTER_DROPPED_IN,
@@ -148,6 +179,9 @@ fn append_chain(script: &mut String, snapshot: &Snapshot, direction: Direction) 
 
         if application_interception_required(snapshot) {
             append_application_flow_accept(script, snapshot, direction, accepted_counter);
+            if direction == Direction::Outbound {
+                append_application_non_tcp_connmark_reset(script);
+            }
         }
 
         let mut direct_rules: Vec<&Rule> = snapshot
@@ -208,25 +242,44 @@ fn append_application_flow_accept(
     direction: Direction,
     accepted_counter: &str,
 ) {
-    script.push_str("    ct direction ");
-    match direction {
-        Direction::Inbound => script.push_str("reply ct state established "),
-        Direction::Outbound => script.push_str("original ct state established "),
-    }
     // A UDP/ICMP conntrack tuple can outlive its owning socket and then be
-    // reused by another process. Never let that new process inherit a cached
-    // application decision. Established TCP has kernel-enforced connection
-    // lifecycle semantics suitable for this fast path.
-    script.push_str("meta l4proto tcp ");
-    script.push_str("ct mark 0x");
-    append_hex_u32(script, application_flow_mark(snapshot.flow_generation));
-    if direction == Direction::Outbound {
-        script.push(' ');
-        append_packet_mark_domain_set(script, APPLICATION_HANDOFF_DOMAIN);
+    // reused by another process. Outbound caching is consequently TCP-only;
+    // inbound replies may use the generation mark for the explicit protocol
+    // allowlist because every new non-TCP original packet clears and refreshes
+    // that mark after successful attribution.
+    let protocol_matches: &[&str] = match direction {
+        Direction::Inbound => &APPLICATION_REPLY_PROTOCOL_MATCHES,
+        Direction::Outbound => &APPLICATION_REPLY_PROTOCOL_MATCHES[..1],
+    };
+    for protocol_match in protocol_matches {
+        script.push_str("    ct direction ");
+        match direction {
+            Direction::Inbound => script.push_str("reply ct state established "),
+            Direction::Outbound => script.push_str("original ct state established "),
+        }
+        script.push_str(protocol_match);
+        script.push_str(" ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_MASK);
+        script.push_str(" == 0x");
+        append_hex_u32(script, application_flow_mark(snapshot.flow_generation));
+        if direction == Direction::Outbound {
+            script.push(' ');
+            append_packet_mark_domain_set(script, APPLICATION_HANDOFF_DOMAIN);
+        }
+        script.push_str(" counter name ");
+        script.push_str(accepted_counter);
+        script.push_str(" accept\n");
     }
-    script.push_str(" counter name ");
-    script.push_str(accepted_counter);
-    script.push_str(" accept\n");
+}
+
+fn append_application_non_tcp_connmark_reset(script: &mut String) {
+    for protocol_match in APPLICATION_NON_TCP_PROTOCOL_MATCHES {
+        script.push_str("    ct direction original ");
+        script.push_str(protocol_match);
+        script.push_str(" ct mark set ct mark & 0x");
+        append_hex_u32(script, APPLICATION_CONNMARK_FOREIGN_MASK);
+        script.push('\n');
+    }
 }
 
 fn append_application_queue(script: &mut String) {
@@ -274,40 +327,32 @@ fn append_application_authorization_chain(script: &mut String, snapshot: &Snapsh
         "  chain output_authorize {\n    type filter hook output priority 1; policy drop;\n",
     );
     if application_interception_required(snapshot) && snapshot.mode != Mode::BlockAll {
-        // Only TCP decisions are cached in conntrack. UDP and ICMP socket
-        // tuples can be reused while the old conntrack entry is alive, so
-        // every such packet must be attributed again and any stale mark is
-        // explicitly removed. Their replies therefore need an independent
-        // inbound allow rule.
-        script.push_str("    meta l4proto tcp meta mark & 0x");
-        append_hex_u32(script, APPLICATION_MARK_DOMAIN_MASK);
-        script.push_str(" == 0x");
-        append_hex_u32(script, APPLICATION_PENDING_DOMAIN);
-        script.push_str(" ct mark set 0x");
-        append_hex_u32(script, flow);
-        script.push_str(" meta mark set meta mark & 0x");
-        append_hex_u32(script, APPLICATION_MARK_PAYLOAD_MASK);
-        if snapshot.mode == Mode::Learning {
+        // All attributable protocols receive the current generation so a
+        // reply can be recognized. Only TCP uses that mark as an outbound
+        // cache; UDP/ICMP clear it before every original packet and are queued
+        // again. Restricting this branch to the parser's explicit allowlist
+        // makes an accidental NF_ACCEPT for another protocol fail closed.
+        for protocol_match in APPLICATION_REPLY_PROTOCOL_MATCHES {
+            script.push_str("    ");
+            script.push_str(protocol_match);
+            script.push_str(" meta mark & 0x");
+            append_hex_u32(script, APPLICATION_MARK_DOMAIN_MASK);
+            script.push_str(" == 0x");
+            append_hex_u32(script, APPLICATION_PENDING_DOMAIN);
+            script.push_str(" ct mark set (ct mark & 0x");
+            append_hex_u32(script, APPLICATION_CONNMARK_FOREIGN_MASK);
+            script.push_str(") | 0x");
+            append_hex_u32(script, flow);
+            script.push_str(" meta mark set meta mark & 0x");
+            append_hex_u32(script, APPLICATION_MARK_PAYLOAD_MASK);
+            if snapshot.mode == Mode::Learning {
+                script.push_str(" counter name ");
+                script.push_str(COUNTER_LEARNED_OUT);
+            }
             script.push_str(" counter name ");
-            script.push_str(COUNTER_LEARNED_OUT);
+            script.push_str(COUNTER_ACCEPTED_OUT);
+            script.push_str(" accept\n");
         }
-        script.push_str(" counter name ");
-        script.push_str(COUNTER_ACCEPTED_OUT);
-        script.push_str(" accept\n");
-
-        script.push_str("    meta mark & 0x");
-        append_hex_u32(script, APPLICATION_MARK_DOMAIN_MASK);
-        script.push_str(" == 0x");
-        append_hex_u32(script, APPLICATION_PENDING_DOMAIN);
-        script.push_str(" ct mark set 0x00000000 meta mark set meta mark & 0x");
-        append_hex_u32(script, APPLICATION_MARK_PAYLOAD_MASK);
-        if snapshot.mode == Mode::Learning {
-            script.push_str(" counter name ");
-            script.push_str(COUNTER_LEARNED_OUT);
-        }
-        script.push_str(" counter name ");
-        script.push_str(COUNTER_ACCEPTED_OUT);
-        script.push_str(" accept\n");
     }
     if snapshot.mode != Mode::BlockAll {
         script.push_str("    meta mark & 0x");
@@ -450,6 +495,30 @@ mod tests {
         Ok(())
     }
 
+    fn add_udp_rule(
+        state: &mut State,
+        direction: Direction,
+        network: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .ok_or("invalid test time")?;
+        let id = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002")?;
+        let spec = RuleSpec::new(
+            RuleName::new("dns")?,
+            direction,
+            TransportProtocol::Udp,
+            Some(network.parse()?),
+            Some(PortRange::single(53)?),
+            Some(InterfaceName::new("eth0")?),
+            RuleOrigin::Manual,
+            true,
+        )?;
+        state.create_rule_at(id, spec, now)?;
+        Ok(())
+    }
+
     #[test]
     fn block_all_has_no_accept_path_even_with_rules() -> Result<(), Box<dyn Error>> {
         let mut state = State::new();
@@ -464,6 +533,7 @@ mod tests {
         assert!(!policy.as_str().contains(" accept\n"));
         assert!(policy.as_str().contains("policy drop"));
         for counter in [
+            NFT_OWNERSHIP_COUNTER,
             COUNTER_ACCEPTED_IN,
             COUNTER_ACCEPTED_OUT,
             COUNTER_DROPPED_IN,
@@ -478,6 +548,22 @@ mod tests {
             "chain forward {\n    type filter hook forward priority filter; policy drop;"
         ));
         assert!(!policy.as_str().contains(LEARNED_TCP_V4_SET));
+        Ok(())
+    }
+
+    #[test]
+    fn non_block_modes_leave_forwarding_to_other_base_chains() -> Result<(), Box<dyn Error>> {
+        for mode in [Mode::Learning, Mode::Enforcing] {
+            let mut state = State::new();
+            state.set_mode(mode)?;
+            let script = NftablesCompiler::compile(&state.snapshot())?.into_string();
+            assert!(script.contains(
+                "chain forward {\n    type filter hook forward priority filter; policy drop;\n    accept\n  }"
+            ));
+            assert!(!script.contains(
+                "chain forward {\n    type filter hook forward priority filter; policy drop;\n    counter drop"
+            ));
+        }
         Ok(())
     }
 
@@ -500,6 +586,9 @@ mod tests {
         assert!(!script.contains("ct state established,related counter name"));
         assert!(script.contains(
             "oifname \"eth0\" ip daddr 203.0.113.0/24 meta l4proto tcp tcp dport 443 meta mark set (meta mark & 0x3fffffff) | 0xc0000000 counter name accepted_out accept"
+        ));
+        assert!(script.contains(
+            "chain forward {\n    type filter hook forward priority filter; policy drop;\n    accept\n  }"
         ));
         Ok(())
     }
@@ -547,15 +636,26 @@ mod tests {
         ));
         assert!(!script.contains("queue flags bypass"));
         assert!(script.contains(&format!(
-            "meta l4proto tcp meta mark & 0xc0000000 == 0x80000000 ct mark set 0x{flow} meta mark set meta mark & 0x3fffffff counter name learned_out counter name accepted_out accept"
+            "meta l4proto tcp meta mark & 0xc0000000 == 0x80000000 ct mark set (ct mark & 0x80000000) | 0x{flow} meta mark set meta mark & 0x3fffffff counter name learned_out counter name accepted_out accept"
         )));
         assert!(script.contains(&format!(
-            "ct direction reply ct state established meta l4proto tcp ct mark 0x{flow} counter name accepted_in accept"
+            "ct direction reply ct state established meta l4proto tcp ct mark & 0x7fffffff == 0x{flow} counter name accepted_in accept"
         )));
-        assert!(script.contains(
-            "meta mark & 0xc0000000 == 0x80000000 ct mark set 0x00000000 meta mark set meta mark & 0x3fffffff counter name learned_out counter name accepted_out accept"
-        ));
-        assert!(!script.contains("ct state established meta l4proto udp ct mark"));
+        assert!(
+            script.contains(
+                "ct direction original meta l4proto udp ct mark set ct mark & 0x80000000"
+            )
+        );
+        assert!(script.contains(&format!(
+            "ct direction reply ct state established meta l4proto udp ct mark & 0x7fffffff == 0x{flow} counter name accepted_in accept"
+        )));
+        assert!(script.contains(&format!(
+            "meta l4proto udp meta mark & 0xc0000000 == 0x80000000 ct mark set (ct mark & 0x80000000) | 0x{flow}"
+        )));
+        assert!(
+            !script.contains("ct direction original ct state established meta l4proto udp ct mark")
+        );
+        assert!(!script.contains("\n    meta mark & 0xc0000000 == 0x80000000 ct mark set"));
         assert!(script.contains(
             "chain output_sanitize {\n    type filter hook output priority -1; policy accept;"
         ));
@@ -568,6 +668,43 @@ mod tests {
             "chain output_authorize {\n    type filter hook output priority 1; policy drop;"
         ));
         assert!(!script.contains("set learned_"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_tcp_application_reply_allowlist_is_explicit_and_refreshed_before_direct_rules()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        add_udp_rule(&mut state, Direction::Outbound, "192.0.2.53/32")?;
+        let snapshot = state.snapshot();
+        let flow = format!("{:08x}", application_flow_mark(snapshot.flow_generation));
+        let script = NftablesCompiler::compile(&snapshot)?.into_string();
+
+        for protocol_match in APPLICATION_REPLY_PROTOCOL_MATCHES {
+            assert!(script.contains(&format!(
+                "ct direction reply ct state established {protocol_match} ct mark & 0x7fffffff == 0x{flow} counter name accepted_in accept"
+            )));
+        }
+        for protocol_match in APPLICATION_NON_TCP_PROTOCOL_MATCHES {
+            assert!(script.contains(&format!(
+                "ct direction original {protocol_match} ct mark set ct mark & 0x80000000"
+            )));
+        }
+
+        let reset = script
+            .find("ct direction original meta l4proto udp ct mark set ct mark & 0x80000000")
+            .ok_or("missing UDP connmark reset")?;
+        let direct = script
+            .find("oifname \"eth0\" ip daddr 192.0.2.53/32 meta l4proto udp udp dport 53")
+            .ok_or("missing direct UDP rule")?;
+        let queue = script
+            .find("queue num 1337")
+            .ok_or("missing application queue")?;
+        assert!(reset < direct);
+        assert!(reset < queue);
+        assert!(!script.contains("ct direction original ct state established meta l4proto udp"));
+        assert!(!script.contains("meta l4proto sctp ct mark & 0x7fffffff"));
         Ok(())
     }
 

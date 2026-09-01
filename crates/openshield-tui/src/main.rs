@@ -51,7 +51,7 @@ fn terminal_safe(value: &str) -> String {
         .chars()
         .take(MAX_FATAL_ERROR_CHARS)
         .map(|character| {
-            if character.is_control() {
+            if i18n::is_unsafe_dynamic_character(character) {
                 ' '
             } else {
                 character
@@ -70,7 +70,7 @@ fn run() -> Result<()> {
     let paths = SocketPaths::fixed();
 
     let read_only = !geteuid().is_root();
-    let observer = Observer::start(&paths);
+    let observer = Observer::start(&paths, &i18n);
     let mut app = App::new(read_only, i18n.clone());
     let mut terminal = TerminalSession::enter()
         .with_context(|| i18n.tr("main.terminal_init_failed").to_owned())?;
@@ -200,7 +200,7 @@ fn control_failure_presentation(
         _ => ControlFailurePresentation {
             title: i18n.tr("control.unconfirmed_title").to_owned(),
             body: {
-                let error = error.to_string();
+                let error = error.localized(i18n);
                 i18n.format("control.unconfirmed_body", &[("error", error.as_str())])
             },
             request_resync: true,
@@ -213,7 +213,7 @@ fn request_resync_notice(observer: &Observer, i18n: &I18n) -> String {
         |error| {
             i18n.format(
                 "control.resync_failed",
-                &[("error", error.to_string().as_str())],
+                &[("error", error.localized(i18n).as_str())],
             )
         },
         |()| i18n.tr("control.resync_scheduled").to_owned(),
@@ -427,5 +427,13 @@ mod tests {
         assert!(presentation.body.contains("may have been applied"));
         assert!(presentation.body.contains("Do not retry"));
         assert_eq!(presentation.title, " Result not confirmed ");
+    }
+
+    #[test]
+    fn fatal_stderr_text_removes_terminal_and_bidi_controls() {
+        assert_eq!(
+            terminal_safe("safe\u{1b}[31m\u{202e}tail"),
+            "safe [31m tail"
+        );
     }
 }

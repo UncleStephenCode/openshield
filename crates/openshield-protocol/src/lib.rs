@@ -17,8 +17,13 @@ pub const MAX_RULES_PER_PAGE: u16 = 128;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 pub const OBSERVE_SOCKET_PATH: &str = "/run/openshield/observe.sock";
 pub const CONTROL_SOCKET_PATH: &str = "/run/openshield/control.sock";
+pub const OBSERVE_GROUP_NAME: &str = "openshield";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keeping the stable unboxed control-request API avoids protocol-wide churn"
+)]
 #[serde(
     deny_unknown_fields,
     rename_all = "snake_case",
@@ -468,6 +473,9 @@ mod tests {
             Some(ExecutableFileId {
                 device: u64::MAX,
                 inode: u64::MAX,
+                size: u64::MAX,
+                ctime_seconds: i64::MAX,
+                ctime_nanoseconds: 999_999_999,
             }),
             Some(CommandLineSelector::new(
                 CommandLineMatch::Exact,

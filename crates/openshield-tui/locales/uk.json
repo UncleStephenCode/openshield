@@ -1,85 +1,185 @@
 {
-  "cli.about":"Безпечний термінальний інтерфейс OpenShield","main.terminal_required":"TUI потребує інтерактивного термінала","main.terminal_init_failed":"не вдалося ініціалізувати термінал","main.draw_failed":"не вдалося відобразити TUI","main.input_poll_failed":"помилка очікування вводу","main.input_read_failed":"помилка читання вводу","view.status":"Стан","view.rules":"Правила","view.events":"Події","view.help":"Довідка",
-  "common.unknown":"невідомий","common.any":"будь-який","common.yes":"так","common.no":"ні","common.manual":"ручне","common.learned":"навчання","common.learned_immutable":"навчання (походження незмінне)",
-  "status.policy":"Політика: ","status.telemetry":"Телеметрія: ","status.access":"Доступ: ","status.mode":"Режим: ","status.revision":"Ревізія політики: {revision}","status.rule_counts":"Правила: {rules}; активні вхідні дозволи: {inbound}","status.inbound_policy":"Вхідна політика: DROP за замовчуванням; пропускаються лише пакети, що відповідають активним дозвільним правилам.","status.age_unknown":"час оновлення невідомий","status.age":"оновлено {duration} тому","status.counters_title":"Останні лічильники nftables ({age}; пакети / байти):","status.counters_waiting":"Лічильники nftables: очікування першого оновлення…","status.observe_socket":"Спостереження: {path}","status.control_socket":"Керування: {path}","status.title":" Стан ",
-  "health.connecting":"з’єднання…","health.connected":"з’єднано","health.disconnected":"немає з’єднання ({reason})","health.telemetry_stale":"ДЕГРАДАЦІЯ: немає свіжих лічильників протягом {duration}","health.subscription_active":"підписка активна","health.subscription_waiting":"підписка активна, очікування лічильників…","health.telemetry_disconnected":"ДЕГРАДАЦІЯ: потік від’єднано ({reason})","access.read_only":"ЛИШЕ ЧИТАННЯ (зміни потребують root)","access.privileged":"ПРИВІЛЕЙОВАНЕ КЕРУВАННЯ",
-  "rules.column_enabled":"Увім.","rules.column_direction":"Напр.","rules.column_protocol":"Прот.","rules.column_peer":"Вузол/мережа","rules.column_port":"Порт","rules.column_interface":"Інтерфейс","rules.column_name":"Назва","rules.column_origin":"Походження","rules.title":" Дозвільні правила ","events.title":" Події (нові спочатку) ","events.title_dropped":" Події (нові спочатку; канал відкинув: {count}) ",
-  "help.navigation":"1/2/3/4   стан / правила / події / довідка","help.next_tab":"Tab       наступна вкладка","help.select_rule":"↑/↓       вибір правила","help.quit":"q         вихід","help.open_help":"?         довідка","help.control_title":"Керування (лише root):","help.select_mode":"m         вибрати режим","help.rule_actions":"n/e/d     створити / змінити / видалити правило","help.toggle_rule":"Space     увімкнути або вимкнути вибране правило","help.editor":"Редактор: Tab/Shift-Tab — поле; ←/→ — вибір; Enter — зберегти; Esc — скасувати.","help.unprivileged":"Непривілейований сеанс: команди змін навмисно вимкнено.","help.title":" Довідка ",
-  "footer.status":"m: режим   ?: довідка   q: вихід","footer.rules_read_only":"↑/↓: вибір   лише читання   ?: довідка   q: вихід","footer.rules":"n: створити   e: змінити   d: видалити   Space: увім/вимк","footer.events_live":"події наживо   q: вихід","footer.events_offline":"події наживо недоступні   q: вихід","footer.help":"q: вихід",
-  "overlay.mode_picker":" Вибір режиму ","overlay.block_all_title":" БЛОКУВАТИ ВСЕ ","overlay.block_all_body":"УВЕСЬ вхідний і вихідний IP-трафік буде заблоковано. Продовжити? [y/N]","overlay.delete_title":" Видалити правило ","overlay.delete_body":"Видалити «{name}»? [y/N]","editor.field_name":"Назва","editor.field_direction":"Напрямок","editor.field_protocol":"Протокол","editor.field_peer":"Віддалений вузол/CIDR","editor.field_port":"Порт/діапазон","editor.field_interface":"Інтерфейс","editor.field_enabled":"Увімкнено","editor.field_origin":"Походження","editor.help":"Правило дозволяє відповідний трафік; для вхідного правила виберіть вхідний напрямок. Інші вхідні пакети блокуються.","editor.edit_title":" Змінити правило ","editor.new_title":" Нове дозвільне правило ",
-  "mode.block_all":"блокувати все","mode.learning":"навчання","mode.enforcing":"застосування правил","direction.inbound":"вхід","direction.outbound":"вихід","duration.subsecond":"<1 с","duration.seconds":"{value} с","duration.minutes":"{value} хв","duration.hours":"{value} год"
-  ,"control.policy_changed_title":" Політику змінено "
-  ,"control.policy_changed_body":"Команду не застосовано й не буде повторено автоматично. Повторіть дію після оновлення стану.\n\n{message}"
-  ,"control.rejected_title":" Команду відхилено "
-  ,"control.rejected_body":"Демон підтвердив, що зміну не застосовано ({code}).\n\n{message}"
-  ,"control.unconfirmed_title":" Результат не підтверджено "
-  ,"control.unconfirmed_body":"Від демона не надійшла відповідь: команду могло бути застосовано до збою з’єднання. Не повторюйте її автоматично; дочекайтеся актуального знімка та перевірте результат.\n\n{error}"
-  ,"control.resync_failed":"\n\nНе вдалося надіслати запит на синхронізацію: {error}"
-  ,"control.resync_scheduled":"\n\nАктуальний знімок буде завантажено автоматично."
-  ,"control.applied":"Команду застосовано, ревізія політики {revision}"
-  ,"control.applied_rule":"Команду застосовано до «{rule}», ревізія політики {revision}"
-  ,"validation.name_empty":"Назва правила не може бути порожньою"
-  ,"validation.icmp_port":"Для ICMP не можна вказувати порт"
-  ,"validation.invalid_interface":"Неприпустимий інтерфейс: {error}"
-  ,"validation.invalid_name":"Неприпустима назва: {error}"
-  ,"validation.invalid_rule":"Неприпустиме правило: {error}"
-  ,"validation.invalid_peer":"Неприпустима IP-адреса або CIDR: {error}"
-  ,"validation.port_missing":"Порт не вказано"
-  ,"validation.port_number":"Порт має бути числом від 1 до 65535"
-  ,"validation.port_end_number":"Кінець діапазону має бути числом"
-  ,"validation.port_format":"Формат порту: 443 або 8000-8100"
-  ,"validation.invalid_port_range":"Неприпустимий діапазон портів: {error}"
-  ,"notice.daemon_restarted":"Виявлено перезапуск демона; стан перезавантажено, а незавершені зміни скасовано"
-  ,"notice.connection_lost":"З’єднання втрачено; незавершену зміну скасовано"
-  ,"notice.revisions_skipped":"Пропущено ревізії {first}..{last}; стан буде оновлено зі знімка"
-  ,"notice.wait_snapshot":"Спочатку дочекайтеся актуального знімка політики"
-  ,"notice.base_revision_missing":"Зміну скасовано: базова ревізія політики недоступна"
-  ,"notice.no_rule_selected":"Жодного правила не вибрано"
-  ,"notice.read_only":"Режим лише читання: зміни доступні тільки root через control.sock"
-  ,"status.counter_accepted_in":"прийнято на вході"
-  ,"status.counter_accepted_out":"прийнято на виході"
-  ,"status.counter_dropped_in":"відкинуто на вході"
-  ,"status.counter_dropped_out":"відкинуто на виході"
-  ,"status.counter_learned_out":"навчено на виході"
-  ,"event.mode_changed":"режим: {previous} → {current}"
-  ,"event.rule_created":"створено правило «{rule}»"
-  ,"event.rule_updated":"оновлено правило «{rule}»"
-  ,"event.rule_deleted":"видалено правило «{rule}»"
-  ,"event.rule_enabled":"правило «{rule}»: {state}"
-  ,"event.enabled":"увімкнено"
-  ,"event.disabled":"вимкнено"
-  ,"event.counters":"лічильники: вхід +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; вихід +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; навчено {learned_packets}/{learned_bytes}B"
-  ,"editor.field_application":"Зіставлення із застосунком"
-  ,"editor.field_executable":"Шлях до виконуваного файлу"
-  ,"editor.field_device":"Ідентифікатор пристрою"
-  ,"editor.field_inode":"Індексний дескриптор (inode)"
-  ,"editor.field_command_mode":"Зіставлення командного рядка"
-  ,"editor.field_arguments":"Аргументи (масив JSON)"
-  ,"editor.field_uid":"Ідентифікатор користувача (UID)"
-  ,"editor.field_cgroup":"Контрольна група (cgroup)"
-  ,"editor.command_any":"Будь-які аргументи"
-  ,"editor.command_exact":"Точний збіг аргументів"
-  ,"editor.command_prefix":"Префікс аргументів"
-  ,"editor.application_help":"Зіставлення із застосунком доступне лише для вихідних правил. Шлях до виконуваного файлу обов’язковий; пристрій та inode слід указувати разом."
-  ,"rules.column_application":"Застосунок"
-  ,"rules.network_only":"лише мережа"
-  ,"rules.application_redacted":"дані застосунку приховано"
-  ,"rules.details_title":" Відомості про застосунок "
-  ,"rules.details_executable":"Виконуваний файл"
-  ,"rules.details_file_id":"пристрій {device}, inode {inode}"
-  ,"rules.details_command":"Командний рядок"
-  ,"rules.details_uid":"Ідентифікатор користувача (UID)"
-  ,"rules.details_cgroup":"Контрольна група (cgroup)"
-  ,"validation.application_outbound":"Зіставлення із застосунком доступне лише для вихідних правил"
-  ,"validation.executable_required":"Для зіставлення із застосунком необхідно вказати шлях до виконуваного файлу"
-  ,"validation.file_id_pair":"Пристрій та inode слід указувати разом"
-  ,"validation.invalid_device":"Ідентифікатор пристрою має бути невід’ємним цілим числом"
-  ,"validation.invalid_inode":"Індексний дескриптор (inode) має бути додатним цілим числом"
-  ,"validation.arguments_unused":"У режимі будь-яких аргументів поле аргументів має бути порожнім"
-  ,"validation.arguments_json":"Аргументи мають бути масивом JSON"
-  ,"validation.arguments_strings":"Кожен аргумент має бути рядком"
-  ,"validation.invalid_executable":"Неприпустимий шлях до виконуваного файлу: {error}"
-  ,"validation.invalid_arguments":"Неприпустимі аргументи командного рядка: {error}"
-  ,"validation.invalid_uid":"Ідентифікатор користувача має бути невід’ємним цілим числом"
-  ,"validation.invalid_cgroup":"Неприпустима контрольна група: {error}"
+  "cli.about": "Безпечний термінальний інтерфейс OpenShield",
+  "main.terminal_required": "TUI потребує інтерактивного термінала",
+  "main.terminal_init_failed": "не вдалося ініціалізувати термінал",
+  "main.draw_failed": "не вдалося відобразити TUI",
+  "main.input_poll_failed": "помилка очікування вводу",
+  "main.input_read_failed": "помилка читання вводу",
+  "view.status": "Стан",
+  "view.rules": "Правила",
+  "view.events": "Події",
+  "view.help": "Довідка",
+  "common.unknown": "невідомий",
+  "common.any": "будь-який",
+  "common.yes": "так",
+  "common.no": "ні",
+  "common.manual": "ручне",
+  "common.learned": "навчання",
+  "common.learned_immutable": "навчання (походження незмінне)",
+  "status.policy": "Політика: ",
+  "status.telemetry": "Телеметрія: ",
+  "status.access": "Доступ: ",
+  "status.mode": "Режим: ",
+  "status.revision": "Ревізія політики: {revision}",
+  "status.rule_counts": "Правила: {rules}; активні вхідні дозволи: {inbound}",
+  "status.inbound_policy": "Вхідна політика: DROP за замовчуванням; пропускаються лише пакети, що відповідають активним дозвільним правилам.",
+  "status.age_unknown": "час оновлення невідомий",
+  "status.age": "оновлено {duration} тому",
+  "status.counters_title": "Останні лічильники міжмережевого екрана ({age}; пакети / байти):",
+  "status.counters_waiting": "Лічильники міжмережевого екрана: очікування першого оновлення…",
+  "status.observe_socket": "Спостереження: {path}",
+  "status.control_socket": "Керування: {path}",
+  "status.title": " Стан ",
+  "health.connecting": "з’єднання…",
+  "health.connected": "з’єднано",
+  "health.disconnected": "немає з’єднання ({reason})",
+  "health.telemetry_stale": "ДЕГРАДАЦІЯ: немає свіжих лічильників протягом {duration}",
+  "health.subscription_active": "підписка активна",
+  "health.subscription_waiting": "підписка активна, очікування лічильників…",
+  "health.telemetry_disconnected": "ДЕГРАДАЦІЯ: потік від’єднано ({reason})",
+  "access.read_only": "ЛИШЕ ЧИТАННЯ (зміни потребують root)",
+  "access.privileged": "ПРИВІЛЕЙОВАНЕ КЕРУВАННЯ",
+  "rules.column_enabled": "Увім.",
+  "rules.column_direction": "Напр.",
+  "rules.column_protocol": "Прот.",
+  "rules.column_peer": "Вузол/мережа",
+  "rules.column_port": "Порт",
+  "rules.column_interface": "Інтерфейс",
+  "rules.column_name": "Назва",
+  "rules.column_origin": "Походження",
+  "rules.title": " Дозвільні правила ",
+  "events.title": " Події (нові спочатку) ",
+  "events.title_dropped": " Події (нові спочатку; канал відкинув: {count}) ",
+  "help.navigation": "1/2/3/4   стан / правила / події / довідка",
+  "help.next_tab": "Tab       наступна вкладка",
+  "help.select_rule": "↑/↓       вибір правила",
+  "help.quit": "q         вихід",
+  "help.open_help": "?         довідка",
+  "help.control_title": "Керування (лише root):",
+  "help.select_mode": "m         вибрати режим",
+  "help.rule_actions": "n/e/d     створити / змінити / видалити правило",
+  "help.toggle_rule": "Space     увімкнути або вимкнути вибране правило",
+  "help.editor": "Редактор: Tab/Shift-Tab — поле; ←/→ — вибір; Enter — зберегти; Esc — скасувати.",
+  "help.unprivileged": "Спостереження доступне лише root або членам групи openshield; команди змін потребують root.",
+  "help.title": " Довідка ",
+  "footer.status": "m: режим   ?: довідка   q: вихід",
+  "footer.rules_read_only": "↑/↓: вибір   лише читання   ?: довідка   q: вихід",
+  "footer.rules": "n: створити   e: змінити   d: видалити   Space: увім/вимк",
+  "footer.events_live": "події наживо   q: вихід",
+  "footer.events_offline": "події наживо недоступні   q: вихід",
+  "footer.help": "q: вихід",
+  "overlay.mode_picker": " Вибір режиму ",
+  "overlay.block_all_title": " БЛОКУВАТИ ВСЕ ",
+  "overlay.block_all_body": "УВЕСЬ вхідний і вихідний IP-трафік буде заблоковано. Продовжити? [y/N]",
+  "overlay.delete_title": " Видалити правило ",
+  "overlay.delete_body": "Видалити «{name}»? [y/N]",
+  "editor.field_name": "Назва",
+  "editor.field_direction": "Напрямок",
+  "editor.field_protocol": "Протокол",
+  "editor.field_peer": "Віддалений вузол/CIDR",
+  "editor.field_port": "Порт/діапазон",
+  "editor.field_interface": "Інтерфейс",
+  "editor.field_enabled": "Увімкнено",
+  "editor.field_origin": "Походження",
+  "editor.help": "Правило дозволяє відповідний трафік; для вхідного правила виберіть вхідний напрямок. Інші вхідні пакети блокуються.",
+  "editor.edit_title": " Змінити правило ",
+  "editor.new_title": " Нове дозвільне правило ",
+  "mode.block_all": "блокувати все",
+  "mode.learning": "навчання",
+  "mode.enforcing": "застосування правил",
+  "direction.inbound": "вхід",
+  "direction.outbound": "вихід",
+  "duration.subsecond": "<1 с",
+  "duration.seconds": "{value} с",
+  "duration.minutes": "{value} хв",
+  "duration.hours": "{value} год",
+  "control.policy_changed_title": " Політику змінено ",
+  "control.policy_changed_body": "Команду не застосовано й не буде повторено автоматично. Повторіть дію після оновлення стану.\n\n{message}",
+  "control.rejected_title": " Команду відхилено ",
+  "control.rejected_body": "Демон підтвердив, що зміну не застосовано ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Результат не підтверджено ",
+  "control.unconfirmed_body": "Від демона не надійшла відповідь: команду могло бути застосовано до збою з’єднання. Не повторюйте її автоматично; дочекайтеся актуального знімка та перевірте результат.\n\n{error}",
+  "control.resync_failed": "\n\nНе вдалося надіслати запит на синхронізацію: {error}",
+  "control.resync_scheduled": "\n\nАктуальний знімок буде завантажено автоматично.",
+  "control.applied": "Команду застосовано, ревізія політики {revision}",
+  "control.applied_rule": "Команду застосовано до «{rule}», ревізія політики {revision}",
+  "validation.name_empty": "Назва правила не може бути порожньою",
+  "validation.icmp_port": "Для ICMP не можна вказувати порт",
+  "validation.invalid_interface": "Неприпустимий інтерфейс: {error}",
+  "validation.invalid_name": "Неприпустима назва: {error}",
+  "validation.invalid_rule": "Неприпустиме правило: {error}",
+  "validation.invalid_peer": "Неприпустима IP-адреса або CIDR: {error}",
+  "validation.port_missing": "Порт не вказано",
+  "validation.port_number": "Порт має бути числом від 1 до 65535",
+  "validation.port_end_number": "Кінець діапазону має бути числом",
+  "validation.port_format": "Формат порту: 443 або 8000-8100",
+  "validation.invalid_port_range": "Неприпустимий діапазон портів: {error}",
+  "notice.daemon_restarted": "Виявлено перезапуск демона; стан перезавантажено, а незавершені зміни скасовано",
+  "notice.connection_lost": "З’єднання втрачено; незавершену зміну скасовано",
+  "notice.revisions_skipped": "Пропущено ревізії {first}..{last}; стан буде оновлено зі знімка",
+  "notice.wait_snapshot": "Спочатку дочекайтеся актуального знімка політики",
+  "notice.base_revision_missing": "Зміну скасовано: базова ревізія політики недоступна",
+  "notice.no_rule_selected": "Жодного правила не вибрано",
+  "notice.read_only": "Режим лише читання: зміни доступні тільки root через control.sock",
+  "status.counter_accepted_in": "прийнято на вході",
+  "status.counter_accepted_out": "прийнято на виході",
+  "status.counter_dropped_in": "відкинуто на вході",
+  "status.counter_dropped_out": "відкинуто на виході",
+  "status.counter_learned_out": "навчено на виході",
+  "event.mode_changed": "режим: {previous} → {current}",
+  "event.rule_created": "створено правило «{rule}»",
+  "event.rule_updated": "оновлено правило «{rule}»",
+  "event.rule_deleted": "видалено правило «{rule}»",
+  "event.rule_enabled": "правило «{rule}»: {state}",
+  "event.enabled": "увімкнено",
+  "event.disabled": "вимкнено",
+  "event.counters": "лічильники: вхід +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; вихід +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; навчено {learned_packets}/{learned_bytes}B",
+  "editor.field_application": "Зіставлення із застосунком",
+  "editor.field_executable": "Шлях до виконуваного файлу",
+  "editor.field_command_mode": "Зіставлення командного рядка",
+  "editor.field_arguments": "Аргументи (масив JSON)",
+  "editor.field_uid": "Ідентифікатор користувача (UID)",
+  "editor.field_cgroup": "Контрольна група (cgroup)",
+  "editor.command_any": "Будь-які аргументи",
+  "editor.command_exact": "Точний збіг аргументів",
+  "editor.command_prefix": "Префікс аргументів",
+  "editor.application_help": "Зіставлення із застосунком доступне лише для вихідних правил. Шлях до виконуваного файла обов’язковий. Демон автоматично фіксує версію файла; редагування відхиляється, якщо раніше зафіксована версія вже змінилася.",
+  "rules.column_application": "Застосунок",
+  "rules.network_only": "лише мережа",
+  "rules.application_redacted": "дані застосунку приховано",
+  "rules.details_title": " Відомості про застосунок ",
+  "rules.details_executable": "Виконуваний файл",
+  "rules.details_file_id": "пристрій {device}, inode {inode}",
+  "rules.details_command": "Командний рядок",
+  "rules.details_uid": "Ідентифікатор користувача (UID)",
+  "rules.details_cgroup": "Контрольна група (cgroup)",
+  "validation.application_outbound": "Зіставлення із застосунком доступне лише для вихідних правил",
+  "validation.executable_required": "Для зіставлення із застосунком необхідно вказати шлях до виконуваного файлу",
+  "validation.arguments_unused": "У режимі будь-яких аргументів поле аргументів має бути порожнім",
+  "validation.arguments_json": "Аргументи мають бути масивом JSON",
+  "validation.arguments_strings": "Кожен аргумент має бути рядком",
+  "validation.invalid_executable": "Неприпустимий шлях до виконуваного файлу: {error}",
+  "validation.invalid_arguments": "Неприпустимі аргументи командного рядка: {error}",
+  "validation.invalid_uid": "Ідентифікатор користувача має бути невід’ємним цілим числом",
+  "validation.invalid_cgroup": "Неприпустима контрольна група: {error}",
+  "ipc.connect_error": "Не вдалося підключитися до IPC-сокета {path}: {error}",
+  "ipc.control_root_required": "Для керуючих запитів потрібен ефективний UID 0 (root)",
+  "ipc.coordinator_unavailable": "Координатор ревизій спостерігача недоступний",
+  "ipc.daemon_rejected": "Демон відхилив запит ({code}): {message}",
+  "ipc.generation_exhausted": "Лічильник поколінь спостерігача вичерпано",
+  "ipc.inconsistent_pages": "Політика змінилася під час читання сторінок правил; повторне читання",
+  "ipc.inspect_error": "Не вдалося перевірити шлях IPC {path}: {error}",
+  "ipc.invalid_snapshot": "Демон повернув недійсний знімок політики: {error}",
+  "ipc.local_groups_error": "Не вдалося прочитати додаткові групи поточного процесу: {error}",
+  "ipc.not_observer_group_member": "Спостереження вимагає root або членства в групі openshield",
+  "ipc.observer_group_error": "Не вдалося визначити обов'язкову групу спостерігача openshield: {error}",
+  "ipc.peer_credentials_error": "Не вдалося прочитати облікові дані демона на IPC-сокеті: {error}",
+  "ipc.protocol_error": "Помилка протоколу IPC: {error}",
+  "ipc.rule_count_mismatch": "Демон оголосив {advertised} правил, але повернув {received}",
+  "ipc.socket_path_changed": "Шлях IPC-сокета змінився під час підключення: {path}",
+  "ipc.timeout_error": "Не вдалося налаштувати тайм-аут IPC: {error}",
+  "ipc.unexpected_response": "Несподівана відповідь демона: {error}",
+  "ipc.untrusted_directory": "Недовірений батьківський каталог IPC: {path}",
+  "ipc.untrusted_peer": "UID {uid} однорангової сторони IPC не належить привілейованому демону",
+  "ipc.untrusted_socket": "Шлях IPC не є Unix-сокетом, що належить root: {path}"
 }

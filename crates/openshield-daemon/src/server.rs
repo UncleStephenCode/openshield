@@ -17,7 +17,7 @@ use openshield_protocol::{
 use tracing::{debug, error, warn};
 
 use crate::engine::{Engine, EventBus, SharedEngine, SubscribeError};
-use crate::socket::{SocketSet, authorize_control_peer, peer_uid};
+use crate::socket::{SocketSet, authorize_control_peer, authorize_observe_peer};
 
 const MAX_CONTROL_CLIENTS: usize = 16;
 // Observation uses a fixed worker pool: unprivileged connection churn can no
@@ -31,6 +31,10 @@ const MAX_OBSERVE_SUBSCRIBERS: usize = 24;
 const MAX_OBSERVE_SUBSCRIBERS_PER_UID: usize = 2;
 const OBSERVE_RATE_BURST: u32 = 256;
 const OBSERVE_RATE_PER_SECOND: u32 = 64;
+const OBSERVE_GLOBAL_RATE_BURST: u32 = 512;
+const OBSERVE_GLOBAL_RATE_PER_SECOND: u32 = 64;
+const MAX_OBSERVE_RULE_PAGE_BUILDS: usize = 4;
+const MAX_OBSERVE_RULE_PAGE_BUILDS_PER_UID: usize = 1;
 const MAX_TRACKED_OBSERVER_UIDS: usize = 1_024;
 const OBSERVER_RATE_ENTRY_IDLE: Duration = Duration::from_secs(60);
 const ACCEPT_BATCH: usize = 8;
@@ -66,6 +70,7 @@ pub fn serve(
 
     let control_clients = ClientLimiter::new(MAX_CONTROL_CLIENTS);
     let observe_admission = ObserverAdmission::production();
+    let observer_gid = sockets.observer_gid();
     let (observe_sender, observe_workers) = spawn_observe_workers(engine, events, shutdown)?;
 
     let control_thread = {
@@ -97,6 +102,7 @@ pub fn serve(
                     &accept_shutdown,
                     &observe_sender,
                     &admission,
+                    observer_gid,
                 );
             }) {
             Ok(handle) => handle,
@@ -166,12 +172,13 @@ fn observe_accept_loop(
     shutdown: &Arc<AtomicBool>,
     sender: &SyncSender<ObserveJob>,
     admission: &ObserverAdmission,
+    observer_gid: u32,
 ) {
     accept_loop(listener, shutdown, OBSERVE_ACCEPT_THROTTLE, |stream| {
-        let uid = match peer_uid(&stream) {
+        let uid = match authorize_observe_peer(&stream, observer_gid) {
             Ok(uid) => uid,
             Err(error) => {
-                debug!(error = %format_args!("{error:#}"), "cannot authenticate observation peer");
+                debug!(error = %format_args!("{error:#}"), "observation peer is not authorized");
                 return;
             }
         };
@@ -416,25 +423,11 @@ fn handle_observe_client(
                     )?;
                     return Ok(());
                 }
-                let response = lock_engine(engine).map_or_else(Response::Error, |engine| {
-                    // A public client must not amplify lock/serialization work
-                    // by requesting one rule per page. The byte-fitting stage
-                    // below still shrinks responses that approach 64 KiB.
-                    engine.rules_page_response(after, MAX_RULES_PER_PAGE)
-                });
-                let response = redact_rule_page(response, permit.uid != 0);
-                let response = fit_rule_page(response);
-                let next_after = match &response {
-                    Response::RulesPage { next_after, .. } => *next_after,
-                    Response::Error(_) => {
-                        write_response_with_deadline(&mut stream, &response)
-                            .context("cannot write rule-page error")?;
-                        return Ok(());
-                    }
-                    _ => return Err(anyhow!("rule-page fitting changed the response variant")),
+                let RulePageOutcome::Sent { next_after } =
+                    write_rule_page(&mut stream, engine, permit, after, permit.uid != 0)?
+                else {
+                    return Ok(());
                 };
-                write_response_with_deadline(&mut stream, &response)
-                    .context("cannot write rule page")?;
                 pages_started = true;
                 expected_after = next_after;
                 pages_finished = next_after.is_none();
@@ -476,6 +469,53 @@ fn handle_observe_client(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RulePageOutcome {
+    Sent { next_after: Option<uuid::Uuid> },
+    SessionFinished,
+}
+
+fn write_rule_page(
+    stream: &mut UnixStream,
+    engine: &SharedEngine,
+    observer: &ObserverPermit,
+    after: Option<uuid::Uuid>,
+    redact_sensitive: bool,
+) -> Result<RulePageOutcome> {
+    let Some(page_build_permit) = observer.try_acquire_rule_page_build() else {
+        write_error(
+            stream,
+            ErrorCode::Conflict,
+            "observation rule-page service is busy; retry later",
+        )?;
+        return Ok(RulePageOutcome::SessionFinished);
+    };
+    let response = {
+        let response = lock_engine(engine).map_or_else(Response::Error, |engine| {
+            // Ignore tiny client hints so a caller cannot amplify lock and
+            // serialization work into one request per rule.
+            engine.rules_page_response(after, MAX_RULES_PER_PAGE)
+        });
+        let response = redact_rule_page(response, redact_sensitive);
+        fit_rule_page(response)
+    };
+    // Slow readers must not occupy a page-build slot. RAII also releases the
+    // permit on every error or early-return path during response construction.
+    drop(page_build_permit);
+
+    let next_after = match &response {
+        Response::RulesPage { next_after, .. } => *next_after,
+        Response::Error(_) => {
+            write_response_with_deadline(stream, &response)
+                .context("cannot write rule-page error")?;
+            return Ok(RulePageOutcome::SessionFinished);
+        }
+        _ => return Err(anyhow!("rule-page fitting changed the response variant")),
+    };
+    write_response_with_deadline(stream, &response).context("cannot write rule page")?;
+    Ok(RulePageOutcome::Sent { next_after })
+}
+
 fn read_observer_request(
     stream: &mut UnixStream,
     permit: &ObserverPermit,
@@ -504,7 +544,7 @@ fn read_observer_request(
         write_error(
             stream,
             ErrorCode::Conflict,
-            "per-UID observation request rate exceeded",
+            "observation request rate exceeded",
         )?;
         return Ok(None);
     }
@@ -821,6 +861,10 @@ struct ObserverLimits {
     maximum_subscriptions_per_uid: usize,
     rate_burst: u32,
     rate_per_second: u32,
+    global_rate_burst: u32,
+    global_rate_per_second: u32,
+    maximum_rule_page_builds: usize,
+    maximum_rule_page_builds_per_uid: usize,
     maximum_tracked_uids: usize,
     rate_entry_idle: Duration,
 }
@@ -833,38 +877,35 @@ impl ObserverLimits {
         maximum_subscriptions_per_uid: MAX_OBSERVE_SUBSCRIBERS_PER_UID,
         rate_burst: OBSERVE_RATE_BURST,
         rate_per_second: OBSERVE_RATE_PER_SECOND,
+        global_rate_burst: OBSERVE_GLOBAL_RATE_BURST,
+        global_rate_per_second: OBSERVE_GLOBAL_RATE_PER_SECOND,
+        maximum_rule_page_builds: MAX_OBSERVE_RULE_PAGE_BUILDS,
+        maximum_rule_page_builds_per_uid: MAX_OBSERVE_RULE_PAGE_BUILDS_PER_UID,
         maximum_tracked_uids: MAX_TRACKED_OBSERVER_UIDS,
         rate_entry_idle: OBSERVER_RATE_ENTRY_IDLE,
     };
 }
 
 #[derive(Debug)]
-struct ObserverUidState {
-    active_connections: usize,
-    active_subscriptions: usize,
+struct ObserverTokenBucket {
     tokens: f64,
     last_refill: Instant,
-    last_seen: Instant,
 }
 
-impl ObserverUidState {
+impl ObserverTokenBucket {
     fn new(now: Instant, burst: u32) -> Self {
         Self {
-            active_connections: 0,
-            active_subscriptions: 0,
             tokens: f64::from(burst),
             last_refill: now,
-            last_seen: now,
         }
     }
 
-    fn try_consume_token(&mut self, now: Instant, burst: u32, rate_per_second: u32) -> bool {
+    fn try_consume(&mut self, now: Instant, burst: u32, rate_per_second: u32) -> bool {
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
         self.tokens = (self.tokens + elapsed * f64::from(rate_per_second)).min(f64::from(burst));
         self.last_refill = now;
-        self.last_seen = now;
         if self.tokens < 1.0 {
             return false;
         }
@@ -873,18 +914,46 @@ impl ObserverUidState {
     }
 }
 
+#[derive(Debug)]
+struct ObserverUidState {
+    active_connections: usize,
+    active_subscriptions: usize,
+    active_rule_page_builds: usize,
+    rate: ObserverTokenBucket,
+    last_seen: Instant,
+}
+
+impl ObserverUidState {
+    fn new(now: Instant, burst: u32) -> Self {
+        Self {
+            active_connections: 0,
+            active_subscriptions: 0,
+            active_rule_page_builds: 0,
+            rate: ObserverTokenBucket::new(now, burst),
+            last_seen: now,
+        }
+    }
+
+    fn try_consume_token(&mut self, now: Instant, burst: u32, rate_per_second: u32) -> bool {
+        self.last_seen = now;
+        self.rate.try_consume(now, burst, rate_per_second)
+    }
+}
+
 #[derive(Debug, Default)]
 struct ObserverAdmissionState {
     active_connections: usize,
     active_subscriptions: usize,
+    active_rule_page_builds: usize,
+    global_rate: Option<ObserverTokenBucket>,
     users: BTreeMap<u32, ObserverUidState>,
 }
 
-/// Admission control for the world-readable observation socket.
+/// Admission control for the group-restricted observation socket.
 ///
 /// Credentials come from `SO_PEERCRED`; callers cannot choose the UID carried
-/// by an accepted Unix socket. Limits are deliberately per UID, so one local
-/// account cannot consume every observation worker or subscription slot.
+/// by an accepted Unix socket. Per-UID limits prevent one account from taking
+/// every slot, while aggregate page and rate limits bound the whole group.
 #[derive(Clone, Debug)]
 struct ObserverAdmission {
     inner: Arc<Mutex<ObserverAdmissionState>>,
@@ -919,6 +988,7 @@ impl ObserverAdmission {
             state.users.retain(|_tracked_uid, user| {
                 user.active_connections != 0
                     || user.active_subscriptions != 0
+                    || user.active_rule_page_builds != 0
                     || now.saturating_duration_since(user.last_seen) < idle
             });
             if state.users.len() >= self.limits.maximum_tracked_uids {
@@ -926,19 +996,25 @@ impl ObserverAdmission {
             }
         }
 
-        let user = state
-            .users
-            .entry(uid)
-            .or_insert_with(|| ObserverUidState::new(now, self.limits.rate_burst));
-        if !user.try_consume_token(now, self.limits.rate_burst, self.limits.rate_per_second) {
+        {
+            let user = state
+                .users
+                .entry(uid)
+                .or_insert_with(|| ObserverUidState::new(now, self.limits.rate_burst));
+            if !user.try_consume_token(now, self.limits.rate_burst, self.limits.rate_per_second) {
+                return None;
+            }
+            // Consume a per-UID token even if this UID already holds its
+            // concurrency quota. Overflow attempts cannot preserve a fresh
+            // private burst, but they also cannot drain the shared bucket.
+            if user.active_connections >= self.limits.maximum_connections_per_uid {
+                return None;
+            }
+        }
+        if !Self::try_consume_global_token(&mut state, now, self.limits) {
             return None;
         }
-        // Consume a token even if this UID already holds its concurrency
-        // quota. Repeated overflow attempts cannot preserve a fresh burst for
-        // the instant an existing request completes.
-        if user.active_connections >= self.limits.maximum_connections_per_uid {
-            return None;
-        }
+        let user = state.users.get_mut(&uid)?;
         user.active_connections += 1;
         state.active_connections += 1;
         Some(ObserverPermit {
@@ -970,13 +1046,47 @@ impl ObserverAdmission {
         let Ok(mut state) = self.inner.lock() else {
             return false;
         };
-        let Some(user) = state.users.get_mut(&uid) else {
-            return false;
-        };
-        if user.active_connections == 0 {
-            return false;
+        {
+            let Some(user) = state.users.get_mut(&uid) else {
+                return false;
+            };
+            if user.active_connections == 0
+                || !user.try_consume_token(now, self.limits.rate_burst, self.limits.rate_per_second)
+            {
+                return false;
+            }
         }
-        user.try_consume_token(now, self.limits.rate_burst, self.limits.rate_per_second)
+        Self::try_consume_global_token(&mut state, now, self.limits)
+    }
+
+    fn try_consume_global_token(
+        state: &mut ObserverAdmissionState,
+        now: Instant,
+        limits: ObserverLimits,
+    ) -> bool {
+        state
+            .global_rate
+            .get_or_insert_with(|| ObserverTokenBucket::new(now, limits.global_rate_burst))
+            .try_consume(now, limits.global_rate_burst, limits.global_rate_per_second)
+    }
+
+    fn try_acquire_rule_page_build(&self, uid: u32) -> Option<ObserverRulePagePermit> {
+        let mut state = self.inner.lock().ok()?;
+        if state.active_rule_page_builds >= self.limits.maximum_rule_page_builds {
+            return None;
+        }
+        let user = state.users.get_mut(&uid)?;
+        if user.active_connections == 0
+            || user.active_rule_page_builds >= self.limits.maximum_rule_page_builds_per_uid
+        {
+            return None;
+        }
+        user.active_rule_page_builds += 1;
+        state.active_rule_page_builds += 1;
+        Some(ObserverRulePagePermit {
+            admission: self.clone(),
+            uid,
+        })
     }
 
     fn release_connection(&self, uid: u32) {
@@ -1001,11 +1111,31 @@ impl ObserverAdmission {
         state.active_subscriptions = state.active_subscriptions.saturating_sub(1);
     }
 
+    fn release_rule_page_build(&self, uid: u32) {
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        let Some(user) = state.users.get_mut(&uid) else {
+            return;
+        };
+        user.active_rule_page_builds = user.active_rule_page_builds.saturating_sub(1);
+        state.active_rule_page_builds = state.active_rule_page_builds.saturating_sub(1);
+    }
+
     fn active(&self) -> usize {
         self.inner
             .lock()
             .map_or(self.limits.maximum_connections, |state| {
                 state.active_connections
+            })
+    }
+
+    #[cfg(test)]
+    fn active_rule_page_builds(&self) -> usize {
+        self.inner
+            .lock()
+            .map_or(self.limits.maximum_rule_page_builds, |state| {
+                state.active_rule_page_builds
             })
     }
 }
@@ -1030,6 +1160,10 @@ impl ObserverPermit {
     fn try_acquire_subscription(&self) -> Option<ObserverSubscriptionPermit> {
         self.admission.try_acquire_subscription(self.uid)
     }
+
+    fn try_acquire_rule_page_build(&self) -> Option<ObserverRulePagePermit> {
+        self.admission.try_acquire_rule_page_build(self.uid)
+    }
 }
 
 impl Drop for ObserverPermit {
@@ -1047,6 +1181,18 @@ struct ObserverSubscriptionPermit {
 impl Drop for ObserverSubscriptionPermit {
     fn drop(&mut self) {
         self.admission.release_subscription(self.uid);
+    }
+}
+
+#[derive(Debug)]
+struct ObserverRulePagePermit {
+    admission: ObserverAdmission,
+    uid: u32,
+}
+
+impl Drop for ObserverRulePagePermit {
+    fn drop(&mut self) {
+        self.admission.release_rule_page_build(self.uid);
     }
 }
 
@@ -1131,13 +1277,17 @@ mod tests {
             maximum_subscriptions_per_uid: 1,
             rate_burst: 8,
             rate_per_second: 2,
+            global_rate_burst: 64,
+            global_rate_per_second: 16,
+            maximum_rule_page_builds: 4,
+            maximum_rule_page_builds_per_uid: 1,
             maximum_tracked_uids: 8,
             rate_entry_idle: Duration::from_secs(10),
         }
     }
 
     #[test]
-    fn public_observer_pages_remove_all_application_metadata() -> Result<()> {
+    fn non_root_observer_pages_remove_all_learned_application_metadata() -> Result<()> {
         let mut specification = RuleSpec::new(
             RuleName::new("secret curl rule")?,
             Direction::Outbound,
@@ -1145,7 +1295,7 @@ mod tests {
             Some("203.0.113.7/32".parse()?),
             None,
             None,
-            RuleOrigin::Manual,
+            RuleOrigin::Learned,
             true,
         )?;
         specification.application = Some(ApplicationSelector::new(
@@ -1153,6 +1303,9 @@ mod tests {
             Some(ExecutableFileId {
                 device: 123_456,
                 inode: 654_321,
+                size: 777_333,
+                ctime_seconds: 1_654_321_987,
+                ctime_nanoseconds: 987_654_321,
             }),
             Some(CommandLineSelector::new(
                 CommandLineMatch::Exact,
@@ -1177,6 +1330,9 @@ mod tests {
             "42424",
             "123456",
             "654321",
+            "777333",
+            "1654321987",
+            "987654321",
         ] {
             assert!(!encoded.contains(secret));
         }
@@ -1202,6 +1358,9 @@ mod tests {
             Some(ExecutableFileId {
                 device: 1,
                 inode: 2,
+                size: 3,
+                ctime_seconds: 4,
+                ctime_nanoseconds: 5,
             }),
             None,
             Some(1_000),
@@ -1337,6 +1496,78 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_rule_page_build_quota_returns_busy_conflict() -> Result<()> {
+        let temporary = tempdir()?;
+        let store = AtomicStateStore::for_owner(
+            temporary.path().join("busy-observer.json"),
+            geteuid().as_raw(),
+        );
+        let events = EventBus::new();
+        let engine = Arc::new(Mutex::new(Engine::load(
+            Box::new(MemoryBackend::default()),
+            Box::new(store),
+            events.clone(),
+        )?));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let limits = ObserverLimits {
+            maximum_rule_page_builds: 1,
+            ..test_observer_limits()
+        };
+        let admission = ObserverAdmission::with_limits(limits);
+        let now = Instant::now();
+        let holder = admission
+            .try_acquire_at(1_000, now)
+            .ok_or_else(|| anyhow!("page-slot holder was unexpectedly denied"))?;
+        let held_page = holder
+            .try_acquire_rule_page_build()
+            .ok_or_else(|| anyhow!("page slot could not be reserved"))?;
+        let client_permit = admission
+            .try_acquire_at(1_001, now)
+            .ok_or_else(|| anyhow!("test client was unexpectedly denied"))?;
+        let (server_stream, mut client_stream) = UnixStream::pair()?;
+        let server_engine = Arc::clone(&engine);
+        let server_events = events.clone();
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            handle_observe_client(
+                server_stream,
+                &server_engine,
+                &server_events,
+                &server_shutdown,
+                &client_permit,
+            )
+        });
+
+        write_request(&mut client_stream, &Request::Read(ReadRequest::Status))?;
+        assert!(matches!(
+            read_response(&mut client_stream)?,
+            Response::Status { .. }
+        ));
+        write_request(
+            &mut client_stream,
+            &Request::Read(ReadRequest::RulesPage {
+                after: None,
+                limit: MAX_RULES_PER_PAGE,
+            }),
+        )?;
+        assert!(matches!(
+            read_response(&mut client_stream)?,
+            Response::Error(ProtocolError {
+                code: ErrorCode::Conflict,
+                message,
+            }) if message.contains("busy")
+        ));
+        server
+            .join()
+            .map_err(|_| anyhow!("busy observation session thread panicked"))??;
+        assert_eq!(admission.active_rule_page_builds(), 1);
+        drop((held_page, holder));
+        assert_eq!(admission.active_rule_page_builds(), 0);
+        assert_eq!(admission.active(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn client_limit_is_atomic_and_releases_on_drop() {
         let limiter = ClientLimiter::new(1);
         let permit = limiter.try_acquire();
@@ -1366,6 +1597,65 @@ mod tests {
         assert_eq!(admission.active(), 3);
         drop((first, second, other));
         assert_eq!(admission.active(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rule_page_build_admission_is_global_per_uid_and_raii_released() -> Result<()> {
+        let admission = ObserverAdmission::with_limits(test_observer_limits());
+        let now = Instant::now();
+        let connections = (1_000..=1_004)
+            .map(|uid| {
+                admission
+                    .try_acquire_at(uid, now)
+                    .ok_or_else(|| anyhow!("connection for uid {uid} was unexpectedly denied"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let first = connections[0]
+            .try_acquire_rule_page_build()
+            .ok_or_else(|| anyhow!("first page build was unexpectedly denied"))?;
+        assert!(connections[0].try_acquire_rule_page_build().is_none());
+        let second = connections[1]
+            .try_acquire_rule_page_build()
+            .ok_or_else(|| anyhow!("second page build was unexpectedly denied"))?;
+        let third = connections[2]
+            .try_acquire_rule_page_build()
+            .ok_or_else(|| anyhow!("third page build was unexpectedly denied"))?;
+        let fourth = connections[3]
+            .try_acquire_rule_page_build()
+            .ok_or_else(|| anyhow!("fourth page build was unexpectedly denied"))?;
+        assert_eq!(admission.active_rule_page_builds(), 4);
+        assert!(connections[4].try_acquire_rule_page_build().is_none());
+
+        drop(second);
+        let replacement = connections[4]
+            .try_acquire_rule_page_build()
+            .ok_or_else(|| anyhow!("released global page slot was not reusable"))?;
+        assert_eq!(admission.active_rule_page_builds(), 4);
+        drop((first, third, fourth, replacement));
+        assert_eq!(admission.active_rule_page_builds(), 0);
+        drop(connections);
+        assert_eq!(admission.active(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rule_page_build_permit_releases_on_early_error_return() -> Result<()> {
+        let admission = ObserverAdmission::with_limits(test_observer_limits());
+        let connection = admission
+            .try_acquire_at(1_000, Instant::now())
+            .ok_or_else(|| anyhow!("connection was unexpectedly denied"))?;
+
+        let simulated_build: Result<()> = (|| {
+            let _page = connection
+                .try_acquire_rule_page_build()
+                .ok_or_else(|| anyhow!("page build was unexpectedly denied"))?;
+            Err(anyhow!("simulated page-build failure"))
+        })();
+        assert!(simulated_build.is_err());
+        assert_eq!(admission.active_rule_page_builds(), 0);
+        assert!(connection.try_acquire_rule_page_build().is_some());
         Ok(())
     }
 
@@ -1484,6 +1774,54 @@ mod tests {
             .ok_or_else(|| anyhow!("token bucket did not refill deterministically"))?;
         drop(refilled);
         Ok(())
+    }
+
+    #[test]
+    fn global_observer_token_bucket_bounds_distinct_uids() -> Result<()> {
+        let limits = ObserverLimits {
+            maximum_connections_per_uid: 1,
+            rate_burst: 8,
+            rate_per_second: 8,
+            global_rate_burst: 2,
+            global_rate_per_second: 1,
+            ..test_observer_limits()
+        };
+        let admission = ObserverAdmission::with_limits(limits);
+        let started = Instant::now();
+
+        let first = admission
+            .try_acquire_at(1_000, started)
+            .ok_or_else(|| anyhow!("first global burst token was unexpectedly denied"))?;
+        let second = admission
+            .try_acquire_at(1_001, started)
+            .ok_or_else(|| anyhow!("second global burst token was unexpectedly denied"))?;
+        drop((first, second));
+        assert!(
+            admission
+                .try_acquire_at(1_002, started + Duration::from_millis(999))
+                .is_none()
+        );
+        let refilled = admission
+            .try_acquire_at(1_002, started + Duration::from_secs(1))
+            .ok_or_else(|| anyhow!("global token bucket did not refill deterministically"))?;
+        drop(refilled);
+        Ok(())
+    }
+
+    #[test]
+    fn production_bursts_allow_a_complete_ten_thousand_rule_snapshot() {
+        let page_size = usize::from(MAX_RULES_PER_PAGE);
+        let page_requests = MAX_RULES.saturating_add(page_size - 1) / page_size;
+        // One connection admission, one Status request, then every rule page.
+        let initial_snapshot_work = page_requests + 2;
+        assert!(
+            usize::try_from(OBSERVE_RATE_BURST)
+                .is_ok_and(|burst| { burst >= initial_snapshot_work })
+        );
+        assert!(
+            usize::try_from(OBSERVE_GLOBAL_RATE_BURST)
+                .is_ok_and(|burst| { burst >= initial_snapshot_work })
+        );
     }
 
     #[test]

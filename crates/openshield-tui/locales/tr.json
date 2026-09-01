@@ -1,83 +1,185 @@
 {
-  "cli.about":"OpenShield için güvenli terminal arayüzü","main.terminal_required":"TUI etkileşimli bir terminal gerektirir","main.terminal_init_failed":"terminal başlatılamadı","main.draw_failed":"TUI çizilemedi","main.input_poll_failed":"girdi beklenirken hata","main.input_read_failed":"girdi okunurken hata","view.status":"Durum","view.rules":"Kurallar","view.events":"Olaylar","view.help":"Yardım","common.unknown":"bilinmiyor","common.any":"herhangi","common.yes":"evet","common.no":"hayır","common.manual":"elle","common.learned":"öğrenme","common.learned_immutable":"öğrenme (köken değişmez)",
-  "status.policy":"Politika: ","status.telemetry":"Telemetri: ","status.access":"Erişim: ","status.mode":"Kip: ","status.revision":"Politika revizyonu: {revision}","status.rule_counts":"Kurallar: {rules}; etkin gelen izinler: {inbound}","status.inbound_policy":"Gelen politikası: varsayılan DROP; yalnızca etkin izin kurallarıyla eşleşen paketler geçer.","status.age_unknown":"yaş bilinmiyor","status.age":"yaş {duration}","status.counters_title":"Son nftables sayaçları ({age}; paket / bayt):","status.counters_waiting":"nftables sayaçları: ilk güncelleme bekleniyor…","status.observe_socket":"Gözlem: {path}","status.control_socket":"Denetim: {path}","status.title":" Durum ",
-  "health.connecting":"bağlanıyor…","health.connected":"bağlı","health.disconnected":"bağlantı kesildi ({reason})","health.telemetry_stale":"BOZULMUŞ: {duration} boyunca yeni sayaç yok","health.subscription_active":"abonelik etkin","health.subscription_waiting":"abonelik etkin, sayaçlar bekleniyor…","health.telemetry_disconnected":"BOZULMUŞ: akış kesildi ({reason})","access.read_only":"SALT OKUNUR (değişiklikler root gerektirir)","access.privileged":"AYRICALIKLI DENETİM",
-  "rules.column_enabled":"Açık","rules.column_direction":"Yön","rules.column_protocol":"Prot.","rules.column_peer":"Eş/ağ","rules.column_port":"Bağlantı noktası","rules.column_interface":"Arayüz","rules.column_name":"Ad","rules.column_origin":"Köken","rules.title":" İzin kuralları ","events.title":" Olaylar (en yeni önce) ","events.title_dropped":" Olaylar (en yeni önce; kanalın attığı: {count}) ",
-  "help.navigation":"1/2/3/4   durum / kurallar / olaylar / yardım","help.next_tab":"Tab       sonraki sekme","help.select_rule":"↑/↓       kural seç","help.quit":"q         çık","help.open_help":"?         yardım","help.control_title":"Denetim (yalnızca root):","help.select_mode":"m         kip seç","help.rule_actions":"n/e/d     kural oluştur / düzenle / sil","help.toggle_rule":"Space     seçili kuralı aç veya kapat","help.editor":"Düzenleyici: Tab/Shift-Tab — alan; ←/→ — seçim; Enter — kaydet; Esc — iptal.","help.unprivileged":"Ayrıcalıksız oturum: değişiklik komutları kapalıdır.","help.title":" Yardım ",
-  "footer.status":"m: kip   ?: yardım   q: çık","footer.rules_read_only":"↑/↓: seç   salt okunur   ?: yardım   q: çık","footer.rules":"n: oluştur   e: düzenle   d: sil   Space: aç/kapat","footer.events_live":"gerçek zamanlı olaylar   q: çık","footer.events_offline":"gerçek zamanlı olaylar kullanılamıyor   q: çık","footer.help":"q: çık","overlay.mode_picker":" Kip seç ","overlay.block_all_title":" TÜMÜNÜ ENGELLE ","overlay.block_all_body":"Gelen ve giden TÜM IP trafiği engellenecek. Devam? [y/N]","overlay.delete_title":" Kuralı sil ","overlay.delete_body":"“{name}” silinsin mi? [y/N]","editor.field_name":"Ad","editor.field_direction":"Yön","editor.field_protocol":"Protokol","editor.field_peer":"Uzak eş/CIDR","editor.field_port":"Port/aralık","editor.field_interface":"Arayüz","editor.field_enabled":"Etkin","editor.field_origin":"Köken","editor.help":"Kural eşleşen trafiğe izin verir; gelen kuralı için geleni seçin. Diğer tüm gelen paketler engellenir.","editor.edit_title":" Kuralı düzenle ","editor.new_title":" Yeni izin kuralı ",
-  "mode.block_all":"tümünü engelle","mode.learning":"öğrenme","mode.enforcing":"kuralları uygula","direction.inbound":"gelen","direction.outbound":"giden","duration.subsecond":"<1 sn","duration.seconds":"{value} sn","duration.minutes":"{value} dk","duration.hours":"{value} sa"
-  ,"control.policy_changed_title":" Politika değişti "
-  ,"control.policy_changed_body":"Komut uygulanmadı ve otomatik olarak yeniden denenmeyecek. Durum yenilendikten sonra işlemi yineleyin.\n\n{message}"
-  ,"control.rejected_title":" Komut reddedildi "
-  ,"control.rejected_body":"Daemon, değişikliğin uygulanmadığını doğruladı ({code}).\n\n{message}"
-  ,"control.unconfirmed_title":" Sonuç doğrulanmadı "
-  ,"control.unconfirmed_body":"Daemon yanıtı alınmadı: komut, bağlantı kesilmeden önce uygulanmış olabilir. Komutu otomatik olarak yeniden denemeyin; güncel bir anlık görüntüyü bekleyip doğrulayın.\n\n{error}"
-  ,"control.resync_failed":"\n\nEşzamanlama istenemedi: {error}"
-  ,"control.resync_scheduled":"\n\nGüncel bir anlık görüntü otomatik olarak yüklenecek."
-  ,"control.applied":"Komut uygulandı, revizyon {revision}"
-  ,"control.applied_rule":"Komut “{rule}” kuralına uygulandı, revizyon {revision}"
-  ,"validation.name_empty":"Kural adı boş olamaz"
-  ,"validation.icmp_port":"ICMP için bağlantı noktası belirtilemez"
-  ,"validation.invalid_interface":"Geçersiz arayüz: {error}"
-  ,"validation.invalid_name":"Geçersiz ad: {error}"
-  ,"validation.invalid_rule":"Geçersiz kural: {error}"
-  ,"validation.invalid_peer":"Geçersiz IP adresi veya CIDR: {error}"
-  ,"validation.port_missing":"Bağlantı noktası eksik"
-  ,"validation.port_number":"Bağlantı noktası 1 ile 65535 arasında bir sayı olmalıdır"
-  ,"validation.port_end_number":"Aralık sonu bir sayı olmalıdır"
-  ,"validation.port_format":"Bağlantı noktası biçimi: 443 veya 8000-8100"
-  ,"validation.invalid_port_range":"Geçersiz bağlantı noktası aralığı: {error}"
-  ,"notice.daemon_restarted":"Daemon'ın yeniden başlatıldığı algılandı; durum yeniden yüklendi ve tamamlanmamış değişiklikler iptal edildi"
-  ,"notice.connection_lost":"Bağlantı kesildi; tamamlanmamış değişiklik iptal edildi"
-  ,"notice.revisions_skipped":"{first}..{last} revizyonları atlandı; durum bir anlık görüntüden yenilenecek"
-  ,"notice.wait_snapshot":"Önce güncel bir politika anlık görüntüsünü bekleyin"
-  ,"notice.base_revision_missing":"Değişiklik iptal edildi: temel politika revizyonu kullanılamıyor"
-  ,"notice.no_rule_selected":"Kural seçilmedi"
-  ,"notice.read_only":"Salt okunur kip: değişiklikler yalnızca root tarafından control.sock üzerinden yapılabilir"
-  ,"status.counter_accepted_in":"kabul edilen gelen trafik"
-  ,"status.counter_accepted_out":"kabul edilen giden trafik"
-  ,"status.counter_dropped_in":"atılan gelen trafik"
-  ,"status.counter_dropped_out":"atılan giden trafik"
-  ,"status.counter_learned_out":"öğrenilen giden trafik"
-  ,"event.mode_changed":"kip: {previous} → {current}"
-  ,"event.rule_created":"“{rule}” kuralı oluşturuldu"
-  ,"event.rule_updated":"“{rule}” kuralı güncellendi"
-  ,"event.rule_deleted":"“{rule}” kuralı silindi"
-  ,"event.rule_enabled":"“{rule}” kuralı: {state}"
-  ,"event.enabled":"etkin"
-  ,"event.disabled":"devre dışı"
-  ,"event.counters":"sayaçlar: gelen +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; giden +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; öğrenilen {learned_packets}/{learned_bytes}B"
-  ,"editor.field_application":"Uygulama eşleştirme"
-  ,"editor.field_executable":"Yürütülebilir dosya yolu"
-  ,"editor.field_device":"Aygıt kimliği"
-  ,"editor.field_inode":"Inode numarası"
-  ,"editor.field_command_mode":"Komut satırı eşleştirme"
-  ,"editor.field_arguments":"Argümanlar (JSON dizisi)"
-  ,"editor.field_uid":"Kullanıcı kimliği (UID)"
-  ,"editor.field_cgroup":"Denetim grubu (cgroup)"
-  ,"editor.command_any":"Tüm argümanlar"
-  ,"editor.command_exact":"Tam argümanlar"
-  ,"editor.command_prefix":"Argüman öneki"
-  ,"editor.application_help":"Uygulama eşleştirme yalnızca giden kurallarda kullanılabilir. Yürütülebilir dosya yolu zorunludur; aygıt ve inode birlikte belirtilmelidir."
-  ,"rules.column_application":"Uygulama"
-  ,"rules.network_only":"yalnızca ağ"
-  ,"rules.application_redacted":"uygulama ayrıntıları gizli"
-  ,"rules.details_title":" Uygulama ayrıntıları "
-  ,"rules.details_executable":"Yürütülebilir dosya"
-  ,"rules.details_file_id":"aygıt {device}, inode {inode}"
-  ,"rules.details_command":"Komut satırı"
-  ,"rules.details_uid":"Kullanıcı kimliği (UID)"
-  ,"rules.details_cgroup":"Denetim grubu (cgroup)"
-  ,"validation.application_outbound":"Uygulama eşleştirme yalnızca giden kurallarda kullanılabilir"
-  ,"validation.executable_required":"Uygulama eşleştirme etkinken yürütülebilir dosya yolu zorunludur"
-  ,"validation.file_id_pair":"Aygıt ve inode birlikte belirtilmelidir"
-  ,"validation.invalid_device":"Aygıt kimliği negatif olmayan bir tam sayı olmalıdır"
-  ,"validation.invalid_inode":"Inode pozitif bir tam sayı olmalıdır"
-  ,"validation.arguments_unused":"Tüm argümanlar modunda argüman alanı boş olmalıdır"
-  ,"validation.arguments_json":"Argümanlar bir JSON dizisi olmalıdır"
-  ,"validation.arguments_strings":"Her argüman bir dize olmalıdır"
-  ,"validation.invalid_executable":"Geçersiz yürütülebilir dosya yolu: {error}"
-  ,"validation.invalid_arguments":"Geçersiz komut satırı argümanları: {error}"
-  ,"validation.invalid_uid":"Kullanıcı kimliği negatif olmayan bir tam sayı olmalıdır"
-  ,"validation.invalid_cgroup":"Geçersiz denetim grubu: {error}"
+  "cli.about": "OpenShield için güvenli terminal arayüzü",
+  "main.terminal_required": "TUI etkileşimli bir terminal gerektirir",
+  "main.terminal_init_failed": "terminal başlatılamadı",
+  "main.draw_failed": "TUI çizilemedi",
+  "main.input_poll_failed": "girdi beklenirken hata",
+  "main.input_read_failed": "girdi okunurken hata",
+  "view.status": "Durum",
+  "view.rules": "Kurallar",
+  "view.events": "Olaylar",
+  "view.help": "Yardım",
+  "common.unknown": "bilinmiyor",
+  "common.any": "herhangi",
+  "common.yes": "evet",
+  "common.no": "hayır",
+  "common.manual": "elle",
+  "common.learned": "öğrenme",
+  "common.learned_immutable": "öğrenme (köken değişmez)",
+  "status.policy": "Politika: ",
+  "status.telemetry": "Telemetri: ",
+  "status.access": "Erişim: ",
+  "status.mode": "Kip: ",
+  "status.revision": "Politika revizyonu: {revision}",
+  "status.rule_counts": "Kurallar: {rules}; etkin gelen izinler: {inbound}",
+  "status.inbound_policy": "Gelen politikası: varsayılan DROP; yalnızca etkin izin kurallarıyla eşleşen paketler geçer.",
+  "status.age_unknown": "yaş bilinmiyor",
+  "status.age": "yaş {duration}",
+  "status.counters_title": "Son güvenlik duvarı sayaçları ({age}; paket / bayt):",
+  "status.counters_waiting": "Güvenlik duvarı sayaçları: ilk güncelleme bekleniyor…",
+  "status.observe_socket": "Gözlem: {path}",
+  "status.control_socket": "Denetim: {path}",
+  "status.title": " Durum ",
+  "health.connecting": "bağlanıyor…",
+  "health.connected": "bağlı",
+  "health.disconnected": "bağlantı kesildi ({reason})",
+  "health.telemetry_stale": "BOZULMUŞ: {duration} boyunca yeni sayaç yok",
+  "health.subscription_active": "abonelik etkin",
+  "health.subscription_waiting": "abonelik etkin, sayaçlar bekleniyor…",
+  "health.telemetry_disconnected": "BOZULMUŞ: akış kesildi ({reason})",
+  "access.read_only": "SALT OKUNUR (değişiklikler root gerektirir)",
+  "access.privileged": "AYRICALIKLI DENETİM",
+  "rules.column_enabled": "Açık",
+  "rules.column_direction": "Yön",
+  "rules.column_protocol": "Prot.",
+  "rules.column_peer": "Eş/ağ",
+  "rules.column_port": "Bağlantı noktası",
+  "rules.column_interface": "Arayüz",
+  "rules.column_name": "Ad",
+  "rules.column_origin": "Köken",
+  "rules.title": " İzin kuralları ",
+  "events.title": " Olaylar (en yeni önce) ",
+  "events.title_dropped": " Olaylar (en yeni önce; kanalın attığı: {count}) ",
+  "help.navigation": "1/2/3/4   durum / kurallar / olaylar / yardım",
+  "help.next_tab": "Tab       sonraki sekme",
+  "help.select_rule": "↑/↓       kural seç",
+  "help.quit": "q         çık",
+  "help.open_help": "?         yardım",
+  "help.control_title": "Denetim (yalnızca root):",
+  "help.select_mode": "m         kip seç",
+  "help.rule_actions": "n/e/d     kural oluştur / düzenle / sil",
+  "help.toggle_rule": "Space     seçili kuralı aç veya kapat",
+  "help.editor": "Düzenleyici: Tab/Shift-Tab — alan; ←/→ — seçim; Enter — kaydet; Esc — iptal.",
+  "help.unprivileged": "Gözlem için root veya openshield grubu üyeliği gerekir; değişiklik komutları root gerektirir.",
+  "help.title": " Yardım ",
+  "footer.status": "m: kip   ?: yardım   q: çık",
+  "footer.rules_read_only": "↑/↓: seç   salt okunur   ?: yardım   q: çık",
+  "footer.rules": "n: oluştur   e: düzenle   d: sil   Space: aç/kapat",
+  "footer.events_live": "gerçek zamanlı olaylar   q: çık",
+  "footer.events_offline": "gerçek zamanlı olaylar kullanılamıyor   q: çık",
+  "footer.help": "q: çık",
+  "overlay.mode_picker": " Kip seç ",
+  "overlay.block_all_title": " TÜMÜNÜ ENGELLE ",
+  "overlay.block_all_body": "Gelen ve giden TÜM IP trafiği engellenecek. Devam? [y/N]",
+  "overlay.delete_title": " Kuralı sil ",
+  "overlay.delete_body": "“{name}” silinsin mi? [y/N]",
+  "editor.field_name": "Ad",
+  "editor.field_direction": "Yön",
+  "editor.field_protocol": "Protokol",
+  "editor.field_peer": "Uzak eş/CIDR",
+  "editor.field_port": "Port/aralık",
+  "editor.field_interface": "Arayüz",
+  "editor.field_enabled": "Etkin",
+  "editor.field_origin": "Köken",
+  "editor.help": "Kural eşleşen trafiğe izin verir; gelen kuralı için geleni seçin. Diğer tüm gelen paketler engellenir.",
+  "editor.edit_title": " Kuralı düzenle ",
+  "editor.new_title": " Yeni izin kuralı ",
+  "mode.block_all": "tümünü engelle",
+  "mode.learning": "öğrenme",
+  "mode.enforcing": "kuralları uygula",
+  "direction.inbound": "gelen",
+  "direction.outbound": "giden",
+  "duration.subsecond": "<1 sn",
+  "duration.seconds": "{value} sn",
+  "duration.minutes": "{value} dk",
+  "duration.hours": "{value} sa",
+  "control.policy_changed_title": " Politika değişti ",
+  "control.policy_changed_body": "Komut uygulanmadı ve otomatik olarak yeniden denenmeyecek. Durum yenilendikten sonra işlemi yineleyin.\n\n{message}",
+  "control.rejected_title": " Komut reddedildi ",
+  "control.rejected_body": "Daemon, değişikliğin uygulanmadığını doğruladı ({code}).\n\n{message}",
+  "control.unconfirmed_title": " Sonuç doğrulanmadı ",
+  "control.unconfirmed_body": "Daemon yanıtı alınmadı: komut, bağlantı kesilmeden önce uygulanmış olabilir. Komutu otomatik olarak yeniden denemeyin; güncel bir anlık görüntüyü bekleyip doğrulayın.\n\n{error}",
+  "control.resync_failed": "\n\nEşzamanlama istenemedi: {error}",
+  "control.resync_scheduled": "\n\nGüncel bir anlık görüntü otomatik olarak yüklenecek.",
+  "control.applied": "Komut uygulandı, revizyon {revision}",
+  "control.applied_rule": "Komut “{rule}” kuralına uygulandı, revizyon {revision}",
+  "validation.name_empty": "Kural adı boş olamaz",
+  "validation.icmp_port": "ICMP için bağlantı noktası belirtilemez",
+  "validation.invalid_interface": "Geçersiz arayüz: {error}",
+  "validation.invalid_name": "Geçersiz ad: {error}",
+  "validation.invalid_rule": "Geçersiz kural: {error}",
+  "validation.invalid_peer": "Geçersiz IP adresi veya CIDR: {error}",
+  "validation.port_missing": "Bağlantı noktası eksik",
+  "validation.port_number": "Bağlantı noktası 1 ile 65535 arasında bir sayı olmalıdır",
+  "validation.port_end_number": "Aralık sonu bir sayı olmalıdır",
+  "validation.port_format": "Bağlantı noktası biçimi: 443 veya 8000-8100",
+  "validation.invalid_port_range": "Geçersiz bağlantı noktası aralığı: {error}",
+  "notice.daemon_restarted": "Daemon'ın yeniden başlatıldığı algılandı; durum yeniden yüklendi ve tamamlanmamış değişiklikler iptal edildi",
+  "notice.connection_lost": "Bağlantı kesildi; tamamlanmamış değişiklik iptal edildi",
+  "notice.revisions_skipped": "{first}..{last} revizyonları atlandı; durum bir anlık görüntüden yenilenecek",
+  "notice.wait_snapshot": "Önce güncel bir politika anlık görüntüsünü bekleyin",
+  "notice.base_revision_missing": "Değişiklik iptal edildi: temel politika revizyonu kullanılamıyor",
+  "notice.no_rule_selected": "Kural seçilmedi",
+  "notice.read_only": "Salt okunur kip: değişiklikler yalnızca root tarafından control.sock üzerinden yapılabilir",
+  "status.counter_accepted_in": "kabul edilen gelen trafik",
+  "status.counter_accepted_out": "kabul edilen giden trafik",
+  "status.counter_dropped_in": "atılan gelen trafik",
+  "status.counter_dropped_out": "atılan giden trafik",
+  "status.counter_learned_out": "öğrenilen giden trafik",
+  "event.mode_changed": "kip: {previous} → {current}",
+  "event.rule_created": "“{rule}” kuralı oluşturuldu",
+  "event.rule_updated": "“{rule}” kuralı güncellendi",
+  "event.rule_deleted": "“{rule}” kuralı silindi",
+  "event.rule_enabled": "“{rule}” kuralı: {state}",
+  "event.enabled": "etkin",
+  "event.disabled": "devre dışı",
+  "event.counters": "sayaçlar: gelen +{accepted_in_packets}/{accepted_in_bytes}B -{dropped_in_packets}/{dropped_in_bytes}B; giden +{accepted_out_packets}/{accepted_out_bytes}B -{dropped_out_packets}/{dropped_out_bytes}B; öğrenilen {learned_packets}/{learned_bytes}B",
+  "editor.field_application": "Uygulama eşleştirme",
+  "editor.field_executable": "Yürütülebilir dosya yolu",
+  "editor.field_command_mode": "Komut satırı eşleştirme",
+  "editor.field_arguments": "Argümanlar (JSON dizisi)",
+  "editor.field_uid": "Kullanıcı kimliği (UID)",
+  "editor.field_cgroup": "Denetim grubu (cgroup)",
+  "editor.command_any": "Tüm argümanlar",
+  "editor.command_exact": "Tam argümanlar",
+  "editor.command_prefix": "Argüman öneki",
+  "editor.application_help": "Uygulama eşleştirme yalnızca giden kurallarda kullanılabilir. Yürütülebilir dosya yolu zorunludur. Artalan süreci dosya sürümünü otomatik olarak sabitler; önceden sabitlenen sürüm değişmişse düzenleme reddedilir.",
+  "rules.column_application": "Uygulama",
+  "rules.network_only": "yalnızca ağ",
+  "rules.application_redacted": "uygulama ayrıntıları gizli",
+  "rules.details_title": " Uygulama ayrıntıları ",
+  "rules.details_executable": "Yürütülebilir dosya",
+  "rules.details_file_id": "aygıt {device}, inode {inode}",
+  "rules.details_command": "Komut satırı",
+  "rules.details_uid": "Kullanıcı kimliği (UID)",
+  "rules.details_cgroup": "Denetim grubu (cgroup)",
+  "validation.application_outbound": "Uygulama eşleştirme yalnızca giden kurallarda kullanılabilir",
+  "validation.executable_required": "Uygulama eşleştirme etkinken yürütülebilir dosya yolu zorunludur",
+  "validation.arguments_unused": "Tüm argümanlar modunda argüman alanı boş olmalıdır",
+  "validation.arguments_json": "Argümanlar bir JSON dizisi olmalıdır",
+  "validation.arguments_strings": "Her argüman bir dize olmalıdır",
+  "validation.invalid_executable": "Geçersiz yürütülebilir dosya yolu: {error}",
+  "validation.invalid_arguments": "Geçersiz komut satırı argümanları: {error}",
+  "validation.invalid_uid": "Kullanıcı kimliği negatif olmayan bir tam sayı olmalıdır",
+  "validation.invalid_cgroup": "Geçersiz denetim grubu: {error}",
+  "ipc.connect_error": "IPC soketi {path} bağlanamadı: {error}",
+  "ipc.control_root_required": "Yönetim istekleri için etkin UID 0 (root) gerekir",
+  "ipc.coordinator_unavailable": "Gözlemci revizyon koordinatörü kullanılamıyor",
+  "ipc.daemon_rejected": "Daemon isteği reddetti ({code}): {message}",
+  "ipc.generation_exhausted": "Gözlemci nesil sayacı tükendi",
+  "ipc.inconsistent_pages": "Kural sayfaları okunurken ilke değişti; yeniden okunuyor",
+  "ipc.inspect_error": "IPC yolu {path} denetlenemedi: {error}",
+  "ipc.invalid_snapshot": "Daemon geçersiz ilke anlık görüntüsü döndürdü: {error}",
+  "ipc.local_groups_error": "Geçerli işlemin ek grupları okunamadı: {error}",
+  "ipc.not_observer_group_member": "Gözlem için root veya openshield grubu üyeliği gerekir",
+  "ipc.observer_group_error": "Zorunlu openshield gözlemci grubu belirlenemedi: {error}",
+  "ipc.peer_credentials_error": "IPC soketindeki daemon kimlik bilgileri okunamadı: {error}",
+  "ipc.protocol_error": "IPC protokol hatası: {error}",
+  "ipc.rule_count_mismatch": "Daemon {advertised} kural açıkladı, ancak {received} döndürdü",
+  "ipc.socket_path_changed": "Bağlantı sırasında IPC soket yolu değişti: {path}",
+  "ipc.timeout_error": "IPC zaman aşımı ayarlanamadı: {error}",
+  "ipc.unexpected_response": "Beklenmeyen daemon yanıtı: {error}",
+  "ipc.untrusted_directory": "Güvenilmeyen IPC üst dizini: {path}",
+  "ipc.untrusted_peer": "IPC eşinin UID {uid} yetkili daemona ait değil",
+  "ipc.untrusted_socket": "IPC yolu, root'a ait Unix soketi değil: {path}"
 }

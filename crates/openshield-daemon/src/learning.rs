@@ -24,12 +24,12 @@ where
     O: FirewallObserver + 'static,
 {
     thread::Builder::new()
-        .name("openshield-nft-monitor".to_owned())
+        .name("openshield-firewall-monitor".to_owned())
         .spawn(move || {
             let mut observer = observer;
             monitor_loop(&mut observer, &engine, &shutdown);
         })
-        .context("cannot spawn nftables monitor")
+        .context("cannot spawn firewall monitor")
 }
 
 fn monitor_loop<O>(observer: &mut O, engine: &SharedEngine, shutdown: &AtomicBool)
@@ -62,7 +62,7 @@ fn poll_counters<O>(
     };
     match observer.policy_observation() {
         Ok(counters) => {
-            errors.recovered("nft counter polling recovered");
+            errors.recovered("firewall counter polling recovered");
             let Ok(mut engine) = engine.lock() else {
                 errors.report("policy engine mutex is poisoned while publishing counters");
                 return;
@@ -71,7 +71,7 @@ fn poll_counters<O>(
         }
         Err(error) => {
             errors.report(&format!(
-                "cannot verify bounded nft policy observation: {error:#}"
+                "cannot verify bounded firewall policy observation: {error:#}"
             ));
             repair_after_observation_failure(engine, shutdown, revision, errors);
         }
@@ -84,13 +84,18 @@ fn repair_after_observation_failure(
     revision: u64,
     errors: &mut ErrorGate,
 ) {
-    if !errors.should_attempt_repair() {
+    if shutdown.load(Ordering::Acquire) || !errors.should_attempt_repair() {
         return;
     }
     let Ok(mut engine) = engine.lock() else {
         errors.report("policy engine mutex is poisoned during firewall repair");
         return;
     };
+    // Shutdown installs a non-persistent BlockAll quarantine under this same
+    // mutex. Never race it by restoring the saved runtime mode afterward.
+    if shutdown.load(Ordering::Acquire) {
+        return;
+    }
     match engine.repair_policy(revision) {
         Ok(true) => info!(
             revision,
@@ -117,7 +122,7 @@ fn policy_identity(engine: &SharedEngine) -> Option<(u64, Mode)> {
     if let Ok(engine) = engine.lock() {
         Some((engine.revision(), engine.mode()))
     } else {
-        warn!("policy engine mutex is poisoned; nft observation paused");
+        warn!("policy engine mutex is poisoned; firewall observation paused");
         None
     }
 }

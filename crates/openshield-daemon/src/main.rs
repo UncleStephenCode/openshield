@@ -26,9 +26,9 @@ use nix::unistd::geteuid;
 use openshield_core::{AtomicStateStore, StateStore};
 use tracing::{error, info};
 
-use crate::backend::{FirewallBackend, NftBackend};
-use crate::engine::{Engine, EventBus};
-use crate::socket::DaemonInstance;
+use crate::backend::{AutoBackend, FirewallBackend, FirewallObserver, QueueVerdictStrategy};
+use crate::engine::{Engine, EventBus, SharedEngine};
+use crate::socket::{DaemonInstance, SocketSet, required_observer_gid};
 
 const STATE_DIRECTORY: &str = "/var/lib/openshield";
 const STATE_FILE: &str = "/var/lib/openshield/state.json";
@@ -36,6 +36,14 @@ const STATE_DIRECTORY_MODE: u32 = 0o700;
 const MAX_NOTIFY_SOCKET_BYTES: usize = 107;
 const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const READY_MESSAGE: &[u8] = b"READY=1";
+
+#[derive(Debug)]
+struct ActiveRuntime {
+    sockets: SocketSet,
+    queue: nfqueue::QueueRuntime,
+    monitor: thread::JoinHandle<()>,
+    _signal: thread::JoinHandle<()>,
+}
 
 fn main() -> ExitCode {
     match dispatch() {
@@ -97,9 +105,13 @@ fn install_fail_closed() -> Result<()> {
     );
     let _instance = DaemonInstance::acquire_fixed()
         .context("another daemon operation is active; refusing to replace its live policy")?;
-    let mut backend = NftBackend::discover().context(
-        "cannot initialize the trusted nftables backend; fail-closed enforcement is unavailable",
+    let mut backend = AutoBackend::discover().context(
+        "cannot initialize a trusted firewall backend; fail-closed enforcement is unavailable",
     )?;
+    info!(
+        firewall_backend = backend.name(),
+        "selected firewall backend"
+    );
     install_fail_closed_with(&mut backend)
 }
 
@@ -145,47 +157,69 @@ fn run() -> Result<()> {
         DaemonInstance::acquire_fixed().context("cannot acquire the singleton daemon lock")?;
     let termination_signals = block_termination_signals()?;
 
-    let mut backend = NftBackend::discover().context(
-        "cannot initialize the trusted nftables backend; fail-closed enforcement is unavailable",
+    let mut backend = AutoBackend::discover().context(
+        "cannot initialize a trusted firewall backend; fail-closed enforcement is unavailable",
     )?;
+    info!(
+        firewall_backend = backend.name(),
+        "selected firewall backend"
+    );
+    // Do not rely solely on service-manager preflight. A direct invocation
+    // must close the network before it inspects storage or constructs any
+    // fallible userspace runtime component. Engine::load repeats this
+    // quarantine deliberately; only start_firewall_runtime may later replace
+    // it after the authenticated NFQUEUE consumer is ready.
+    install_fail_closed_with(&mut backend)
+        .context("cannot install the bootstrap BlockAll policy before state inspection")?;
     ensure_state_storage_or_fail_closed(&mut backend, Path::new(STATE_DIRECTORY), 0)?;
+    let queue_verdict_strategy = backend.queue_verdict_strategy();
     let observer = backend.clone();
     let store: Box<dyn StateStore> = Box::new(AtomicStateStore::root_owned(STATE_FILE));
     let events = EventBus::new();
     let engine = Engine::load(Box::new(backend), store, events.clone())
         .context("cannot initialize fail-closed policy engine")?;
+    // Engine loading has already installed the bootstrap BlockAll quarantine.
+    // A missing NSS/group prerequisite must therefore fail closed before any
+    // desired persisted policy is activated.
+    let observer_gid = required_observer_gid().context(
+        "observation is unavailable without the required system group; refusing partial startup",
+    )?;
 
     let engine = Arc::new(Mutex::new(engine));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let queue_runtime = match nfqueue::spawn(&engine, &shutdown) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            if let Ok(mut engine) = engine.lock() {
-                engine.quarantine_after_runtime_failure();
-            }
-            return Err(error).context(
-                "application quarantine is unavailable; emergency BlockAll was requested",
-            );
-        }
-    };
-
-    // Bind management sockets only after the complete kernel policy and its
-    // fail-closed application-verdict consumer are active.
-    let sockets = instance
-        .bind_sockets()
-        .context("cannot create local management sockets")?;
-    let _signal_thread = spawn_signal_waiter(termination_signals, Arc::clone(&shutdown))?;
-    let monitor = learning::spawn_monitor(observer, Arc::clone(&engine), Arc::clone(&shutdown))?;
-    notify_systemd_ready()?;
+    let ActiveRuntime {
+        sockets,
+        queue: queue_runtime,
+        monitor,
+        _signal: _signal_thread,
+    } = start_firewall_runtime(
+        instance,
+        observer,
+        observer_gid,
+        termination_signals,
+        &engine,
+        &shutdown,
+        queue_verdict_strategy,
+    )?;
 
     info!("OpenShield firewall policy and local IPC are active");
     let server_result = server::serve(&sockets, &engine, &events, &shutdown);
     shutdown.store(true, Ordering::Release);
-    queue_runtime.join()?;
-    monitor
+    let shutdown_quarantine = install_runtime_shutdown_quarantine(&engine);
+    let queue_result = queue_runtime.join();
+    let monitor_result = monitor
         .join()
-        .map_err(|_| anyhow::anyhow!("nftables monitor terminated unexpectedly"))?;
+        .map_err(|_| anyhow::anyhow!("firewall monitor terminated unexpectedly"));
+    // Repeat after all policy-mutating workers have exited. The first call
+    // closes the shutdown window; this final call makes BlockAll authoritative
+    // even if a worker was already completing an observation when shutdown
+    // began.
+    let final_shutdown_quarantine = install_runtime_shutdown_quarantine(&engine);
     server_result?;
+    shutdown_quarantine?;
+    queue_result?;
+    monitor_result?;
+    final_shutdown_quarantine?;
     let engine = engine
         .lock()
         .map_err(|_| anyhow::anyhow!("policy engine mutex is poisoned during shutdown"))?;
@@ -198,6 +232,140 @@ fn run() -> Result<()> {
     drop(engine);
     info!("OpenShield daemon stopped; kernel-resident policy remains active");
     Ok(())
+}
+
+fn start_firewall_runtime<O>(
+    instance: DaemonInstance,
+    observer: O,
+    observer_gid: u32,
+    termination_signals: SigSet,
+    engine: &SharedEngine,
+    shutdown: &Arc<AtomicBool>,
+    queue_verdict_strategy: QueueVerdictStrategy,
+) -> Result<ActiveRuntime>
+where
+    O: FirewallObserver + 'static,
+{
+    let queue_runtime = match nfqueue::spawn(engine, shutdown, queue_verdict_strategy) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if let Ok(mut engine) = engine.lock() {
+                engine.quarantine_after_runtime_failure();
+            }
+            return Err(error).context(
+                "application quarantine is unavailable; emergency BlockAll was requested",
+            );
+        }
+    };
+
+    let startup_activation = engine
+        .lock()
+        .map_err(|_| anyhow::anyhow!("policy engine mutex is poisoned during startup"))
+        .and_then(|mut engine| engine.activate_startup_policy());
+    if let Err(error) = startup_activation {
+        return Err(clean_up_failed_startup(
+            error.context(
+                "cannot leave the bootstrap BlockAll quarantine for the selected startup policy",
+            ),
+            engine,
+            shutdown,
+            queue_runtime,
+            None,
+        ));
+    }
+
+    // Bind management sockets only after the complete kernel policy and its
+    // fail-closed application-verdict consumer are active.
+    let sockets = match instance.bind_sockets(observer_gid) {
+        Ok(sockets) => sockets,
+        Err(error) => {
+            return Err(clean_up_failed_startup(
+                error.context("cannot create local management sockets"),
+                engine,
+                shutdown,
+                queue_runtime,
+                None,
+            ));
+        }
+    };
+    let signal = match spawn_signal_waiter(termination_signals, Arc::clone(shutdown)) {
+        Ok(signal_thread) => signal_thread,
+        Err(error) => {
+            return Err(clean_up_failed_startup(
+                error,
+                engine,
+                shutdown,
+                queue_runtime,
+                None,
+            ));
+        }
+    };
+    let monitor = match learning::spawn_monitor(observer, Arc::clone(engine), Arc::clone(shutdown))
+    {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            return Err(clean_up_failed_startup(
+                error,
+                engine,
+                shutdown,
+                queue_runtime,
+                None,
+            ));
+        }
+    };
+    if let Err(error) = notify_systemd_ready() {
+        return Err(clean_up_failed_startup(
+            error,
+            engine,
+            shutdown,
+            queue_runtime,
+            Some(monitor),
+        ));
+    }
+
+    Ok(ActiveRuntime {
+        sockets,
+        queue: queue_runtime,
+        monitor,
+        _signal: signal,
+    })
+}
+
+fn install_runtime_shutdown_quarantine(engine: &SharedEngine) -> Result<()> {
+    engine
+        .lock()
+        .map_err(|_| anyhow::anyhow!("policy engine mutex is poisoned during shutdown"))?
+        .install_shutdown_quarantine()
+}
+
+fn clean_up_failed_startup(
+    startup_error: anyhow::Error,
+    engine: &SharedEngine,
+    shutdown: &Arc<AtomicBool>,
+    queue_runtime: nfqueue::QueueRuntime,
+    monitor: Option<thread::JoinHandle<()>>,
+) -> anyhow::Error {
+    shutdown.store(true, Ordering::Release);
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = install_runtime_shutdown_quarantine(engine) {
+        cleanup_errors.push(format!("shutdown quarantine failed: {error:#}"));
+    }
+    if let Err(error) = queue_runtime.join() {
+        cleanup_errors.push(format!("NFQUEUE shutdown failed: {error:#}"));
+    }
+    if let Some(monitor) = monitor
+        && monitor.join().is_err()
+    {
+        cleanup_errors.push("firewall monitor panicked during shutdown".to_owned());
+    }
+    if cleanup_errors.is_empty() {
+        startup_error
+    } else {
+        anyhow::anyhow!(
+            "{startup_error:#}; fail-closed startup cleanup also reported: {}",
+            cleanup_errors.join("; ")
+        )
+    }
 }
 
 fn notify_systemd_ready() -> Result<()> {

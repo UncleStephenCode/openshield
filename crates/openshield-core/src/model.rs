@@ -418,7 +418,7 @@ impl Rule {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearnedEndpoint {
     pub address: IpAddr,
@@ -591,7 +591,13 @@ mod tests {
             "interface":null,
             "application":{
                 "executable":"/usr/bin/example",
-                "executable_file":{"device":8,"inode":9},
+                "executable_file":{
+                    "device":8,
+                    "inode":9,
+                    "size":10,
+                    "ctime_seconds":1700000000,
+                    "ctime_nanoseconds":123456789
+                },
                 "command_line":null,
                 "uid":1000,
                 "cgroup":null

@@ -53,13 +53,13 @@
   "status.inbound_policy": "Inbound policy: DROP by default; only packets matching active allow rules pass.",
   "status.age_unknown": "age unknown",
   "status.age": "age {duration}",
-  "status.counters_title": "Latest nftables counters ({age}; packets / bytes):",
+  "status.counters_title": "Latest firewall counters ({age}; packets / bytes):",
   "status.counter_accepted_in": "accepted in",
   "status.counter_accepted_out": "accepted out",
   "status.counter_dropped_in": "dropped in",
   "status.counter_dropped_out": "dropped out",
   "status.counter_learned_out": "learned out",
-  "status.counters_waiting": "nftables counters: waiting for the first update…",
+  "status.counters_waiting": "firewall counters: waiting for the first update…",
   "status.observe_socket": "Observation: {path}",
   "status.control_socket": "Control: {path}",
   "status.title": " State ",
@@ -93,7 +93,7 @@
   "help.rule_actions": "n/e/d     create / edit / delete rule",
   "help.toggle_rule": "Space     enable or disable selected rule",
   "help.editor": "Editor: Tab/Shift-Tab — field; ←/→ — choice; Enter — save; Esc — cancel.",
-  "help.unprivileged": "Unprivileged session: mutation commands are deliberately disabled.",
+  "help.unprivileged": "Observation requires root or membership in the openshield group; mutation commands require root.",
   "help.title": " Help ",
   "footer.status": "m: mode   ?: help   q: quit",
   "footer.rules_read_only": "↑/↓: select   read only   ?: help   q: quit",
@@ -133,38 +133,53 @@
   "duration.subsecond": "<1 s",
   "duration.seconds": "{value} s",
   "duration.minutes": "{value} min",
-  "duration.hours": "{value} h"
-  ,"editor.field_application": "Application matching"
-  ,"editor.field_executable": "Executable path"
-  ,"editor.field_device": "Device ID"
-  ,"editor.field_inode": "Inode"
-  ,"editor.field_command_mode": "Command-line match"
-  ,"editor.field_arguments": "Arguments (JSON array)"
-  ,"editor.field_uid": "User ID (UID)"
-  ,"editor.field_cgroup": "Control group (cgroup)"
-  ,"editor.command_any": "Any arguments"
-  ,"editor.command_exact": "Exact arguments"
-  ,"editor.command_prefix": "Argument prefix"
-  ,"editor.application_help": "Application matching is available only for outbound rules. The executable path is required; device and inode must be provided together."
-  ,"rules.column_application": "Application"
-  ,"rules.network_only": "network only"
-  ,"rules.application_redacted": "application details hidden"
-  ,"rules.details_title": " Application details "
-  ,"rules.details_executable": "Executable"
-  ,"rules.details_file_id": "device {device}, inode {inode}"
-  ,"rules.details_command": "Command line"
-  ,"rules.details_uid": "User ID (UID)"
-  ,"rules.details_cgroup": "Control group (cgroup)"
-  ,"validation.application_outbound": "Application matching is available only for outbound rules"
-  ,"validation.executable_required": "An executable path is required when application matching is enabled"
-  ,"validation.file_id_pair": "Device and inode must be specified together"
-  ,"validation.invalid_device": "Device ID must be a non-negative integer"
-  ,"validation.invalid_inode": "Inode must be a positive integer"
-  ,"validation.arguments_unused": "Arguments must be empty when command-line matching is set to any"
-  ,"validation.arguments_json": "Arguments must be a JSON array"
-  ,"validation.arguments_strings": "Every argument must be a string"
-  ,"validation.invalid_executable": "Invalid executable path: {error}"
-  ,"validation.invalid_arguments": "Invalid command-line arguments: {error}"
-  ,"validation.invalid_uid": "User ID must be a non-negative integer"
-  ,"validation.invalid_cgroup": "Invalid control group: {error}"
+  "duration.hours": "{value} h",
+  "editor.field_application": "Application matching",
+  "editor.field_executable": "Executable path",
+  "editor.field_command_mode": "Command-line match",
+  "editor.field_arguments": "Arguments (JSON array)",
+  "editor.field_uid": "User ID (UID)",
+  "editor.field_cgroup": "Control group (cgroup)",
+  "editor.command_any": "Any arguments",
+  "editor.command_exact": "Exact arguments",
+  "editor.command_prefix": "Argument prefix",
+  "editor.application_help": "Application matching is available only for outbound rules. The executable path is required. The daemon pins the file version automatically; editing is rejected if the existing pinned version has changed.",
+  "rules.column_application": "Application",
+  "rules.network_only": "network only",
+  "rules.application_redacted": "application details hidden",
+  "rules.details_title": " Application details ",
+  "rules.details_executable": "Executable",
+  "rules.details_file_id": "device {device}, inode {inode}",
+  "rules.details_command": "Command line",
+  "rules.details_uid": "User ID (UID)",
+  "rules.details_cgroup": "Control group (cgroup)",
+  "validation.application_outbound": "Application matching is available only for outbound rules",
+  "validation.executable_required": "An executable path is required when application matching is enabled",
+  "validation.arguments_unused": "Arguments must be empty when command-line matching is set to any",
+  "validation.arguments_json": "Arguments must be a JSON array",
+  "validation.arguments_strings": "Every argument must be a string",
+  "validation.invalid_executable": "Invalid executable path: {error}",
+  "validation.invalid_arguments": "Invalid command-line arguments: {error}",
+  "validation.invalid_uid": "User ID must be a non-negative integer",
+  "validation.invalid_cgroup": "Invalid control group: {error}",
+  "ipc.inspect_error": "Cannot inspect IPC path {path}: {error}",
+  "ipc.untrusted_directory": "Untrusted IPC parent directory: {path}",
+  "ipc.untrusted_socket": "IPC path is not a root-owned Unix socket: {path}",
+  "ipc.observer_group_error": "Cannot resolve required observation group openshield: {error}",
+  "ipc.not_observer_group_member": "Observation requires root or membership in the openshield group",
+  "ipc.local_groups_error": "Cannot read supplementary groups of the current process: {error}",
+  "ipc.socket_path_changed": "IPC socket path changed while connecting: {path}",
+  "ipc.connect_error": "Cannot connect to IPC socket {path}: {error}",
+  "ipc.peer_credentials_error": "Cannot read daemon peer credentials: {error}",
+  "ipc.untrusted_peer": "IPC peer UID {uid} is not the privileged daemon",
+  "ipc.control_root_required": "Control requests require effective UID 0 (root)",
+  "ipc.timeout_error": "Cannot configure IPC timeout: {error}",
+  "ipc.protocol_error": "IPC protocol error: {error}",
+  "ipc.daemon_rejected": "Daemon rejected the request ({code}): {message}",
+  "ipc.unexpected_response": "Unexpected daemon response: {error}",
+  "ipc.invalid_snapshot": "Daemon returned an invalid policy snapshot: {error}",
+  "ipc.inconsistent_pages": "Policy changed while reading paginated rules; retrying",
+  "ipc.rule_count_mismatch": "Daemon advertised {advertised} rules but returned {received}",
+  "ipc.coordinator_unavailable": "Observer revision coordinator is unavailable",
+  "ipc.generation_exhausted": "Observer generation counter is exhausted"
 }

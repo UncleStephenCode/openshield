@@ -517,7 +517,7 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
 
 #[allow(clippy::too_many_lines)]
 fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
-    let area = centered_rect(86, 31, frame.area());
+    let area = centered_rect(86, 29, frame.area());
     frame.render_widget(Clear, area);
     let fields = [
         (
@@ -564,16 +564,6 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             FormField::Executable,
             i18n.tr("editor.field_executable"),
             form.executable.clone(),
-        ),
-        (
-            FormField::Device,
-            i18n.tr("editor.field_device"),
-            form.executable_device.clone(),
-        ),
-        (
-            FormField::Inode,
-            i18n.tr("editor.field_inode"),
-            form.executable_inode.clone(),
         ),
         (
             FormField::CommandMode,

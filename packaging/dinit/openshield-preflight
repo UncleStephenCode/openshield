@@ -1,0 +1,3 @@
+type = scripted
+command = /usr/libexec/openshield/dinit-preflight
+stop-command = /usr/bin/openshield-daemon --install-fail-closed

@@ -2,331 +2,340 @@
 
 # OpenShield
 
-OpenShield is a secure Linux host firewall written in Rust, with a privileged
-daemon and a terminal interface. It is a new, minimal port of the OpenSnitch
-core: it implements the required modes, network-level rules, and local
-observation, including outbound rules bound to an application identity. It does
-not retain compatibility with the former project's Python/Go plugins, task
-executors, or legacy rule format.
+OpenShield is a local, application-aware Linux host firewall written in Rust.
+It consists of a privileged daemon and a terminal user interface (TUI). The
+daemon prefers nftables and automatically falls back to a complete
+`iptables`/`ip6tables` tool set when the fixed, trusted `nft` executable or the
+running kernel cannot validate an nftables policy.
 
-The project builds with Rust 1.98.0 (edition 2024). Filtering is performed in
-the kernel through a dedicated nftables `inet openshield` table. Initial
-application decisions use one fixed, bounded NFQUEUE without a bypass flag;
-shell execution, loadable plugins, and configuration-selected executables are
-not used.
+OpenShield is a focused Rust port of the OpenSnitch security model, not a
+line-by-line replacement. It does not load the original Python/Go plugins,
+execute configuration-selected programs, or accept the legacy rule format. The
+audit and port started from the local `../opensnitch` revision
+`a1353848ba1b660320e90cefea782c3fba272c00` (2026-07-27). The copied `LICENSE`
+has the same SHA-256 digest as that revision.
 
-## Port provenance
+The workspace uses Rust 1.98.0, edition 2024, and forbids `unsafe` Rust in
+workspace code.
 
-The audit and port are based on the local `../opensnitch` checkout from
-<https://github.com/evilsocket/opensnitch.git>, commit
-`a1353848ba1b660320e90cefea782c3fba272c00` dated 2026-07-27. OpenShield is a
-new, minimal Rust implementation of the required network model, not a
-line-by-line translation. The `LICENSE` file has the same SHA-256 digest as the
-file in that source revision.
+## Policy modes
 
-## Modes
+| Mode | Local input | Local output | Forwarding |
+| --- | --- | --- | --- |
+| `BlockAll` | drop | drop | drop |
+| `Learning` | default-drop; explicit inbound allows and replies bound to a current authorized outbound flow only | matching rules are allowed; otherwise supported traffic is allowed only after fail-closed application attribution and becomes an exact learned rule | return to the pre-existing firewall policy |
+| `Enforcing` | default-drop; explicit inbound allows and replies bound to a current authorized outbound flow only | default-drop; enabled manual and learned allow rules only | return to the pre-existing firewall policy |
 
-- `BlockAll` blocks local inbound, outbound, and forwarded IP traffic. The local
-  Unix control sockets remain available.
-- `Learning` sends otherwise-unmatched outbound TCP, UDP, ICMP echo, and ICMPv6
-  echo traffic through fail-closed application attribution. A successfully
-  attributed connection creates an exact application-bound endpoint rule with
-  the actual outbound interface. Missing, ambiguous, oversized, unsupported, or
-  timed-out attribution is denied. New inbound traffic remains denied except
-  where an explicit inbound rule allows it.
-- `Enforcing` permits new packets only when an enabled manual or learned rule
-  matches. Network-only rules are evaluated in the kernel; application-bound
-  outbound rules additionally require a successful process match. Established
-  TCP replies can use the current application authorization; UDP/ICMP replies
-  require an explicit inbound allow. There is no blanket
-  `ct state established accept`.
+A machine with no state file gets a persisted `Learning` policy. This does not
+create a fail-open startup window: every daemon start first installs a temporary
+kernel `BlockAll` quarantine. The saved policy is activated only after it has
+been validated, the NFQUEUE consumer is ready, and all required local
+prerequisites are available. An existing saved mode is preserved.
 
-Forwarding is always blocked: version 0.1 has no API for forwarding allow
-rules.
+Graceful shutdown installs kernel `BlockAll` again without overwriting the saved
+mode. Service-manager pre-start and post-stop hooks provide the same quarantine
+around daemon failures. A forced kill or kernel/backend failure cannot provide a
+universal persistence guarantee; operational recovery must therefore use a
+local console or independent out-of-band access.
 
-## Outbound application rules
+Learning applies only to supported outbound TCP, UDP, ICMP echo, and ICMPv6
+echo traffic. Missing, ambiguous, oversized, unsupported, or timed-out process
+attribution is denied. Inbound traffic is never learned automatically.
+Automatic insertion stops when the state already contains 7,500 learned rules,
+512 learned rules for one filesystem UID, or 256 for one filesystem UID and full
+executable file-version identity. These are admission budgets, not validation
+invariants for a legacy or root-edited state. The 10,000-rule total normally
+leaves 2,500 count slots for root-created rules, although root can still fill the
+total manually. Budgets use the numeric filesystem UID, so distinct subordinate
+UIDs count independently and can distribute activity until the global budget.
+Traffic that reaches a learning quota is allowed
+for that Learning decision but is not persisted and is therefore denied in
+Enforcing unless another rule matches. The separate 8 MiB state limit still
+applies. Reaching that byte limit or a recoverable save failure discards the
+current batch and pauses automatic persistence until a successful root mutation
+or daemon restart; otherwise eligible, successfully attributed `Learning`
+packets remain allowed but create no new rules while persistence is paused. An
+immutable current-policy admission index also keeps exact-known and saturated
+observations out of the 512-item persistence queue; only a new candidate consumes
+a queue slot.
 
-An outbound allow rule can be constrained by an application selector. Its
-executable path is mandatory and the persisted rule is always pinned to a
-device/inode pair. If the path is visible in the daemon's mount namespace, the
-daemon canonicalizes and opens it, fills the pair automatically, and rejects a
-conflicting supplied pair. A privileged operator must provide both values for a
-path outside that namespace.
+## Application-bound outbound rules
 
-Optional constraints are a numeric filesystem UID (`fsuid`, the fourth value on
-the procfs `Uid:` line), an exact unified-cgroup-v2 path, and either an exact or
-prefix command line. The cgroup identity comes from exactly one procfs
-`0::/path` entry; v1 controller entries are ignored. A v1-only host, a missing
-v2 identity, or multiple v2 identities deny application attribution. Command
-arguments are entered in the
-TUI as a JSON string array, preserving token boundaries and empty arguments;
-matching starts at `argv[0]`. Every supplied application and network field is
-combined with AND. Regular expressions, environment matching, parent-process
-selectors, persistent PID rules, MD5/SHA-1, and executable execution are
-deliberately unsupported.
+An application selector always includes a canonical executable path and a
+persisted file-version identity: device, inode, size, and change time in seconds
+and nanoseconds. Optional selectors constrain the filesystem UID, the exact
+unified-cgroup-v2 path, and an exact or prefix command line. The command line is
+represented as a JSON array of strings, so token boundaries and empty arguments
+are preserved. Every supplied application and network field is combined with
+logical AND.
 
-These selectors identify observed process metadata, not every piece of code
-inside the process. For example, `LD_PRELOAD=/tmp/evil.so /allowed/path` keeps
-the same path, device/inode, arguments, filesystem UID, and cgroup while the
-loaded library can initiate traffic. Interpreters, plugins, and JIT code have
-the same boundary; this is not code attestation.
+For a root-created rule, the daemon must resolve the path in its own mount
+namespace. It repeatedly canonicalizes and opens a regular file, fills an omitted
+version pin, and rejects a supplied stale pin or an unresolvable path. The TUI
+therefore sends no pin for a new or changed path and carries the complete old pin
+when the path is unchanged, so a concurrent executable replacement rejects the
+edit instead of silently authorizing new code. A learned rule pins the observed
+canonical path, complete file version, filesystem UID, exact tokenized argv,
+and, when available, the single unified-cgroup-v2 path. On cgroup v1 the cgroup
+field is absent while the other fields remain enforced.
 
-These values are bounded UTF-8: an application path is at most 4,096 bytes, a
-cgroup path 1,024 bytes, and a command selector at most 64 arguments, 1,024
-bytes per argument, and 8,192 bytes in total. Control and bidirectional-format
-characters and `.`/`..` path components are rejected. An empty JSON string is a
-valid argument, but an exact/prefix selector must contain at least one token.
+Exact argv can contain credentials, tokens, or other secrets. Learning persists
+it in the root-owned `0600` `/var/lib/openshield/state.json`; non-root observation
+redacts application selectors. Protect the state file and its backups. A change
+to argv or the unified cgroup path intentionally stops the learned selector from
+matching and requires a separate rule or a reviewed root edit. Treat Learning as
+a controlled capture window and review learned rules before Enforcing.
 
-The daemon attributes a queued packet by its kernel-reported UID and
-network tuple, requires exactly one socket inode and one owning process, and
-then performs bounded, repeated checks of the process start time, socket fd,
-executable path, file identity, and UID. Failure at any stage returns DROP. The
-owner search enumerates every `/proc/TGID/task/TID/fd` table, regardless of
-filesystem UID, and groups holders by TGID. Different TGIDs, a cross-UID holder,
-or any incomplete, unavailable, or bounded-out live process/task scan deny
-attribution. Sibling holders in one TGID count as one process only when every
-holder task has the same executable/file, argv, filesystem UID, and cgroup
-identity. A vanished entry is skipped only after procfs confirms it disappeared.
-`PermissionDenied` on a TGID-leader fd table is skipped only when two bounded
-`stat` reads confirm stable zombie state `Z`; every other error, non-zombie
-state, or unconfirmed state is denied.
-The queue is fixed at number 1337, has no `bypass` flag, and is bounded
-independently from the learning worker, so a missing or overloaded consumer
-cannot turn an application rule into a network-wide allow.
+The daemon attributes a queued packet from the kernel-reported UID and network
+tuple, requires one unambiguous socket inode and process owner, and performs
+bounded repeated checks of `/proc` metadata. It enumerates descriptor tables
+only for tasks whose filesystem UID equals the kernel socket UID, groups matching
+holders by process, and denies on incomplete candidate scans, multiple process
+owners, changing identity, or exhausted bounds. NFQUEUE number 1337 has no
+fail-open bypass flag. TCP authorization is tied to a persisted 30-bit policy
+generation that increases by one and is not reused before exhaustion; UDP and
+ICMP are re-attributed for every otherwise-unmatched outbound packet.
 
-After a successful TCP decision, both directions of the established connection
-are bound to a persisted, nonzero policy generation. A mode change or rule
-mutation that invalidates authorization advances the generation without reuse,
-so stale TCP state does not by itself preserve permission. UDP and ICMP are not
-cached: every otherwise-unmatched outbound packet is queued and attributed
-again, its conntrack mark is cleared, and its reply requires an explicit inbound
-allow. This prevents another process from inheriting an authorization by reusing
-a surviving UDP five-tuple.
+These selectors identify observed process metadata, not all code executing in
+the process. The version pin detects ordinary in-place rewrites through size or
+change-time differences, but dynamic loaders, interpreters, scripts, plugins,
+JIT code, mount-namespace aliases, descriptor transfer, and post-queue `exec`
+remain explicit trust boundaries. This mechanism is not cryptographic software
+attestation. Older serialized two-field device/inode application pins are rejected
+rather than silently upgraded; network-only state remains compatible. Review and
+recreate affected rules from a protected console.
+See the [threat model](docs/THREAT_MODEL.md) before relying on application rules
+as a security boundary.
 
-Rules are allow-only. A broader network-only rule can accept traffic before an
-application rule is considered; an application selector is not a deny override.
-Avoid overlapping generic allows when application identity must be mandatory.
+Rules are allow-only. A broad network-only rule is evaluated before an
+application rule and can authorize the same traffic without process matching.
+Avoid overlapping broad rules when application identity must be mandatory.
 
-## Privilege separation
+## Local access control
 
-The daemon accepts requests only through two fixed Unix sockets:
+The daemon exposes no TCP management endpoint. It creates two Unix sockets in
+the root-owned `/run/openshield` directory:
 
-| Path | Mode | Purpose |
-| --- | ---: | --- |
-| `/run/openshield/control.sock` | `0600` | mode changes and rule CRUD; additionally checks `SO_PEERCRED uid == 0` |
-| `/run/openshield/observe.sock` | `0666` | policy status, rules, events, and counters; available to every local user |
+| Path | Owner and mode | Authorization |
+| --- | --- | --- |
+| `/run/openshield/control.sock` | `root:root`, `0600` | mode and rule mutations; Linux `SO_PEERCRED` must report UID 0 |
+| `/run/openshield/observe.sock` | `root:openshield`, `0660` | read-only status, rules, events, and counters; peer must be root or a member of `openshield` |
 
-The TUI independently verifies the root ownership of the runtime directory,
-socket, and daemon process. An ordinary user receives a read-only interface;
-the daemon rejects mutation attempts again regardless of client behavior. Each
-mutation also contains the revision of the snapshot on which it is based. If
-the policy has already changed, the daemon returns `Conflict` before applying
-anything; the TUI reloads the snapshot and never retries the command
-automatically.
+Observation is not public. The daemon authenticates the peer with
+`SO_PEERCRED`; for a supplementary-group match it reads the peer's bounded procfs
+credentials twice and verifies a stable process start time. Filesystem mode
+alone is not treated as authorization. Non-root observers receive redacted
+application selectors and redacted names for application rules. Mutation
+requests are rejected on the observation socket regardless of the client.
+Authorization occurs when the Unix connection is accepted; a group member can
+pass an already-connected socket fd to another process. Treat group membership
+and processes running in those sessions as part of the monitoring trust boundary.
 
-Before working with nftables or persisted state, the daemon acquires a
-nonblocking exclusive lock on `/run/openshield/daemon.lock`. The lock must be a
-regular root-owned `0600` file; links are rejected. The
-`--install-fail-closed` action uses the same lock, so a manual invocation cannot
-overwrite the policy of a running instance.
+The package must create the system group before starting the daemon. To grant a
+user read-only monitoring access, add that user to `openshield` with the
+distribution's account-management tool, then start a new login session so the
+supplementary group is present. Group membership does not grant rule or mode
+changes.
 
-In version 0.1, observation consists of aggregate ALLOW/DROP/LEARN counters
-updated once per second and policy-change events; it is not a per-packet capture.
-For application decisions, the daemon reads a bounded packet prefix and bounded
-`/proc` identity metadata, including the command-line tokens, but never reads a
-process environment. A UID-0 observer receives full rule metadata. For every
-other UID the daemon replaces the application selector and even its potentially
-identifying rule name with fixed redacted values before serialization. The
-public IPC path uses a fixed worker pool and bounded queues: there can be at most
-24 active subscriptions globally and two per UID; a slow reader is disconnected
-when its 512-event queue fills. For each cursor the server ignores a smaller
-client limit, fetches up to 128 rules, and shrinks the page only to fit the 64
-KiB frame limit, returning a resumable cursor. The TUI reuses one connection,
-while the server permits at most two `Status` requests before strictly advancing
-pagination; `Subscribe` is valid only as the first request.
+The IPC protocol uses typed, length-bounded JSON frames, absolute I/O deadlines,
+bounded worker and subscription queues, rate limits, server-side pagination,
+and optimistic policy revisions. A stale mutation returns `Conflict`; the TUI
+reloads state and never retries an unconfirmed change automatically.
 
-## TUI languages
+## Building
 
-The TUI ships with separate, compile-time embedded JSON resources under
-`crates/openshield-tui/locales/` for 20 locales: English (`en`), Russian (`ru`),
-Chinese (`zh`), Spanish (`es`), Hindi (`hi`), Arabic (`ar`), Portuguese (`pt`),
-French (`fr`), German (`de`), Japanese (`ja`), Korean (`ko`), Indonesian (`id`),
-Turkish (`tr`), Italian (`it`), Polish (`pl`), Ukrainian (`uk`), Dutch (`nl`),
-Vietnamese (`vi`), Thai (`th`), and Persian (`fa`). Select one explicitly, for
-example:
-
-```console
-openshield-tui --locale ru
-```
-
-Without `--locale`, the TUI checks `LC_ALL`, `LC_MESSAGES`, `LANGUAGE`, and
-`LANG`, in that order, and falls back to English if none selects a supported
-locale; `LANGUAGE` may contain a colon-separated preference list, and `C` or
-`POSIX` selects the English fallback. An explicit unknown or malformed
-`--locale` is an error. Locale identifiers are bounded and parsed without
-filesystem access. At startup, the selected embedded resource is validated
-against the English message keys and placeholders, while the test suite
-validates all resources; the privileged TUI never loads a translation path
-supplied through the environment.
-
-## Building and verification
-
-Build the project as an unprivileged user:
+Build as an unprivileged user with the pinned lock file:
 
 ```console
 cargo build --release --locked
-cargo test --workspace --locked
+cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
 cargo audit --file Cargo.lock
 cargo deny check
 ```
 
-Linux, procfs, nftables, kernel NFQUEUE support, and `inet` family tables are
-required. The daemon checks a fixed root-owned `nft` at `/usr/sbin/nft`,
-`/usr/bin/nft`, or `/sbin/nft` and never invokes it through a shell.
+Application attribution requires Linux procfs plus kernel conntrack and NFQUEUE
+support. A cgroup-path selector additionally requires a unified cgroup v2
+identity. On v1-only systems, executable path, full file-version identity,
+filesystem-UID, and argv matching remain available, while an explicit
+cgroup-path selector fails closed.
+Network-only rules remain usable when attribution is unavailable. A usable installation also needs one
+of these backend sets:
 
-## Installation
+- a fixed, root-owned `nft` executable and kernel nftables support; or
+- complete, fixed, root-owned IPv4 and IPv6 `iptables`, `*-restore`, and
+  `*-save` bundles.
 
-> **Warning:** the first start deliberately installs `BlockAll`. It immediately
-> interrupts SSH, VPN, DNS, and all other IP traffic. Perform the first start
-> only from a local console or with independent out-of-band access.
+Executables are selected only from compiled absolute-path allowlists, checked
+for safe metadata, invoked with typed arguments and a cleared environment, and
+never passed through a shell.
 
-After building, install only the completed artifacts and the unit file:
+## Installation and init systems
+
+OpenShield includes service definitions for systemd, OpenRC, SysVinit, runit,
+s6, and dinit. `packaging/stage-install.sh` stages a package tree for exactly one
+of these init systems; by design it refuses to install directly into `/`.
+Package maintainers should use it with a fresh `DESTDIR`, install the staged
+files through their package manager, and run the platform-specific enablement
+step described in [packaging/README.md](packaging/README.md).
+
+For a manual systemd installation, install both binaries, the unit, and the
+sysusers and tmpfiles declarations. Create the group and the shared xtables lock
+before starting the service:
 
 ```console
 sudo install -o root -g root -m 0755 target/release/openshield-daemon /usr/bin/openshield-daemon
 sudo install -o root -g root -m 0755 target/release/openshield-tui /usr/bin/openshield-tui
 sudo install -o root -g root -m 0644 packaging/daemon/openshield-daemon.service /usr/lib/systemd/system/openshield-daemon.service
+sudo install -o root -g root -m 0644 packaging/daemon/openshield.sysusers /usr/lib/sysusers.d/openshield.conf
+sudo install -o root -g root -m 0644 packaging/daemon/openshield.tmpfiles /usr/lib/tmpfiles.d/openshield.conf
+sudo systemd-sysusers /usr/lib/sysusers.d/openshield.conf
+sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/openshield.conf
 sudo systemctl daemon-reload
 ```
 
-The unit first runs the explicitly documented
-`openshield-daemon --install-fail-closed` action, which installs only
-`BlockAll`. The main process uses `Type=notify` and sends `READY=1` only after a
-validated policy, the fail-closed NFQUEUE consumer, and both IPC sockets are
-active. The `[Install]` section contains `RequiredBy=network-pre.target`; after
-`systemctl enable openshield-daemon`, this creates a success dependency, while
-`Before=network-pre.target` keeps the target behind the readiness boundary. A
-standard consumer of `network-pre.target` therefore does not proceed through
-that target when the fixed `nft` executable is missing or `ExecStartPre` fails.
+### Safe first activation on a remote server
 
-This is not a guarantee for all boot-time traffic. Installing the file without
-enabling it creates no `RequiredBy` link, and a network manager, unit, initramfs,
-or early packet path that bypasses `network-pre.target` also bypasses this
-dependency. Strict whole-boot enforcement needs tested distribution-specific
-integration or an initramfs policy.
+> **Warning:** `Learning` still denies all new inbound traffic unless an
+> explicit inbound allow rule matches. Starting OpenShield over the only SSH or
+> VPN path can immediately lock out the operator.
 
-Independently of the unit helper, every daemon start first installs kernel
-`BlockAll`, selects a cryptographically random nonzero startup epoch from the
-lower 29 bits of the 30-bit flow-generation domain, persists it, and only then
-applies the saved policy. The new value differs from the previously persisted
-one, invalidating TCP authorization marks from the previous daemon process.
-
-Application attribution requires inspecting protected metadata below `/proc`.
-The packaged unit therefore retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
-`CAP_DAC_READ_SEARCH`, while explicitly denying `ptrace`, `process_vm_readv`,
-`process_vm_writev`, `kcmp`, `pidfd_getfd`, and `open_by_handle_at` syscalls.
-The normal daemon code does not inspect process memory or environments, but the
-syscall list is not memory isolation: after a daemon compromise,
-`CAP_SYS_PTRACE` can still authorize opening `/proc/<pid>/mem`, and ordinary
-read/write syscalls remain available. `CAP_DAC_READ_SEARCH` can also bypass
-read/search permissions for files visible to the service. Procfs magic links
-such as `/proc/<pid>/root` may expose another process's mount view despite the
-service mount restrictions. These capabilities are therefore a material trust
-expansion; see the threat model before enabling application rules.
-
-From a local console, start the daemon and then open the privileged TUI to add
-rules or deliberately enable Learning:
+Use a local console or independently tested out-of-band management for the
+first activation. Start the daemon, open the root TUI from that console, and
+create a narrowly scoped inbound rule for the administration protocol, source
+network, local port, and interface. Verify the rule from a second session before
+depending on remote access. Keep Learning enabled only for a controlled window,
+review and narrow every learned outbound rule, then switch to `Enforcing` and
+verify required DNS, time synchronization, package mirrors, monitoring, backup,
+and application traffic.
 
 ```console
 sudo systemctl enable --now openshield-daemon.service
 sudo openshield-tui
 ```
 
-For unprivileged live observation:
+A monitoring user with a fresh `openshield` group session can then run:
 
 ```console
 openshield-tui
 ```
 
-Do not simultaneously run another manager that executes `flush ruleset` or
-modifies `inet openshield`. The daemon detects a missing table, base hook, or
-named counter and attempts to restore the current policy. An isolated
-`flush chain` leaves the default-drop hook in place and therefore remains
-fail-closed, but lost permits may not be noticed until the next policy change or
-restart. The monitor does not compare complete rule bodies, so a privileged
-targeted edit or additional allow can evade it. Concurrent firewall services
-are unsupported.
+Do not manually flush or edit OpenShield-owned backend objects. Do not run a
+second privileged firewall manager unless its hook ordering, chain ownership,
+upper-two packet-mark use, and low-31 conntrack-mark use have been reviewed for
+compatibility. Recovery and
+removal are administrative firewall changes and should be performed from a
+console using a distribution-specific, tested rollback procedure.
 
-Stopping the service leaves the last kernel-resident policy active. This
-protects the host if userspace crashes. To **deliberately** remove protection,
-first stop and disable the service from a local console, then delete only the
-table owned by OpenShield:
+## Backend behavior and coexistence
+
+nftables is preferred. It uses the dedicated `inet openshield` table and
+validates a complete replacement before an atomic nftables transaction.
+
+The compatibility backend creates only `OPENSHIELD_*` chains and places
+dispatch jumps first in the built-in IPv4 and IPv6 INPUT, OUTPUT, and FORWARD
+chains. It uses `iptables-restore`/`ip6tables-restore` with `--noflush`; it does
+not flush a system table or change a built-in chain policy. Because xtables has
+no transaction spanning both address families, policy replacement first places
+both families in `BlockAll`, then applies IPv4 and IPv6. A transition can cause
+a temporary denial, but is designed not to create a cross-family allow window.
+
+In `Learning` and `Enforcing`, the OpenShield forwarding chain returns to the
+existing firewall rather than accepting forwarded traffic itself. Consequently
+the system's pre-existing forwarding policy remains authoritative. In
+`BlockAll`, OpenShield drops forwarded traffic before delegating it.
+
+OpenShield reserves the upper two packet-mark bits and preserves the lower 30.
+For application authorization it reserves the low 31 conntrack-mark bits and
+preserves bit 31. A firewall, VPN, QoS, or CONNMARK writer using the reserved
+bits can invalidate either policy. The daemon's
+health checks are backend-specific but do not establish safe coexistence with
+arbitrary privileged ruleset editors.
+
+## Compatibility evidence
+
+Compatibility claims are intentionally scoped:
+
+- final Rust 1.98.0 workspace verification passed formatting, locked
+  all-target checks, clippy with warnings denied, and all 247 tests: 55 core,
+  129 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
+  live-firewall end-to-end result;
+- both final static-PIE musl binaries completed a no-network, read-only,
+  capability-free `--version` smoke test in all 60 container image rows in
+  `tests/compat/distros.tsv`;
+- all six service layouts passed static validation; dedicated container
+  supervisor checks passed for OpenRC, SysVinit, runit, s6, and dinit, while
+  systemd is checked separately rather than booted as PID 1 in that matrix;
+- `cargo check --workspace --all-targets --locked` passed for 21 stable Rust
+  Linux targets covering x86, x86_64/amd64, ARMv5/6/7 (soft- and hard-float
+  variants where Rust provides them), arm64/aarch64, and RISC-V 64 with the
+  listed GNU or musl environments;
+- the two RISC-V 32 targets are Rust Tier 3 and were skipped because stable
+  rustup does not ship their standard libraries; they require an explicitly
+  separate nightly `build-std` workflow;
+- non-native `cargo check` proves source-level compilation, not operation on
+  physical hardware. arm64 execution was not available on the test host because
+  no binfmt/QEMU handler was installed.
+
+The 60-image smoke matrix does not boot each image's init system and does not
+exercise its kernel, firewall backend, NFQUEUE, package manager, or upgrade
+path. Archive and rolling images are compatibility probes, not supported-life
+guarantees. See [tests/compat/README.md](tests/compat/README.md) for exact rows,
+commands, and interpretation.
+
+The final Rust 1.98.0 Debian Bookworm release binaries passed the isolated
+`tests/e2e/server-learning-enforcing.sh` workflow separately with nftables and
+iptables. Both runs covered Learning, UDP/TCP Enforcing, an explicit inbound
+allow, and restart. They ran in disposable namespaces on a local Unix-socket
+Docker engine; they neither tested nor modified the host firewall and are not
+production certification.
+
+## TUI localization
+
+The TUI embeds 31 separate JSON resources with 183 messages each: the original
+20 locales plus 11 additions. Each non-English resource is loaded as a complete
+map without merging or falling back to English. Tests verify exact key,
+placeholder, and newline parity for every compiled resource; no non-English
+value is exactly equal to its English counterpart. An all-pairs regression also
+rejects bulk reuse of substantive messages across languages. The complete
+maintained list, inventory of missing and removed resources, and native-review
+status are documented in
+[`crates/openshield-tui/locales/README.md`](crates/openshield-tui/locales/README.md).
+Select a locale explicitly with, for example:
 
 ```console
-sudo systemctl disable --now openshield-daemon.service
-sudo nft delete table inet openshield
+openshield-tui --locale ru
 ```
 
-If the journal reports `read-only quarantine`, the kernel already has
-`BlockAll` installed and the daemon deliberately remains alive, so
-`Restart=on-failure` is not triggered: the persisted file may be in an ambiguous
-state. From a local console, repair the filesystem and directory permissions
-first, stop the service, move
-`/var/lib/openshield/state.json` to a root-only backup for analysis, and only
-then restart the service. If `state.json` is absent, the daemon safely creates a
-new empty `BlockAll` state.
+Without `--locale`, the TUI checks `LC_ALL`, `LC_MESSAGES`, `LANGUAGE`, and
+`LANG`, then falls back to English only when no supported locale is selected.
+Locale identifiers are bounded and never used as filesystem paths. Automated
+structure and copy-detection tests do not constitute linguistic certification
+or replace review by native technical translators. No native technical review
+is recorded for the 11 additions. Six proposed resources (`os`, `inh`, `bua`,
+`xal`, `ady`, and `kjh`) were removed after forensic comparison found large
+cross-language copied blocks; they remain unsupported pending replacement and
+native technical review.
 
-## Rules and limitations
+## Important limits
 
-A rule contains a direction, protocol, remote IP/CIDR, port or port range, and
-interface. Every field is typed and validated before nftables generation.
-Rules are allow-only; no match means DROP.
+- New inbound traffic is default-deny in every mode; IPv6 operation can require
+  explicit, interface- and network-scoped ICMPv6 permissions.
+- The filter covers host IPv4/IPv6, not Ethernet/ARP or direct frame injection
+  by an already privileged `AF_PACKET`/`CAP_NET_RAW` process.
+- Learning is a bounded operator-controlled trust window, not a verdict that a
+  local executable or remote endpoint is benign.
+- The packaged daemon retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
+  `CAP_DAC_READ_SEARCH` for firewall and cross-UID procfs attribution. The
+  systemd syscall filter reduces attack surface but is not process-memory or
+  filesystem isolation after daemon compromise.
+- The workspace, matrices, and audit reduce known risk; they do not prove the
+  absence of vulnerabilities or certify every Linux distribution, kernel,
+  architecture, boot path, or hardware implementation.
 
-- For inbound TCP/UDP, the port is the local destination port; for outbound
-  TCP/UDP, it is the remote destination port.
-- Correct IPv6 connectivity may require explicit inbound ICMPv6 permissions,
-  for example for NDP/RA. Version 0.1 does not yet implement ICMP type/code
-  selectors, so scope such a rule to a link-local CIDR and interface.
-- Counters reset after an atomic policy replacement, such as a mode or manual
-  rule change; the TUI must treat a decrease as a reset.
-- Enable Learning only for a controlled period and review the rules it creates:
-  any attributable local process can deliberately contact many endpoints. The
-  daemon limits state to 10,000 rules, queues at most 512 learning observations,
-  persists at most 256 in one batch, and enforces an independent exact 8 MiB
-  encoded-state quota before nftables application. A manual mutation over the
-  quota is rejected; Learning pauses a batch on the quota or a recoverable save
-  failure and retains the previous state and active policy. These bounds do not
-  decide which application the operator intended to trust.
-- Executable pinning currently identifies a file by canonical path and
-  device/inode, not by a content digest or mount-namespace identity. Command-line
-  and cgroup values are read after the packet is queued and can be changed by the
-  process. Treat these selectors as useful constraints, not as cryptographic
-  software attestation; see the threat model for the fail-closed race handling
-  and remaining limitations.
-- Process identity is checked for the first queued packet of an established TCP
-  connection, not continuously for every later TCP packet. A later exec,
-  credential/cgroup change, or socket-fd transfer may therefore continue that
-  connection until it is reconnected or a policy-generation change invalidates
-  it. UDP and ICMP are re-attributed per outbound packet. Even before any
-  decision, a sender can queue a packet and exec an allowed image while
-  retaining the socket; post-hoc procfs attribution may see only the new image.
-- OpenShield reserves the upper two packet-mark bits during outbound processing
-  and preserves the lower 30 bits, but it exclusively owns the complete
-  conntrack mark on application-authorized traffic: it stores the TCP cache and
-  clears the mark for UDP/ICMP. Other packet-mark users must avoid the upper
-  bits; another firewall, VPN, QoS, or CONNMARK writer on the same conntrack
-  entry is unsupported. A privileged earlier CONNMARK rule can potentially
-  forge the current value on an established TCP flow and bypass the queue; NEW
-  traffic never uses this fast path, but exclusive mark ownership and compatible
-  hook ordering are required.
-- The `inet` table filters host IPv4/IPv6 traffic but is not an L2 firewall: it
-  does not block ARP or direct frame injection by a privileged
-  `AF_PACKET`/`CAP_NET_RAW` peer.
-- OpenShield does not modify other nftables tables, but a chain owned by another
-  product may still additionally block a packet that OpenShield accepts.
-
-For details, see the [architecture](docs/ARCHITECTURE.md),
-[threat model](docs/THREAT_MODEL.md), [audit report](docs/SECURITY_AUDIT.md), and
-[security policy](SECURITY.md).
+See the [architecture](docs/ARCHITECTURE.md),
+[threat model](docs/THREAT_MODEL.md),
+[security audit](docs/SECURITY_AUDIT.md),
+[security policy](SECURITY.md), and
+[packaging guide](packaging/README.md).

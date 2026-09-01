@@ -233,17 +233,21 @@ impl<'de> Deserialize<'de> for CommandLineSelector {
 pub struct ExecutableFileId {
     pub device: u64,
     pub inode: u64,
+    pub size: u64,
+    pub ctime_seconds: i64,
+    pub ctime_nanoseconds: i64,
 }
 
 impl ExecutableFileId {
-    /// Validates a persistent executable device/inode pair.
+    /// Validates a persistent executable version identity.
     ///
     /// # Errors
     ///
     /// Returns [`ApplicationValidationError::InvalidExecutableFileId`] when
-    /// the inode is zero.
+    /// the inode is zero or the change-time nanoseconds are outside the
+    /// kernel's normalized range.
     pub fn validate(self) -> Result<(), ApplicationValidationError> {
-        if self.inode == 0 {
+        if self.inode == 0 || !(0..1_000_000_000).contains(&self.ctime_nanoseconds) {
             return Err(ApplicationValidationError::InvalidExecutableFileId);
         }
         Ok(())
@@ -406,7 +410,7 @@ pub struct ApplicationIdentity {
     pub cgroups: Vec<CgroupPath>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LearnedApplicationEndpoint {
     pub endpoint: LearnedEndpoint,
     pub application: ApplicationSelector,
@@ -422,7 +426,11 @@ impl LearnedApplicationEndpoint {
         self.endpoint
             .validate()
             .map_err(|_| ApplicationValidationError::InvalidLearnedEndpoint)?;
-        self.application.validate()
+        self.application.validate()?;
+        if self.application.uid.is_none() || self.application.executable_file.is_none() {
+            return Err(ApplicationValidationError::IncompleteLearnedApplicationIdentity);
+        }
+        Ok(())
     }
 }
 
@@ -457,19 +465,27 @@ impl ApplicationIdentity {
         Ok(())
     }
 
-    /// Builds the stable path, file-id, and UID selector used by learning.
+    /// Builds the exact application selector used by learning.
     ///
     /// # Errors
     ///
     /// Returns [`ApplicationValidationError`] if the captured identity cannot
     /// form a valid application selector.
     pub fn learned_selector(&self) -> Result<ApplicationSelector, ApplicationValidationError> {
+        self.validate()?;
+        let command_line =
+            CommandLineSelector::new(CommandLineMatch::Exact, self.command_line.clone())?;
+        let cgroup = match self.cgroups.as_slice() {
+            [] => None,
+            [cgroup] => Some(cgroup.clone()),
+            _ => return Err(ApplicationValidationError::InvalidProcessIdentity),
+        };
         ApplicationSelector::new(
             Some(self.executable.clone()),
             Some(self.executable_file),
-            None,
+            Some(command_line),
             Some(self.uid),
-            None,
+            cgroup,
         )
     }
 }
@@ -488,12 +504,14 @@ pub enum ApplicationValidationError {
     ApplicationSelectorNeedsExecutable,
     #[error("executable file identity requires an executable path")]
     FileIdWithoutExecutablePath,
-    #[error("executable file identity has an invalid inode")]
+    #[error("executable file version identity is invalid")]
     InvalidExecutableFileId,
     #[error("runtime process identity is incomplete or exceeds its fixed bounds")]
     InvalidProcessIdentity,
     #[error("learned application endpoint is not an exact supported network endpoint")]
     InvalidLearnedEndpoint,
+    #[error("learned application identity requires a filesystem UID and pinned executable file")]
+    IncompleteLearnedApplicationIdentity,
     #[error("redacted application selector has unexpected metadata")]
     InvalidRedactedSelector,
 }
@@ -523,6 +541,9 @@ mod tests {
             executable_file: ExecutableFileId {
                 device: 8,
                 inode: 99,
+                size: 12_345,
+                ctime_seconds: 1_700_000_000,
+                ctime_nanoseconds: 123_456_789,
             },
             command_line: vec![
                 CommandArgument::new("curl")?,
@@ -555,6 +576,9 @@ mod tests {
             Some(ExecutableFileId {
                 device: 8,
                 inode: 99,
+                size: 12_345,
+                ctime_seconds: 1_700_000_000,
+                ctime_nanoseconds: 123_456_789,
             }),
             Some(CommandLineSelector::new(
                 CommandLineMatch::Prefix,
@@ -577,6 +601,56 @@ mod tests {
     }
 
     #[test]
+    fn selector_rejects_in_place_executable_version_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = identity()?;
+        let selector = ApplicationSelector::new(
+            Some(original.executable.clone()),
+            Some(original.executable_file),
+            None,
+            Some(original.uid),
+            None,
+        )?;
+        let rewritten = ApplicationIdentity {
+            executable_file: ExecutableFileId {
+                device: original.executable_file.device,
+                inode: original.executable_file.inode,
+                size: original.executable_file.size + 1,
+                ctime_seconds: original.executable_file.ctime_seconds + 1,
+                ctime_nanoseconds: original.executable_file.ctime_nanoseconds,
+            },
+            ..original
+        };
+
+        assert!(!selector.matches(&rewritten));
+        Ok(())
+    }
+
+    #[test]
+    fn executable_version_rejects_invalid_timestamp_nanoseconds() {
+        let invalid = ExecutableFileId {
+            device: 8,
+            inode: 99,
+            size: 1,
+            ctime_seconds: 0,
+            ctime_nanoseconds: 1_000_000_000,
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(ApplicationValidationError::InvalidExecutableFileId)
+        );
+    }
+
+    #[test]
+    fn executable_version_wire_format_requires_every_known_field() {
+        assert!(serde_json::from_str::<ExecutableFileId>(r#"{"device":8,"inode":99}"#).is_err());
+        assert!(serde_json::from_str::<ExecutableFileId>(
+            r#"{"device":8,"inode":99,"size":1,"ctime_seconds":2,"ctime_nanoseconds":3,"digest":"unexpected"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn rejects_traversal_deleted_and_bidi_paths() {
         assert!(ApplicationPath::new("/usr/../bin/curl").is_err());
         assert!(ApplicationPath::new("/usr/bin/curl (deleted)").is_err());
@@ -584,12 +658,46 @@ mod tests {
     }
 
     #[test]
-    fn learned_selector_uses_stable_identity_not_mutable_arguments()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let selector = identity()?.learned_selector()?;
-        assert!(selector.command_line.is_none());
+    fn learned_selector_pins_exact_captured_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let identity = identity()?;
+        let selector = identity.learned_selector()?;
+        assert_eq!(
+            selector.command_line,
+            Some(CommandLineSelector::new(
+                CommandLineMatch::Exact,
+                identity.command_line.clone(),
+            )?)
+        );
         assert_eq!(selector.uid, Some(1_000));
         assert!(selector.executable_file.is_some());
+        assert_eq!(selector.cgroup, identity.cgroups.first().cloned());
+        assert!(selector.matches(&identity));
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selector_omits_unavailable_v1_cgroup_but_keeps_exact_argv()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut identity = identity()?;
+        identity.cgroups.clear();
+        let selector = identity.learned_selector()?;
+        assert!(selector.command_line.is_some());
+        assert!(selector.cgroup.is_none());
+        assert!(selector.matches(&identity));
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selector_rejects_ambiguous_cgroup_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut identity = identity()?;
+        identity
+            .cgroups
+            .push(CgroupPath::new("/user.slice/other.scope")?);
+        assert_eq!(
+            identity.learned_selector(),
+            Err(ApplicationValidationError::InvalidProcessIdentity)
+        );
         Ok(())
     }
 }

@@ -18,7 +18,6 @@ const MAX_RULE_NAME_CHARS: usize = 128;
 const MAX_NETWORK_CHARS: usize = 64;
 const MAX_PORT_CHARS: usize = 11;
 const MAX_INTERFACE_CHARS: usize = 15;
-const MAX_FILE_ID_CHARS: usize = 20;
 const MAX_UID_CHARS: usize = 10;
 const MAX_ARGUMENTS_JSON_BYTES: usize = MAX_COMMAND_LINE_BYTES * 3;
 
@@ -68,8 +67,6 @@ pub enum FormField {
     Interface,
     Application,
     Executable,
-    Device,
-    Inode,
     CommandMode,
     Arguments,
     Uid,
@@ -87,9 +84,7 @@ impl FormField {
             Self::Port => Self::Interface,
             Self::Interface => Self::Application,
             Self::Application => Self::Executable,
-            Self::Executable => Self::Device,
-            Self::Device => Self::Inode,
-            Self::Inode => Self::CommandMode,
+            Self::Executable => Self::CommandMode,
             Self::CommandMode => Self::Arguments,
             Self::Arguments => Self::Uid,
             Self::Uid => Self::Cgroup,
@@ -108,9 +103,7 @@ impl FormField {
             Self::Interface => Self::Port,
             Self::Application => Self::Interface,
             Self::Executable => Self::Application,
-            Self::Device => Self::Executable,
-            Self::Inode => Self::Device,
-            Self::CommandMode => Self::Inode,
+            Self::CommandMode => Self::Executable,
             Self::Arguments => Self::CommandMode,
             Self::Uid => Self::Arguments,
             Self::Cgroup => Self::Uid,
@@ -149,8 +142,6 @@ pub struct RuleForm {
     pub interface: String,
     pub bind_application: bool,
     pub executable: String,
-    pub executable_device: String,
-    pub executable_inode: String,
     pub command_mode: CommandMode,
     pub arguments: String,
     pub uid: String,
@@ -158,6 +149,8 @@ pub struct RuleForm {
     pub origin: RuleOrigin,
     pub enabled: bool,
     pub error: Option<String>,
+    original_executable: Option<ApplicationPath>,
+    original_executable_file: Option<ExecutableFileId>,
 }
 
 impl Default for RuleForm {
@@ -173,8 +166,6 @@ impl Default for RuleForm {
             interface: String::new(),
             bind_application: false,
             executable: String::new(),
-            executable_device: String::new(),
-            executable_inode: String::new(),
             command_mode: CommandMode::Any,
             arguments: String::new(),
             uid: String::new(),
@@ -182,6 +173,8 @@ impl Default for RuleForm {
             origin: RuleOrigin::Manual,
             enabled: true,
             error: None,
+            original_executable: None,
+            original_executable_file: None,
         }
     }
 }
@@ -225,12 +218,6 @@ impl RuleForm {
             executable: application
                 .and_then(|selector| selector.executable.as_ref())
                 .map_or_else(String::new, ToString::to_string),
-            executable_device: application
-                .and_then(|selector| selector.executable_file)
-                .map_or_else(String::new, |file| file.device.to_string()),
-            executable_inode: application
-                .and_then(|selector| selector.executable_file)
-                .map_or_else(String::new, |file| file.inode.to_string()),
             command_mode: command_line.map_or(CommandMode::Any, |selector| match selector.kind {
                 CommandLineMatch::Exact => CommandMode::Exact,
                 CommandLineMatch::Prefix => CommandMode::Prefix,
@@ -245,6 +232,8 @@ impl RuleForm {
             origin: rule.spec.origin,
             enabled: rule.spec.enabled,
             error: None,
+            original_executable: application.and_then(|selector| selector.executable.clone()),
+            original_executable_file: application.and_then(|selector| selector.executable_file),
         }
     }
 
@@ -265,20 +254,6 @@ impl RuleForm {
             FormField::Port => (&mut self.port, MAX_PORT_CHARS),
             FormField::Interface => (&mut self.interface, MAX_INTERFACE_CHARS),
             FormField::Executable => (&mut self.executable, MAX_APPLICATION_PATH_BYTES),
-            FormField::Device => {
-                if character.is_ascii_digit() && self.executable_device.len() < MAX_FILE_ID_CHARS {
-                    self.executable_device.push(character);
-                    self.error = None;
-                }
-                return;
-            }
-            FormField::Inode => {
-                if character.is_ascii_digit() && self.executable_inode.len() < MAX_FILE_ID_CHARS {
-                    self.executable_inode.push(character);
-                    self.error = None;
-                }
-                return;
-            }
             FormField::Arguments => (&mut self.arguments, MAX_ARGUMENTS_JSON_BYTES),
             FormField::Uid => {
                 if character.is_ascii_digit() && self.uid.len() < MAX_UID_CHARS {
@@ -320,12 +295,6 @@ impl RuleForm {
             FormField::Executable => {
                 self.executable.pop();
             }
-            FormField::Device => {
-                self.executable_device.pop();
-            }
-            FormField::Inode => {
-                self.executable_inode.pop();
-            }
             FormField::Arguments => {
                 self.arguments.pop();
             }
@@ -365,8 +334,6 @@ impl RuleForm {
             | FormField::Port
             | FormField::Interface
             | FormField::Executable
-            | FormField::Device
-            | FormField::Inode
             | FormField::Arguments
             | FormField::Uid
             | FormField::Cgroup => return,
@@ -450,11 +417,9 @@ impl RuleForm {
                 &[("error", error.to_string().as_str())],
             )
         })?;
-        let executable_file = parse_file_identity(
-            self.executable_device.trim(),
-            self.executable_inode.trim(),
-            i18n,
-        )?;
+        let executable_file = (self.original_executable.as_ref() == Some(&executable))
+            .then_some(self.original_executable_file)
+            .flatten();
         let command_line = match self.command_mode {
             CommandMode::Any => {
                 if !self.arguments.trim().is_empty() {
@@ -505,30 +470,6 @@ impl RuleForm {
                     &[("error", error.to_string().as_str())],
                 )
             })
-    }
-}
-
-fn parse_file_identity(
-    device: &str,
-    inode: &str,
-    i18n: &I18n,
-) -> Result<Option<ExecutableFileId>, String> {
-    match (device.is_empty(), inode.is_empty()) {
-        (true, true) => Ok(None),
-        (false, false) => {
-            let file = ExecutableFileId {
-                device: device
-                    .parse::<u64>()
-                    .map_err(|_| i18n.tr("validation.invalid_device").to_owned())?,
-                inode: inode
-                    .parse::<u64>()
-                    .map_err(|_| i18n.tr("validation.invalid_inode").to_owned())?,
-            };
-            file.validate()
-                .map_err(|_| i18n.tr("validation.invalid_inode").to_owned())?;
-            Ok(Some(file))
-        }
-        (true, false) | (false, true) => Err(i18n.tr("validation.file_id_pair").to_owned()),
     }
 }
 
@@ -1092,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn form_preserves_bounded_application_identity_and_argv_boundaries()
+    fn new_form_leaves_executable_version_for_daemon_pinning()
     -> Result<(), Box<dyn std::error::Error>> {
         let form = RuleForm {
             name: "curl application".to_owned(),
@@ -1100,8 +1041,6 @@ mod tests {
             port: "443".to_owned(),
             bind_application: true,
             executable: "/usr/bin/curl".to_owned(),
-            executable_device: "8".to_owned(),
-            executable_inode: "99".to_owned(),
             command_mode: CommandMode::Exact,
             arguments: r#"["curl","--header=A B"]"#.to_owned(),
             uid: "1000".to_owned(),
@@ -1111,19 +1050,59 @@ mod tests {
 
         let rule = form.to_rule_spec(&I18n::test_english()).map_err(io_error)?;
         let selector = rule.application.ok_or("application selector missing")?;
-        assert_eq!(
-            selector.executable_file,
-            Some(ExecutableFileId {
-                device: 8,
-                inode: 99,
-            })
-        );
+        assert_eq!(selector.executable_file, None);
         assert_eq!(selector.uid, Some(1_000));
         assert!(selector.command_line.is_some_and(|command| {
             command.kind == CommandLineMatch::Exact
                 && command.arguments.len() == 2
                 && command.arguments[1].as_str() == "--header=A B"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn edit_preserves_pin_only_for_the_unchanged_executable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let form = RuleForm {
+            name: "curl application".to_owned(),
+            protocol: TransportProtocol::Tcp,
+            bind_application: true,
+            executable: "/usr/bin/curl".to_owned(),
+            ..RuleForm::default()
+        };
+        let mut specification = form.to_rule_spec(&I18n::test_english()).map_err(io_error)?;
+        let pinned_version = ExecutableFileId {
+            device: 8,
+            inode: 99,
+            size: 12_345,
+            ctime_seconds: 1_700_000_000,
+            ctime_nanoseconds: 123_456_789,
+        };
+        specification
+            .application
+            .as_mut()
+            .ok_or("application selector missing")?
+            .executable_file = Some(pinned_version);
+        specification.validate()?;
+        let rule = Rule::new(specification)?;
+
+        let mut edit = RuleForm::from_rule(&rule);
+        let unchanged = edit.to_rule_spec(&I18n::test_english()).map_err(io_error)?;
+        assert_eq!(
+            unchanged
+                .application
+                .and_then(|selector| selector.executable_file),
+            Some(pinned_version)
+        );
+
+        edit.executable = "/usr/bin/wget".to_owned();
+        let changed = edit.to_rule_spec(&I18n::test_english()).map_err(io_error)?;
+        assert_eq!(
+            changed
+                .application
+                .and_then(|selector| selector.executable_file),
+            None
+        );
         Ok(())
     }
 

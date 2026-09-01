@@ -1,70 +1,102 @@
 [English](README.md) | [Русский](README.ru.md)
 
-# Daemon packaging
+# systemd daemon packaging
 
-Install `openshield-daemon` as `/usr/bin/openshield-daemon` and the unit as
-`/usr/lib/systemd/system/openshield-daemon.service`.
+This directory contains the systemd unit, sysusers declaration, and tmpfiles
+declaration. The unit is valid for both the preferred nftables backend and the automatic
+`iptables`/`ip6tables` fallback.
 
-The service deliberately runs as root and retains `CAP_NET_ADMIN`,
-`CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. The latter two capabilities let the
-daemon bind queued socket inodes to protected `/proc/<pid>` identity metadata
-across local UIDs. The syscall filter still denies `ptrace`,
-`process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_getfd`, and
-`open_by_handle_at`, but these capabilities materially increase the impact of a
-daemon compromise and must not be treated as complete privilege separation.
-In particular, the filter does not prevent a compromised process with
-`CAP_SYS_PTRACE` from opening `/proc/<pid>/mem` and using ordinary read/write
-syscalls. `CAP_DAC_READ_SEARCH` can also bypass read/search permissions for
-files visible in the service mount namespace.
+Install these files through the package manager:
 
-The service creates:
+| Source | Destination | Mode |
+| --- | --- | ---: |
+| `openshield-daemon.service` | `/usr/lib/systemd/system/openshield-daemon.service` | `0644` |
+| `openshield.sysusers` | `/usr/lib/sysusers.d/openshield.conf` | `0644` |
+| `openshield.tmpfiles` | `/usr/lib/tmpfiles.d/openshield.conf` | `0644` |
+| release daemon | `/usr/bin/openshield-daemon` | `0755` |
+| release TUI | `/usr/bin/openshield-tui` | `0755` |
 
-- `/run/openshield/control.sock` (`0600`) for root-only mutations;
-- `/run/openshield/observe.sock` (`0666`) for sanitized, read-only status/events;
-- `/run/openshield/daemon.lock` (root-owned regular `0600`) for the singleton
-  daemon and startup-policy transaction;
-- `/var/lib/openshield/state.json` (`0600`) for atomically persisted state.
+Run `systemd-sysusers` and `systemd-tmpfiles --create` before starting the
+service. The daemon deliberately refuses partial startup when the required
+`openshield` group cannot be resolved.
 
-Do not relocate either socket to a shared temporary directory and do not weaken
-the runtime-directory ownership checks in the daemon.
+## Runtime objects
 
-The first start installs `BlockAll` before opening either socket. Start it only
-from a local console or with independent out-of-band access, then use
-`sudo openshield-tui` to add rules or enter Learning mode. Stopping the service
-leaves the kernel-resident policy active; see the
-[top-level README](../../README.md) for the explicit fixed-table removal
-procedure.
+The service creates or verifies:
 
-The unit's `ExecStartPre` invokes the root-only, non-configurable
-`openshield-daemon --install-fail-closed` action. The main daemon then sends the
-systemd `READY=1` notification only after it has applied validated state, bound
-the fixed fail-closed NFQUEUE 1337 consumer, and bound both verified sockets.
-The queue has no nftables `bypass` flag; if it cannot be bound, startup fails
-with `BlockAll` still active. Do not change the unit back to `Type=simple`, or
-network startup will no longer wait for that readiness boundary.
+- `/run/openshield/control.sock`, `root:root` and `0600`, for UID-0 mutation;
+- `/run/openshield/observe.sock`, `root:openshield` and `0660`, for read-only
+  monitoring by root and members of `openshield`;
+- `/run/openshield/daemon.lock`, a root-owned regular `0600` singleton lock;
+- `/run/xtables.lock`, the standard root-owned `0600` xtables serialization
+  lock created by tmpfiles;
+- `/var/lib/openshield/state.json`, a root-owned `0600` atomically persisted
+  state file.
 
-The `[Install]` section includes `RequiredBy=network-pre.target`. Running
-`systemctl enable openshield-daemon` creates that requirement; together with
-`Before=network-pre.target`, a standard consumer of the target cannot proceed
-through it unless OpenShield starts successfully. Merely copying the unit file
-without enabling it does not create the dependency.
+Unix-socket permissions are only the first check. The daemon also authenticates
+control and observation peers with Linux `SO_PEERCRED`, including a bounded,
+stable supplementary-group check for observers. Do not relocate the sockets to
+a shared temporary directory or weaken ownership checks.
 
-This still does not cover a network manager, unit, initramfs, or early packet
-path that bypasses `network-pre.target`. Strict whole-boot protection requires
-tested distribution-specific integration or initramfs enforcement.
+`ProtectSystem=strict` leaves only the two OpenShield directories and the
+pre-created `/run/xtables.lock` writable. The file-level exception is required
+because both old and new xtables implementations default to that shared lock;
+using a private lock would stop OpenShield from serializing with other xtables
+processes. The daemon clears the environment of firewall subprocesses, so a
+service-level `XTABLES_LOCKFILE` override is intentionally not part of this
+contract. The tmpfiles rule does not truncate an existing lock and never grants
+group write access. Packages must create it before the first manual service
+start; at boot the unit is ordered after and requires
+`systemd-tmpfiles-setup.service`.
 
-`Restart=on-failure` may retry a failed main process, but every attempt repeats
-the fail-closed pre-start action and cannot report readiness until the persisted
-policy, NFQUEUE consumer, and IPC endpoints are active.
+## Startup and shutdown boundary
 
-Both `ExecStartPre` and the long-running daemon acquire the same nonblocking
-singleton lock before nftables access. A manual `--install-fail-closed` while
-the daemon is active therefore exits without replacing live policy. Do not
-delete `daemon.lock` while either operation may be running: the daemon keeps the
-file in place when releasing `flock` so all future processes lock the same inode.
-The packaged unit likewise preserves its runtime directory across stops; `/run`
-still clears it naturally on reboot.
+`ExecStartPre` invokes the fixed, root-only
+`openshield-daemon --install-fail-closed` action. The long-running daemon repeats
+the kernel `BlockAll` bootstrap before reading or activating policy. On a fresh
+installation it persists `Learning`; an existing saved mode remains unchanged.
+The saved policy is activated only after validation and a fail-closed NFQUEUE
+consumer are available.
 
-Do not run a second firewall manager that flushes the complete nftables ruleset.
-OpenShield attempts to repair detected table loss, but competing privileged
-services are an unsupported configuration.
+The main process uses `Type=notify` and sends `READY=1` only after the policy,
+NFQUEUE consumer, and verified IPC sockets are active. `ExecStopPost` installs
+kernel `BlockAll` after the main process releases its singleton lock. Graceful
+shutdown inside the daemon also installs this quarantine without changing the
+persisted mode.
+
+The unit has `Before=network-pre.target` and, when enabled, its
+`RequiredBy=network-pre.target` link makes standard consumers depend on
+successful readiness. Merely installing the unit does not create that link.
+A network manager, initramfs component, unit, or early packet path that bypasses
+`network-pre.target` also bypasses this ordering. Strict whole-boot filtering
+requires distribution-specific validation or an initramfs policy.
+
+`Restart=on-failure` repeats the fail-closed pre-start action. Do not delete
+`daemon.lock`: each operation opens it with `O_NOFOLLOW|O_CLOEXEC`, verifies its
+metadata, and locks the same persistent inode before state or firewall changes.
+
+## Privileges and hardening
+
+The service runs as root and retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
+`CAP_DAC_READ_SEARCH`. The latter capabilities are needed to associate a queued
+socket inode with protected `/proc/<pid>` metadata across local UIDs. The syscall
+filter denies direct inspection calls including `ptrace`, `process_vm_*`,
+`kcmp`, `pidfd_getfd`, and `open_by_handle_at`.
+
+This is attack-surface reduction, not complete isolation. After daemon
+compromise, retained capabilities can still permit access to process memory and
+files through other system calls or procfs magic links. Review the
+[threat model](../../docs/THREAT_MODEL.md) before deployment.
+
+## Operational warning
+
+Fresh state is `Learning`, but inbound traffic is default-drop in every mode.
+First activation can terminate the only SSH or VPN session. Use a local console
+or independent out-of-band access, create a narrowly scoped inbound management
+rule, verify a second session, review learned outbound rules, and only then move
+to `Enforcing`.
+
+Do not run another privileged firewall manager unless chain ordering, the upper
+two packet-mark bits, and OpenShield's low 31 conntrack-mark bits have been
+reviewed. Conntrack bit 31 is preserved. OpenShield health monitoring is not a
+proof that arbitrary concurrent ruleset edits are safe.

@@ -1,8 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::MetadataExt;
+use std::ops::Deref;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -62,9 +63,9 @@ impl OutboundConnection {
 }
 
 /// Resolves a manually supplied executable path to the exact file identity
-/// persisted in policy state. A path outside the daemon's mount namespace is
-/// accepted only when the privileged caller supplied an explicit device/inode
-/// pair; it will still be checked against the packet owner's executable.
+/// persisted in policy state. Canonicalization and a stable pair of opened-file
+/// snapshots bind the rule to the executable version visible in the daemon's
+/// mount namespace.
 pub fn pin_rule_application(specification: &mut RuleSpec) -> Result<()> {
     let Some(selector) = specification.application.as_mut() else {
         return Ok(());
@@ -74,78 +75,193 @@ pub fn pin_rule_application(specification: &mut RuleSpec) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("application selector has no executable path"))?;
     let executable_path = Path::new(executable.as_str());
-    let canonical_path = match fs::canonicalize(executable_path) {
-        Ok(path) => path,
-        Err(source) => {
-            ensure!(
-                selector.executable_file.is_some(),
-                "cannot pin executable path {}: {source}",
-                executable_path.display()
-            );
-            return Ok(());
-        }
-    };
+    let canonical_path = fs::canonicalize(executable_path).with_context(|| {
+        format!(
+            "cannot canonicalize executable {}",
+            executable_path.display()
+        )
+    })?;
+    let (first_handle, actual_file) = open_executable_version(&canonical_path)?;
+    let verified_canonical_path = fs::canonicalize(executable_path).with_context(|| {
+        format!(
+            "cannot re-canonicalize executable {}",
+            executable_path.display()
+        )
+    })?;
+    ensure!(
+        verified_canonical_path == canonical_path,
+        "executable path changed while it was pinned"
+    );
+    let (verification_handle, verified_file) = open_executable_version(&verified_canonical_path)?;
+    ensure!(
+        verified_file == actual_file,
+        "executable version changed while it was pinned"
+    );
+    let final_canonical_path = fs::canonicalize(executable_path).with_context(|| {
+        format!(
+            "cannot finally canonicalize executable {}",
+            executable_path.display()
+        )
+    })?;
+    ensure!(
+        final_canonical_path == canonical_path,
+        "executable path changed while it was pinned"
+    );
     let canonical_text = canonical_path
         .to_str()
         .ok_or_else(|| anyhow!("canonical executable path is not UTF-8"))?;
     let canonical_application = ApplicationPath::new(canonical_text.to_owned())?;
-    let executable_handle = File::open(&canonical_path)
-        .with_context(|| format!("cannot open executable {}", canonical_path.display()))?;
-    let metadata = executable_handle
-        .metadata()
-        .context("cannot inspect executable file")?;
-    ensure!(
-        metadata.is_file(),
-        "application executable is not a regular file"
-    );
-    let actual_file = ExecutableFileId {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    actual_file.validate()?;
     if let Some(expected_file) = selector.executable_file {
         ensure!(
             expected_file == actual_file,
-            "supplied executable device/inode does not match the opened path"
+            "supplied executable version does not match the opened path"
         );
     }
     selector.executable = Some(canonical_application);
     selector.executable_file = Some(actual_file);
     specification.validate()?;
+    drop((first_handle, verification_handle));
     Ok(())
 }
 
+fn open_executable_version(path: &Path) -> Result<(File, ExecutableFileId)> {
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("cannot open executable {}", path.display()))?;
+    let metadata = handle
+        .metadata()
+        .context("cannot inspect executable file")?;
+    let identity = executable_file_id(&metadata)?;
+    Ok((handle, identity))
+}
+
+fn executable_file_id(metadata: &Metadata) -> Result<ExecutableFileId> {
+    ensure!(
+        metadata.is_file(),
+        "application executable is not a regular file"
+    );
+    let identity = ExecutableFileId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
+    };
+    identity.validate()?;
+    Ok(identity)
+}
+
 #[must_use]
+#[cfg(test)]
 pub fn matching_application_rule<'a>(
     snapshot: &'a Snapshot,
     connection: &OutboundConnection,
     identity: &ApplicationIdentity,
 ) -> Option<&'a Rule> {
-    snapshot.rules.iter().find(|rule| {
-        rule.spec.enabled
-            && rule.spec.direction == openshield_core::Direction::Outbound
-            && rule
+    snapshot
+        .rules
+        .iter()
+        .find(|rule| application_rule_matches(rule, connection, identity))
+}
+
+/// Immutable, indexed subset of policy used by the NFQUEUE decision path.
+///
+/// Every persisted application rule has a mandatory executable version pin.
+/// Indexing on that pin prevents an unprivileged packet stream from forcing a
+/// scan of all application rules. Rules for the same executable are still
+/// evaluated in policy order so matching semantics remain unchanged.
+#[derive(Clone, Debug)]
+pub struct ApplicationDecisionPolicy {
+    snapshot: Snapshot,
+    rules_by_executable: HashMap<ExecutableFileId, Vec<usize>>,
+}
+
+impl ApplicationDecisionPolicy {
+    #[must_use]
+    pub fn new(snapshot: Snapshot) -> Self {
+        let mut rules_by_executable = HashMap::<ExecutableFileId, Vec<usize>>::new();
+        for (index, rule) in snapshot.rules.iter().enumerate() {
+            let Some(file) = rule
                 .spec
                 .application
                 .as_ref()
-                .is_some_and(|selector| selector.matches(identity))
-            && (rule.spec.protocol == TransportProtocol::Any
-                || rule.spec.protocol == connection.protocol)
-            && rule
-                .spec
-                .peer_network
-                .is_none_or(|network| network.contains(&connection.destination_address))
-            && rule.spec.port.is_none_or(|range| {
-                connection
-                    .destination_port
-                    .is_some_and(|port| port >= range.start() && port <= range.end())
-            })
-            && rule
-                .spec
-                .interface
-                .as_ref()
-                .is_none_or(|interface| interface == &connection.output_interface)
-    })
+                .and_then(|selector| selector.executable_file)
+            else {
+                // State validation rejects unpinned application rules. If an
+                // internal caller violates that invariant, omitting the rule
+                // from the decision index is fail-closed.
+                continue;
+            };
+            rules_by_executable.entry(file).or_default().push(index);
+        }
+        Self {
+            snapshot,
+            rules_by_executable,
+        }
+    }
+
+    #[must_use]
+    pub fn matching_rule(
+        &self,
+        connection: &OutboundConnection,
+        identity: &ApplicationIdentity,
+    ) -> Option<&Rule> {
+        self.rules_by_executable
+            .get(&identity.executable_file)?
+            .iter()
+            .filter_map(|index| self.snapshot.rules.get(*index))
+            .find(|rule| application_rule_matches(rule, connection, identity))
+    }
+
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.snapshot.rules.len()
+    }
+
+    #[cfg(test)]
+    fn candidate_count(&self, file: ExecutableFileId) -> usize {
+        self.rules_by_executable.get(&file).map_or(0, Vec::len)
+    }
+}
+
+impl Deref for ApplicationDecisionPolicy {
+    type Target = Snapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+fn application_rule_matches(
+    rule: &Rule,
+    connection: &OutboundConnection,
+    identity: &ApplicationIdentity,
+) -> bool {
+    rule.spec.enabled
+        && rule.spec.direction == openshield_core::Direction::Outbound
+        && rule
+            .spec
+            .application
+            .as_ref()
+            .is_some_and(|selector| selector.matches(identity))
+        && (rule.spec.protocol == TransportProtocol::Any
+            || rule.spec.protocol == connection.protocol)
+        && rule
+            .spec
+            .peer_network
+            .is_none_or(|network| network.contains(&connection.destination_address))
+        && rule.spec.port.is_none_or(|range| {
+            connection
+                .destination_port
+                .is_some_and(|port| port >= range.start() && port <= range.end())
+        })
+        && rule
+            .spec
+            .interface
+            .as_ref()
+            .is_none_or(|interface| interface == &connection.output_interface)
 }
 
 #[derive(Clone, Debug)]
@@ -331,15 +447,8 @@ impl ProcfsResolver {
             .metadata()
             .context("cannot inspect pinned process executable")?;
         ensure_within_deadline(deadline)?;
-        ensure!(
-            executable_metadata.is_file(),
-            "process executable is not a regular file"
-        );
-        let executable_file = ExecutableFileId {
-            device: executable_metadata.dev(),
-            inode: executable_metadata.ino(),
-        };
-        executable_file.validate()?;
+        let executable_file = executable_file_id(&executable_metadata)
+            .context("cannot identify pinned process executable version")?;
 
         let command_line = read_command_line(process, deadline)?;
         let cgroups = read_cgroups(process, deadline)?;
@@ -348,10 +457,12 @@ impl ProcfsResolver {
         let executable_link_after =
             fs::read_link(process.join("exe")).context("cannot re-read process executable link")?;
         ensure_within_deadline(deadline)?;
-        let executable_after = File::open(process.join("exe"))
+        let executable_after_metadata = File::open(process.join("exe"))
             .context("cannot re-pin process executable")?
             .metadata()
             .context("cannot re-inspect process executable")?;
+        let executable_file_after = executable_file_id(&executable_after_metadata)
+            .context("cannot re-identify pinned process executable version")?;
         ensure_within_deadline(deadline)?;
         let command_line_after = read_command_line(process, deadline)?;
         let cgroups_after = read_cgroups(process, deadline)?;
@@ -359,8 +470,7 @@ impl ProcfsResolver {
         let uid_after = read_process_fs_uid(process, deadline)?;
         ensure!(
             executable_link_before == executable_link_after
-                && executable_metadata.dev() == executable_after.dev()
-                && executable_metadata.ino() == executable_after.ino()
+                && executable_file == executable_file_after
                 && command_line == command_line_after
                 && cgroups == cgroups_after
                 && start_before == start_after
@@ -481,6 +591,19 @@ fn task_owns_socket(
     deadline: Instant,
     maximum_fds: usize,
 ) -> Result<bool> {
+    let observed_fsuid = match read_process_fs_uid(task, deadline) {
+        Ok(uid) => uid,
+        Err(error) => {
+            if path_disappeared(task)? {
+                return Ok(false);
+            }
+            return Err(error)
+                .with_context(|| format!("cannot inspect filesystem UID for task {task_id}"));
+        }
+    };
+    if observed_fsuid != expected_uid {
+        return Ok(false);
+    }
     let descriptors = match fs::read_dir(task.join("fd")) {
         Ok(entries) => entries,
         Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
@@ -535,7 +658,7 @@ fn task_owns_socket(
             let owner_uid = read_process_fs_uid(task, deadline)
                 .with_context(|| format!("cannot verify socket owner task {task_id}"))?;
             ensure!(
-                owner_uid == expected_uid,
+                owner_uid == observed_fsuid && owner_uid == expected_uid,
                 "socket owner filesystem UID differs from the kernel socket UID"
             );
             return Ok(true);
@@ -740,6 +863,7 @@ fn read_cgroups(process: &Path, deadline: Instant) -> Result<Vec<CgroupPath>> {
     let bytes = read_bounded(&process.join("cgroup"), MAX_CGROUP_BYTES, deadline)?;
     let text = std::str::from_utf8(&bytes).context("process cgroup data is not UTF-8 ASCII")?;
     let mut unified = None;
+    let mut memberships = 0_usize;
     for line in text.lines() {
         ensure_within_deadline(deadline)?;
         let mut fields = line.splitn(3, ':');
@@ -752,19 +876,42 @@ fn read_cgroups(process: &Path, deadline: Instant) -> Result<Vec<CgroupPath>> {
         let path = fields
             .next()
             .ok_or_else(|| anyhow!("process cgroup entry has no path"))?;
+        let validated_path = CgroupPath::new(path.to_owned())?;
+        memberships = memberships
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("process cgroup membership count overflow"))?;
         if hierarchy == "0" && controllers.is_empty() {
             ensure!(
                 unified.is_none(),
                 "process has multiple unified cgroup v2 memberships"
             );
-            unified = Some(CgroupPath::new(path.to_owned())?);
+            unified = Some(validated_path);
+        } else {
+            let hierarchy = hierarchy
+                .parse::<u32>()
+                .context("process cgroup v1 hierarchy is invalid")?;
+            ensure!(
+                hierarchy != 0 && !controllers.is_empty(),
+                "process cgroup membership mixes invalid hierarchy metadata"
+            );
+            ensure!(
+                controllers.split(',').all(|controller| {
+                    !controller.is_empty()
+                        && controller.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'=')
+                        })
+                }),
+                "process cgroup v1 controller list is invalid"
+            );
         }
     }
     ensure_within_deadline(deadline)?;
-    let unified = unified.ok_or_else(|| {
-        anyhow!("application attribution requires one unified cgroup v2 membership")
-    })?;
-    Ok(vec![unified])
+    ensure!(memberships != 0, "process has no cgroup membership");
+    // A cgroup selector is deliberately defined only against the unambiguous
+    // unified-v2 path.  On a v1-only host retain no cgroup identity: selectors
+    // which request one then fail to match, while executable/file/UID/argv
+    // attribution remains available instead of denying every application.
+    Ok(unified.into_iter().collect())
 }
 
 fn read_bounded(path: &Path, maximum: usize, deadline: Instant) -> Result<Vec<u8>> {
@@ -849,6 +996,9 @@ mod tests {
             executable_file: ExecutableFileId {
                 device: 8,
                 inode: 9,
+                size: 10,
+                ctime_seconds: 11,
+                ctime_nanoseconds: 12,
             },
             command_line: vec![CommandArgument::new("curl")?],
             uid: 1_000,
@@ -885,6 +1035,19 @@ mod tests {
             socket_uid: 1_000,
         };
         assert!(matching_application_rule(&state.snapshot(), &connection, &identity).is_some());
+
+        let indexed = ApplicationDecisionPolicy::new(state.snapshot());
+        assert_eq!(indexed.candidate_count(identity.executable_file), 1);
+        assert!(indexed.matching_rule(&connection, &identity).is_some());
+
+        let mut unrelated_binary = identity.clone();
+        unrelated_binary.executable_file.inode += 1;
+        assert_eq!(indexed.candidate_count(unrelated_binary.executable_file), 0);
+        assert!(
+            indexed
+                .matching_rule(&connection, &unrelated_binary)
+                .is_none()
+        );
 
         let mut wrong_destination = connection;
         wrong_destination.destination_address = "203.0.113.8".parse()?;
@@ -930,8 +1093,99 @@ mod tests {
             Some(ExecutableFileId {
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                size: metadata.size(),
+                ctime_seconds: metadata.ctime(),
+                ctime_nanoseconds: metadata.ctime_nsec(),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn privileged_manual_rule_rejects_stale_in_place_version() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("application");
+        fs::write(&executable, b"old")?;
+        let old_file = executable_file_id(&fs::metadata(&executable)?)?;
+        fs::write(&executable, b"new executable contents")?;
+        let new_file = executable_file_id(&fs::metadata(&executable)?)?;
+        assert_eq!(old_file.device, new_file.device);
+        assert_eq!(old_file.inode, new_file.inode);
+        assert_ne!(old_file.size, new_file.size);
+
+        let mut specification = RuleSpec::new(
+            RuleName::new("stale application")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.1/32".parse()?),
+            Some(PortRange::single(443)?),
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?;
+        specification.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new(
+                executable.to_str().ok_or("temporary path is not UTF-8")?,
+            )?),
+            Some(old_file),
+            None,
+            None,
+            None,
+        )?);
+
+        let Err(error) = pin_rule_application(&mut specification) else {
+            return Err("stale pin was accepted".into());
+        };
+        assert!(error.to_string().contains("version does not match"));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_pin_canonicalizes_a_stable_symlink() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("application");
+        let link = directory.path().join("application-link");
+        fs::write(&executable, b"test executable")?;
+        symlink(&executable, &link)?;
+        let mut specification = RuleSpec::new(
+            RuleName::new("symlinked application")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.1/32".parse()?),
+            Some(PortRange::single(443)?),
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?;
+        specification.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new(
+                link.to_str().ok_or("temporary path is not UTF-8")?,
+            )?),
+            None,
+            None,
+            None,
+            None,
+        )?);
+
+        pin_rule_application(&mut specification)?;
+
+        let selector = specification.application.ok_or("selector disappeared")?;
+        assert_eq!(
+            selector.executable.as_ref().map(ApplicationPath::as_str),
+            fs::canonicalize(&executable)?.to_str()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nofollow_open_rejects_an_uncanonicalized_symlink() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("application");
+        let link = directory.path().join("application-link");
+        fs::write(&executable, b"test executable")?;
+        symlink(&executable, &link)?;
+
+        assert!(open_executable_version(&link).is_err());
         Ok(())
     }
 
@@ -955,6 +1209,37 @@ mod tests {
             None,
             None,
         )?);
+        assert!(pin_rule_application(&mut specification).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn privileged_manual_rule_rejects_an_unresolvable_supplied_version()
+    -> Result<(), Box<dyn Error>> {
+        let mut specification = RuleSpec::new(
+            RuleName::new("missing supplied application")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.1/32".parse()?),
+            Some(PortRange::single(443)?),
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?;
+        specification.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new("/definitely/missing/application")?),
+            Some(ExecutableFileId {
+                device: 8,
+                inode: 99,
+                size: 12_345,
+                ctime_seconds: 1_700_000_000,
+                ctime_nanoseconds: 123_456_789,
+            }),
+            None,
+            None,
+            None,
+        )?);
+
         assert!(pin_rule_application(&mut specification).is_err());
         Ok(())
     }
@@ -1018,12 +1303,25 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_v1_only_identity_fails_closed() -> Result<(), Box<dyn Error>> {
+    fn cgroup_v1_keeps_non_cgroup_application_attribution_available() -> Result<(), Box<dyn Error>>
+    {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("cgroup"),
             "5:cpu,cpuacct:/trusted\n4:memory:/trusted\n",
         )?;
+
+        assert_eq!(
+            read_cgroups(directory.path(), Instant::now() + Duration::from_secs(1))?,
+            Vec::<CgroupPath>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_cgroup_v1_metadata_still_fails_closed() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("cgroup"), "0:cpu:/trusted\n")?;
 
         assert!(read_cgroups(directory.path(), Instant::now() + Duration::from_secs(1)).is_err());
         Ok(())
@@ -1056,7 +1354,29 @@ mod tests {
     }
 
     #[test]
-    fn socket_transfer_to_another_fsuid_is_denied() -> Result<(), Box<dyn Error>> {
+    fn unrelated_uid_fd_bound_does_not_break_owner_search() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let known_owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        let unrelated_task = create_task_fixture(directory.path(), 200, 200, 2_000)?;
+        symlink("socket:[77]", known_owner.join("fd/3"))?;
+        symlink("socket:[1]", unrelated_task.join("fd/3"))?;
+        symlink("socket:[2]", unrelated_task.join("fd/4"))?;
+
+        let resolver = ProcfsResolver::at(directory.path());
+        let owners = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            1,
+        )?;
+
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].tid, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn socket_transfer_to_another_fsuid_has_no_attributable_owner() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let recipient = create_task_fixture(directory.path(), 200, 200, 2_000)?;
         symlink("socket:[77]", recipient.join("fd/3"))?;
@@ -1073,7 +1393,7 @@ mod tests {
         assert!(result.err().is_some_and(|error| {
             error
                 .to_string()
-                .contains("filesystem UID differs from the kernel socket UID")
+                .contains("no process owns the attributed socket inode")
         }));
         Ok(())
     }
