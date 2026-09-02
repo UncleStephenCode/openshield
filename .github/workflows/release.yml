@@ -80,7 +80,6 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
@@ -105,10 +104,6 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: release-${{ matrix.target }}
 
       - name: Install musl build tools
         run: |
