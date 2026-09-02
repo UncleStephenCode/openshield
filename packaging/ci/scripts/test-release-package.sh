@@ -66,6 +66,7 @@ esac
 
 docker pull "$IMAGE"
 docker run --rm \
+  --security-opt label=disable \
   -v "$DIST:/packages:ro" \
   "$IMAGE" \
   /bin/sh -c "$CMD"

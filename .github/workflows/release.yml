@@ -15,12 +15,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  NFPM_VERSION: v2.43.4
+  NFPM_VERSION: v2.47.0
+  NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
 
 jobs:
   version:
@@ -29,11 +30,13 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - id: version
         shell: bash
@@ -59,18 +62,25 @@ jobs:
             echo "::error::Tag $TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
             exit 1
           }
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Cannot resolve the release source commit"
+            exit 1
+          }
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
   quality:
     name: Release quality gate
     needs: version
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-      - uses: Swatinem/rust-cache@v2
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
@@ -91,11 +101,12 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
 
@@ -120,16 +131,15 @@ jobs:
           file dist/*
           ./dist/openshield-daemon --version
           ./dist/openshield-tui --version
-          tar -C dist -cJf "openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz" \
+          tar -C dist -cJf "$PWD/dist/openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz" \
             openshield-daemon openshield-tui
+          test -s "dist/openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.arch }}
-          path: |
-            dist/openshield-daemon
-            dist/openshield-tui
-            openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz
+          # A single directory keeps every downloaded entry at artifact root.
+          path: dist/
           if-no-files-found: error
           retention-days: 7
 
@@ -168,27 +178,65 @@ jobs:
             arch: amd64
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: binary-${{ matrix.arch }}
-          path: release-artifact
+          path: ${{ runner.temp }}/binary-${{ matrix.arch }}
 
       - name: Prepare binaries
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/binary-${{ matrix.arch }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
-          mkdir -p release-bin
-          install -m 0755 release-artifact/openshield-daemon release-bin/openshield-daemon
-          install -m 0755 release-artifact/openshield-tui release-bin/openshield-tui
+          set -euo pipefail
+          case "$TARGET_ARCH" in
+            amd64) expected_machine='Advanced Micro Devices X86-64' ;;
+            arm64) expected_machine='AArch64' ;;
+            *) echo "::error::Unsupported package architecture: $TARGET_ARCH"; exit 1 ;;
+          esac
+          for binary in openshield-daemon openshield-tui; do
+            source="$ARTIFACT_DIR/$binary"
+            [[ -f "$source" && ! -L "$source" ]] || {
+              echo "::error::Missing or unsafe binary artifact: $binary"
+              exit 1
+            }
+            machine="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            [[ "$machine" == "$expected_machine" ]] || {
+              echo "::error::Unexpected architecture for $binary: $machine (expected $expected_machine)"
+              exit 1
+            }
+          done
+          install -d -m 0755 release-bin
+          install -m 0755 "$ARTIFACT_DIR/openshield-daemon" release-bin/openshield-daemon
+          install -m 0755 "$ARTIFACT_DIR/openshield-tui" release-bin/openshield-tui
+          if [[ "$TARGET_ARCH" == amd64 ]]; then
+            ./release-bin/openshield-daemon --version
+            ./release-bin/openshield-tui --version
+          fi
 
       - name: Install nFPM
+        shell: bash
         env:
           VERSION: ${{ env.NFPM_VERSION }}
+          EXPECTED_SHA256: ${{ env.NFPM_SHA256 }}
         run: |
-          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin nfpm
+          set -euo pipefail
+          archive="$RUNNER_TEMP/nfpm-${VERSION#v}-linux-x86_64.tar.gz"
+          extract_dir="$RUNNER_TEMP/nfpm-${VERSION#v}"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum --check --strict -
+          mkdir -m 0700 "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir" nfpm
+          [[ -f "$extract_dir/nfpm" && ! -L "$extract_dir/nfpm" ]]
+          sudo install -m 0755 "$extract_dir/nfpm" /usr/local/bin/nfpm
           nfpm --version
 
       - name: Build package
@@ -196,9 +244,9 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           ARCH: ${{ matrix.arch }}
           FAMILY: ${{ matrix.family }}
-        run: packaging/ci/scripts/build-release-package.sh
+        run: bash packaging/ci/scripts/build-release-package.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.family }}-${{ matrix.arch }}
           path: dist/*
@@ -274,10 +322,11 @@ jobs:
             image: archlinux:base
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-      - uses: actions/download-artifact@v4
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: package-${{ matrix.family }}-${{ matrix.arch }}
           path: dist
@@ -285,18 +334,48 @@ jobs:
         env:
           FAMILY: ${{ matrix.family }}
           IMAGE: ${{ matrix.image }}
-        run: packaging/ci/scripts/test-release-package.sh
+        run: bash packaging/ci/scripts/test-release-package.sh
 
   e2e:
-    name: Firewall E2E
-    needs: [version, quality]
+    name: Firewall E2E / ${{ matrix.backend }}
+    needs: [version, quality, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [nftables, iptables]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-amd64
+          path: ${{ runner.temp }}/binary-amd64
+
+      - name: Prepare E2E daemon
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/binary-amd64
+          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          source="$ARTIFACT_DIR/openshield-daemon"
+          [[ -f "$source" && ! -L "$source" ]] || {
+            echo '::error::Missing or unsafe daemon artifact'
+            exit 1
+          }
+          install -d -m 0755 "$BINARY_DIR"
+          install -m 0755 "$source" "$BINARY_DIR/openshield-daemon"
+          "$BINARY_DIR/openshield-daemon" --version
+
       - name: Run isolated firewall E2E
-        run: tests/e2e/server-learning-enforcing.sh
+        env:
+          BACKEND: ${{ matrix.backend }}
+          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
+        run: tests/e2e/server-learning-enforcing.sh "$BACKEND" "$BINARY_DIR"
 
   release:
     name: Publish GitHub Release
@@ -305,32 +384,55 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-      - uses: actions/download-artifact@v4
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: package-*
           path: release
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-*
           path: binaries
-          merge-multiple: true
       - name: Collect archives and checksums
         shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          find binaries -maxdepth 1 -type f -name '*.tar.xz' -exec cp {} release/ \;
+          for arch in amd64 arm64; do
+            archive="openshield-$VERSION-linux-$arch.tar.xz"
+            source="binaries/binary-$arch/$archive"
+            [[ -f "$source" && ! -L "$source" && -s "$source" ]] || {
+              echo "::error::Missing or unsafe release archive: $archive"
+              exit 1
+            }
+            [[ ! -e "release/$archive" ]] || {
+              echo "::error::Duplicate release archive: $archive"
+              exit 1
+            }
+            install -m 0644 "$source" "release/$archive"
+          done
           cd release
-          sha256sum * | sort -k2 > SHA256SUMS
+          sha256sum -- * | sort -k2 > SHA256SUMS
           ls -lah
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create "${{ needs.version.outputs.tag }}" release/* \
+          set -euo pipefail
+          git fetch --force --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          TAG_SHA="$(git rev-parse "$TAG^{commit}")"
+          [[ "$TAG_SHA" == "$SOURCE_SHA" ]] || {
+            echo "::error::Release tag $TAG moved from $SOURCE_SHA to $TAG_SHA"
+            exit 1
+          }
+          gh release create "$TAG" release/* \
             --verify-tag \
             --generate-notes \
-            --title "OpenShield ${{ needs.version.outputs.tag }}"
+            --title "OpenShield $TAG"

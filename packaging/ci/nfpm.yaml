@@ -13,11 +13,16 @@ license: GPL-3.0-only
 description: Application-aware Linux host firewall written in Rust.
 
 contents:
-  - src: ${PACKAGE_ROOT}/
-    dst: /
+  # Environment interpolation for content paths requires nFPM's explicit
+  # `expand` option. Fixed paths keep this staging boundary easy to audit.
+  - src: .package-root/usr/
+    dst: /usr
+  - src: .package-root/etc/
+    dst: /etc
+    packager: apk
 
 scripts:
-  postinstall: ${POSTINSTALL}
+  postinstall: packaging/ci/hooks/postinstall-systemd.sh
 
 overrides:
   deb:
@@ -29,6 +34,8 @@ overrides:
   apk:
     depends:
       - nftables
+    scripts:
+      postinstall: packaging/ci/hooks/postinstall-openrc.sh
   archlinux:
     depends:
       - nftables
