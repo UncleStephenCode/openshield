@@ -139,7 +139,10 @@ not physical-i586 hardware. Tumbleweed `ppc64le` and
 `s390x` use digest-pinned Cross/QEMU environments for capability-free execution
 and package smoke only. QEMU evidence is never presented as a full firewall
 test, native execution, distribution-kernel coverage, or hardware
-certification. No blanket runtime claim is made for x86, ARM, arm64, PowerPC,
+certification. The package smoke registers only the selected digest-pinned
+`binfmt_misc` handler on an ephemeral GitHub-hosted runner; the privileged
+registration step is rejected on self-hosted runners. No blanket runtime claim
+is made for x86, ARM, arm64, PowerPC,
 IBM Z, or RISC-V hardware.
 Architecture aliases do not create additional targets: AMD64 means x86_64, and
 ARM64 means AArch64. `aarch` alone is not a Rust Linux target name.

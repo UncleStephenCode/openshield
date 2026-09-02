@@ -102,6 +102,15 @@ in that research matrix is not a release-support declaration.
   ELF validation, package installation, and capability-free execution smoke.
   Those jobs do not claim native execution or full firewall E2E.
 
+For the two QEMU package-install rows, the workflow registers only the required
+`binfmt_misc` handler by directly running the SHA-256-pinned `tonistiigi/binfmt`
+image on the ephemeral runner. It does not depend on a third-party setup action.
+The registration container is necessarily privileged and is explicitly refused
+on self-hosted runners. Registration is followed immediately by checks of the
+enabled handler, fix-binary flag and interpreter, then by a network-isolated,
+capability-free probe in the pinned foreign-platform image. Any mismatch fails
+the job before the package artifact is downloaded or tested.
+
 QEMU success is explicitly recorded as emulated evidence. It cannot certify
 CPU-specific behavior, physical hardware, boot firmware, a distribution kernel,
 or procfs application attribution under native execution. Full production

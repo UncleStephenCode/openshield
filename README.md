@@ -304,8 +304,10 @@ Compatibility claims are intentionally scoped:
   i586 additionally ran in the pinned official Tumbleweed `linux/386` image;
 - non-native `cargo check` proves source-level compilation, not operation on
   physical hardware. The explicit QEMU smokes above do not replace native
-  hardware validation; no transparent binfmt handler was installed on the test
-  host.
+  hardware validation. Those standalone binary smokes did not install a
+  transparent binfmt handler. The separate release-package matrix registers
+  only the required pinned QEMU handler on an ephemeral GitHub-hosted runner for
+  the Tumbleweed `ppc64le` and `s390x` package-install smokes.
 
 The 60-image smoke matrix does not boot each image's init system and does not
 exercise its kernel, firewall backend, NFQUEUE, package manager, or upgrade

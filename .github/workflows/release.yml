@@ -595,11 +595,81 @@ jobs:
 
       - name: Enable pinned QEMU for emulated package smoke tests
         if: ${{ matrix.arch == 'ppc64le' || matrix.arch == 's390x' }}
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-        with:
-          image: ${{ env.BINFMT_IMAGE }}
-          platforms: ${{ matrix.arch }}
-          cache-image: false
+        shell: bash
+        env:
+          EMULATED_ARCH: ${{ matrix.arch }}
+          EMULATED_IMAGE: ${{ matrix.image }}
+          EMULATED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted \
+            && "${RUNNER_OS:-}" == Linux \
+            && "${RUNNER_ARCH:-}" == X64 ]] || {
+            echo '::error::Privileged binfmt registration is restricted to an ephemeral GitHub-hosted Linux X64 runner'
+            exit 1
+          }
+          case "$EMULATED_ARCH" in
+            ppc64le|s390x) ;;
+            *)
+              echo "::error::Unsupported emulated package-test architecture: $EMULATED_ARCH"
+              exit 1
+              ;;
+          esac
+          [[ "$EMULATED_PLATFORM" == "linux/$EMULATED_ARCH" ]] || {
+            echo "::error::Emulated architecture/platform mismatch: $EMULATED_ARCH / $EMULATED_PLATFORM"
+            exit 1
+          }
+          image_pattern='^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$'
+          [[ "$BINFMT_IMAGE" =~ $image_pattern ]] || {
+            echo '::error::The binfmt installer image is not pinned by SHA-256'
+            exit 1
+          }
+          [[ "$EMULATED_IMAGE" =~ $image_pattern ]] || {
+            echo '::error::The emulated probe image is not pinned by SHA-256'
+            exit 1
+          }
+
+          docker pull --platform linux/amd64 "$BINFMT_IMAGE"
+          install_log="$RUNNER_TEMP/openshield-binfmt-$EMULATED_ARCH.log"
+          if ! docker run --rm --privileged --network none \
+            --platform linux/amd64 --pull never \
+            "$BINFMT_IMAGE" --install "$EMULATED_ARCH" 2>&1 | tee "$install_log"; then
+            echo "::error::The pinned binfmt installer failed for $EMULATED_ARCH"
+            exit 1
+          fi
+          grep -Fqx "installing: $EMULATED_ARCH OK" "$install_log" || {
+            echo "::error::The pinned binfmt image did not register $EMULATED_ARCH"
+            exit 1
+          }
+
+          handler="/proc/sys/fs/binfmt_misc/qemu-$EMULATED_ARCH"
+          [[ -r "$handler" ]] || {
+            echo "::error::QEMU/binfmt handler was not registered: $handler"
+            exit 1
+          }
+          grep -qx enabled "$handler" || {
+            echo "::error::QEMU/binfmt handler is not enabled: $handler"
+            exit 1
+          }
+          handler_flags=$(awk '$1 == "flags:" { print $2; exit }' "$handler")
+          [[ "$handler_flags" == *F* ]] || {
+            echo "::error::QEMU/binfmt handler lacks the fix-binary flag: $handler_flags"
+            exit 1
+          }
+          handler_interpreter=$(awk '$1 == "interpreter" { print $2; exit }' "$handler")
+          [[ "$handler_interpreter" == "/usr/bin/qemu-$EMULATED_ARCH" ]] || {
+            echo "::error::Unexpected QEMU/binfmt interpreter: $handler_interpreter"
+            exit 1
+          }
+
+          actual_arch=$(docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --security-opt label=disable \
+            --platform "$EMULATED_PLATFORM" \
+            --entrypoint /bin/sh "$EMULATED_IMAGE" -eu -c 'uname -m')
+          [[ "$actual_arch" == "$EMULATED_ARCH" ]] || {
+            echo "::error::QEMU/binfmt probe reported $actual_arch instead of $EMULATED_ARCH"
+            exit 1
+          }
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
