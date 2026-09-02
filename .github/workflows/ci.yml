@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-targets --locked
+
+  packaging:
+    name: Packaging checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate distro matrix
+        run: scripts/test-distro-matrix.sh validate
+
+      - name: Validate target matrix
+        run: scripts/check-target-matrix.sh validate
+
+      - name: Validate init layouts
+        run: scripts/test-init-matrix.sh validate
+
+      - name: Validate init manifests
+        run: scripts/test-init-matrix.sh manifests
+
+      - name: Container init checks
+        run: scripts/test-init-matrix.sh containers-clean
