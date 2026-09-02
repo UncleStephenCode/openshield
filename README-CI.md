@@ -55,8 +55,8 @@ fallback backend.
 2. Ensure `[workspace.package].version` in `Cargo.toml` is the desired version.
 3. Create and push the matching tag, for example:
 
-   git tag -a v0.1.14 -m 'OpenShield v0.1.14'
-   git push origin v0.1.14
+   git tag -a v0.1.16 -m 'OpenShield v0.1.16'
+   git push origin v0.1.16
 
 The release workflow refuses a tag whose version differs from Cargo.toml.
 
