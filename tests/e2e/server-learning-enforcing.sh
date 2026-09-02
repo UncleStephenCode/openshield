@@ -39,6 +39,9 @@ network_id=
 client_id=
 server_id=
 stage_name=initialization
+daemon_pid_file=/tmp/openshield.pid
+daemon_exit_file=/tmp/openshield.exit-status
+daemon_wait_attempts=600
 
 begin_stage() {
     stage_name=$1
@@ -49,15 +52,115 @@ wait_for_marker() {
     container=$1
     marker=$2
     description=$3
-    marker_attempt=0
-    while [ "$marker_attempt" -lt 100 ]; do
-        if docker exec "$container" test -f "$marker"; then
-            return 0
-        fi
-        marker_attempt=$((marker_attempt + 1))
-        sleep 0.1
-    done
+    if docker exec "$container" /bin/sh -c '
+        marker=$1
+        attempt=0
+        while [ "$attempt" -lt 100 ]; do
+            [ ! -f "$marker" ] || exit 0
+            attempt=$((attempt + 1))
+            sleep 0.1
+        done
+        exit 1
+    ' openshield-marker-wait "$marker"; then
+        return 0
+    fi
     printf '%s did not become ready within 10 seconds\n' "$description" >&2
+    return 1
+}
+
+dump_daemon_log() {
+    daemon_log=$1
+    docker exec "$client" cat "$daemon_log" >&2 || true
+}
+
+start_daemon() {
+    daemon_log=$1
+    docker exec "$client" rm -f \
+        "$daemon_pid_file" "$daemon_exit_file" "${daemon_exit_file}.tmp"
+    docker exec --detach "$client" /bin/sh -c '
+        log_file=$1
+        pid_file=$2
+        status_file=$3
+        temporary_status="${status_file}.tmp"
+        /opt/openshield/openshield-daemon >"$log_file" 2>&1 &
+        child_pid=$!
+        printf "%s\n" "$child_pid" >"$pid_file"
+        if wait "$child_pid"; then
+            child_status=0
+        else
+            child_status=$?
+        fi
+        printf "%s\n" "$child_status" >"$temporary_status"
+        mv -f "$temporary_status" "$status_file"
+        exit "$child_status"
+    ' openshield-daemon-supervisor \
+        "$daemon_log" "$daemon_pid_file" "$daemon_exit_file"
+}
+
+wait_for_daemon_ready() {
+    daemon_log=$1
+    daemon_description=$2
+    if docker exec "$client" /bin/sh -c '
+        socket_path=$1
+        status_file=$2
+        maximum_attempts=$3
+        attempt=0
+        while [ "$attempt" -lt "$maximum_attempts" ]; do
+            [ ! -s "$status_file" ] || exit 3
+            [ ! -S "$socket_path" ] || exit 0
+            attempt=$((attempt + 1))
+            sleep 0.1
+        done
+        exit 2
+    ' openshield-daemon-ready-wait \
+        /run/openshield/control.sock "$daemon_exit_file" "$daemon_wait_attempts"; then
+        return 0
+    else
+        daemon_wait_status=$?
+    fi
+    dump_daemon_log "$daemon_log"
+    if [ "$daemon_wait_status" -eq 3 ]; then
+        daemon_status=$(docker exec "$client" cat "$daemon_exit_file" 2>/dev/null || true)
+        printf '%s exited before readiness (status %s)\n' \
+            "$daemon_description" "${daemon_status:-unknown}" >&2
+    else
+        printf '%s did not become ready within 60 seconds\n' "$daemon_description" >&2
+    fi
+    return 1
+}
+
+wait_for_daemon_exit() {
+    daemon_log=$1
+    daemon_description=$2
+    if ! docker exec "$client" /bin/sh -c '
+        status_file=$1
+        maximum_attempts=$2
+        attempt=0
+        while [ "$attempt" -lt "$maximum_attempts" ]; do
+            [ ! -s "$status_file" ] || exit 0
+            attempt=$((attempt + 1))
+            sleep 0.1
+        done
+        exit 1
+    ' openshield-daemon-exit-wait "$daemon_exit_file" "$daemon_wait_attempts"; then
+        dump_daemon_log "$daemon_log"
+        printf '%s did not exit within 60 seconds\n' "$daemon_description" >&2
+        return 1
+    fi
+    daemon_status=$(docker exec "$client" cat "$daemon_exit_file" 2>/dev/null || true)
+    case "$daemon_status" in
+        0) return 0 ;;
+        ''|*[!0-9]*)
+            dump_daemon_log "$daemon_log"
+            printf '%s produced an invalid exit status: %s\n' \
+                "$daemon_description" "${daemon_status:-empty}" >&2
+            ;;
+        *)
+            dump_daemon_log "$daemon_log"
+            printf '%s exited unsuccessfully with status %s\n' \
+                "$daemon_description" "$daemon_status" >&2
+            ;;
+    esac
     return 1
 }
 
@@ -122,21 +225,8 @@ docker exec "$client" useradd --system --no-create-home --shell /usr/sbin/nologi
 docker exec "$client" usermod --append --groups openshield observer
 
 begin_stage 'start daemon and select backend'
-docker exec --detach "$client" /bin/sh -c \
-    '/opt/openshield/openshield-daemon >/tmp/openshield.log 2>&1 & echo $! >/tmp/openshield.pid'
-
-attempt=0
-while [ "$attempt" -lt 100 ]; do
-    if docker exec "$client" test -S /run/openshield/control.sock; then
-        break
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.1
-done
-docker exec "$client" test -S /run/openshield/control.sock || {
-    docker exec "$client" cat /tmp/openshield.log >&2 || true
-    exit 1
-}
+start_daemon /tmp/openshield.log
+wait_for_daemon_ready /tmp/openshield.log 'initial daemon'
 if [ "$backend" = nftables ]; then
     expected_backend=nftables
 else
@@ -354,22 +444,14 @@ docker exec "$server" python3 -c \
     }
 
 begin_stage 'graceful shutdown and fail-closed policy'
-daemon_pid=$(docker exec "$client" cat /tmp/openshield.pid)
+daemon_pid=$(docker exec "$client" cat "$daemon_pid_file")
 case "$daemon_pid" in ''|*[!0-9]*) printf '%s\n' 'invalid daemon pid' >&2; exit 1 ;; esac
 docker exec "$client" kill -TERM "$daemon_pid"
-attempt=0
-while [ "$attempt" -lt 100 ]; do
-    if ! docker exec "$client" test -S /run/openshield/control.sock; then
-        break
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.1
-done
-[ "$attempt" -lt 100 ] || {
-    docker exec "$client" cat /tmp/openshield.log >&2 || true
-    printf '%s\n' 'daemon did not complete graceful shutdown' >&2
+wait_for_daemon_exit /tmp/openshield.log 'initial daemon'
+if docker exec "$client" test -S /run/openshield/control.sock; then
+    printf '%s\n' 'daemon left the control socket after process exit' >&2
     exit 1
-}
+fi
 docker exec "$client" python3 -c \
     'import json; assert json.load(open("/var/lib/openshield/state.json", encoding="utf-8"))["mode"] == "enforcing"'
 if docker exec "$client" curl --fail --silent --show-error --max-time 2 \
@@ -379,21 +461,8 @@ if docker exec "$client" curl --fail --silent --show-error --max-time 2 \
 fi
 
 begin_stage 'restart with persisted policy'
-docker exec --detach "$client" /bin/sh -c \
-    '/opt/openshield/openshield-daemon >/tmp/openshield-restart.log 2>&1 & echo $! >/tmp/openshield.pid'
-attempt=0
-while [ "$attempt" -lt 100 ]; do
-    if docker exec "$client" test -S /run/openshield/control.sock; then
-        break
-    fi
-    attempt=$((attempt + 1))
-    sleep 0.1
-done
-[ "$attempt" -lt 100 ] || {
-    docker exec "$client" cat /tmp/openshield-restart.log >&2 || true
-    printf '%s\n' 'daemon did not restart with persisted policy' >&2
-    exit 1
-}
+start_daemon /tmp/openshield-restart.log
+wait_for_daemon_ready /tmp/openshield-restart.log 'restarted daemon'
 status=$(docker exec "$client" python3 /opt/ipc_client.py status)
 case "$status" in *'"mode": "enforcing"'*) ;; *) printf 'unexpected restart status: %s\n' "$status" >&2; exit 1 ;; esac
 docker exec "$client" curl --fail --silent --show-error --max-time 5 \
@@ -401,8 +470,13 @@ docker exec "$client" curl --fail --silent --show-error --max-time 5 \
         printf '%s\n' 'persisted outbound rule did not recover after daemon restart' >&2
         exit 1
     }
-daemon_pid=$(docker exec "$client" cat /tmp/openshield.pid)
+daemon_pid=$(docker exec "$client" cat "$daemon_pid_file")
 case "$daemon_pid" in ''|*[!0-9]*) printf '%s\n' 'invalid restarted daemon pid' >&2; exit 1 ;; esac
 docker exec "$client" kill -TERM "$daemon_pid"
+wait_for_daemon_exit /tmp/openshield-restart.log 'restarted daemon'
+if docker exec "$client" test -S /run/openshield/control.sock; then
+    printf '%s\n' 'restarted daemon left the control socket after process exit' >&2
+    exit 1
+fi
 
 printf 'PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (%s)\n' "$backend"

@@ -367,10 +367,25 @@ jobs:
           "$BINARY_DIR/openshield-daemon" --version
 
       - name: Run isolated firewall E2E
+        id: firewall_e2e
+        shell: bash
         env:
           BACKEND: ${{ matrix.backend }}
           BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
-        run: tests/e2e/server-learning-enforcing.sh "$BACKEND" "$BINARY_DIR"
+          E2E_LOG: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
+        run: |
+          set -o pipefail
+          tests/e2e/server-learning-enforcing.sh "$BACKEND" "$BINARY_DIR" \
+            2>&1 | tee "$E2E_LOG"
+
+      - name: Preserve E2E failure diagnostics
+        if: steps.firewall_e2e.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-failure-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     name: Publish GitHub Release
