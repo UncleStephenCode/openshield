@@ -42,8 +42,8 @@ openSUSE Leap 16.0, Alpine 3.23/3.24 and Arch Linux.
 2. Ensure `[workspace.package].version` in `Cargo.toml` is the desired version.
 3. Create and push the matching tag, for example:
 
-   git tag -a v0.1.9 -m 'OpenShield v0.1.9'
-   git push origin v0.1.9
+   git tag -a v0.1.10 -m 'OpenShield v0.1.10'
+   git push origin v0.1.10
 
 The release workflow refuses a tag whose version differs from Cargo.toml.
 
