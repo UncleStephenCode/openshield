@@ -115,15 +115,44 @@ UDP, ICMP echo, and ICMPv6 echo, maps the tuple to exactly one procfs socket
 inode, requires exactly one process owner, and captures identity with repeated
 start-time, fd, executable path, complete file-version, UID, argv, and cgroup
 checks. Ambiguity, unsupported traffic, malformed metadata, a 250 ms procfs
-deadline, or any configured bound causes DROP. The owner search enumerates
-processes and tasks, reads each task's filesystem UID, and scans
-`/proc/TGID/task/TID/fd` only when that UID equals the kernel socket UID. Matching
-holders are grouped by TGID. No matching-UID holder, different matching TGIDs,
-an incomplete or unavailable live process/task scan, or candidate descriptor-bound
-exhaustion makes the attribution fail closed. Sibling holder TIDs in one TGID are
-accepted as one process only when their captured executable path/file version,
-argv, filesystem-UID, and cgroup enforcement identities are equal. A vanished
-procfs entry is skipped only after disappearance is confirmed.
+deadline, or any configured bound causes DROP. After an attribution attempt has
+resolved one socket inode, its owner search performs a fresh bounded enumeration
+of external PID/TID entries, reads each task's filesystem UID, and scans
+`/proc/TGID/task/TID/fd` only when that UID equals the kernel socket UID. It does
+not retain a process identity or authorization result across packets. Matching
+holders are grouped by TGID. The absence of a matching-UID holder, different
+matching TGIDs, an incomplete or unavailable live process/task scan, or candidate
+descriptor-bound exhaustion makes the attribution fail closed. Sibling holder
+TIDs in one TGID are accepted as one process only when their captured executable
+path/file version, argv, filesystem-UID, and cgroup enforcement identities are
+equal.
+
+The daemon's own TGID is handled separately because its standard Rust threads
+share one descriptor table. When its filesystem UID equals the kernel socket UID,
+the resolver performs a bounded check of `/proc/<self>/fd` immediately before
+external-owner enumeration and another after that enumeration completes. These
+are two shared-table checks on a completed owner scan instead of one scan per
+daemon thread. Finding the target socket or failing either inspection fails
+closed, and the daemon's per-thread fd paths are never accepted as application
+owners.
+This optimization is valid only while daemon threads retain the standard shared
+file table and do not receive file descriptors from another process or change
+filesystem UID independently; introducing `unshare(CLONE_FILES)`/
+`CLOSE_RANGE_UNSHARE`, cross-process descriptor receipt, or per-thread
+filesystem-UID changes requires re-auditing and, if the invariant no longer
+holds, redesigning it.
+The normal cross-UID exclusion applies when the UIDs differ. For an external
+owner, the descriptor number found for one task is tried first for later
+matching-UID tasks in the same scan. Only an exact target-symlink match followed
+by a repeated filesystem-UID check is accepted; any mismatch or read error falls
+back to that task's complete bounded fd-table scan. This local hint is not
+retained across packets. The exact fd path found by the ownership scan is
+likewise only a performance hint:
+runtime capture revalidates its symlink before reading identity metadata, falls
+back to a bounded rescan of that same task's fd table when the hint vanished or
+no longer names the target, and rechecks the selected symlink after identity
+capture. A revalidation or fallback error fails closed. A vanished procfs entry
+is skipped only after disappearance is confirmed.
 `PermissionDenied` on a TGID leader's fd table is skipped only after two bounded
 `stat` reads confirm stable zombie state `Z`; every other error, non-zombie
 state, or unconfirmed state fails closed.
@@ -140,7 +169,9 @@ executable file version. A lookup scans only the policy-ordered candidate vector
 for that exact version rather than all application rules. A root-edited or legacy
 state can still place many rules under one pin, so candidate matching is linear
 within that bucket. Learning uses a separate 512-item queue and persists at most
-256 observations per batch.
+256 observations per batch. This is a rule-index cache, not a process-identity or
+authorization-result cache. Apart from the established-TCP conntrack-generation
+fast path described below, every queued packet still receives fresh attribution.
 
 Both backend compilers implement an early mark-sanitization step, the main
 policy path, and a late authorization path. OpenShield reserves the upper two bits of

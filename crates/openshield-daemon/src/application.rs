@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -267,12 +268,32 @@ fn application_rule_matches(
 #[derive(Clone, Debug)]
 pub struct ProcfsResolver {
     root: PathBuf,
+    /// The daemon creates all of its threads with the standard Rust thread
+    /// runtime, which shares one descriptor table. Its own TGID can therefore
+    /// be checked through `/proc/<tgid>/fd` before and after the external-owner
+    /// scan instead of once for every observer and worker task. An unexpected
+    /// matching socket in that table is denied rather than attributed to the
+    /// firewall daemon. This optimization must be re-audited if daemon code
+    /// ever unshares `CLONE_FILES`, uses `CLOSE_RANGE_UNSHARE`, receives a file
+    /// descriptor from another process, or changes a thread's filesystem UID
+    /// independently.
+    daemon_process_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OwnerTask {
     tid: u32,
     path: PathBuf,
+    fd_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SocketFdSearch<'a> {
+    target: &'a str,
+    expected_uid: u32,
+    deadline: Instant,
+    maximum_fds: usize,
+    preferred_fd_name: Option<&'a OsStr>,
 }
 
 impl Default for ProcfsResolver {
@@ -286,13 +307,26 @@ impl ProcfsResolver {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("/proc"),
+            daemon_process_id: Some(std::process::id()),
         }
     }
 
     #[cfg(test)]
     #[must_use]
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            daemon_process_id: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn at_with_daemon_process(root: impl Into<PathBuf>, daemon_process_id: u32) -> Self {
+        Self {
+            root: root.into(),
+            daemon_process_id: Some(daemon_process_id),
+        }
     }
 
     pub fn resolve(&self, connection: &OutboundConnection) -> Result<ApplicationIdentity> {
@@ -311,6 +345,7 @@ impl ProcfsResolver {
                 Self::capture_identity(
                     &owner.path,
                     owner.tid,
+                    &owner.fd_path,
                     inode,
                     connection.socket_uid,
                     deadline,
@@ -385,11 +420,24 @@ impl ProcfsResolver {
         ensure!(maximum_fds > 0, "per-task fd bound is zero");
         let target = format!("socket:[{inode}]");
         let process_ids = enumerate_process_ids(&self.root, deadline)?;
+        if let Some(daemon_process_id) = self.daemon_process_id {
+            Self::reject_daemon_socket_owner(
+                &self.root.join(daemon_process_id.to_string()),
+                inode,
+                uid,
+                deadline,
+                maximum_fds,
+            )?;
+        }
         let mut owners: BTreeMap<u32, Vec<OwnerTask>> = BTreeMap::new();
         let mut task_count = 0_usize;
+        let mut preferred_fd_name: Option<OsString> = None;
         for process_id in process_ids {
             ensure_within_deadline(deadline)?;
             let process = self.root.join(process_id.to_string());
+            if self.daemon_process_id == Some(process_id) {
+                continue;
+            }
             let task_root = process.join("task");
             let Some(task_ids) =
                 enumerate_task_ids(&process, &task_root, process_id, deadline, &mut task_count)?
@@ -399,17 +447,42 @@ impl ProcfsResolver {
             for tid in task_ids {
                 ensure_within_deadline(deadline)?;
                 let task = task_root.join(tid.to_string());
-                if task_owns_socket(&task, process_id, tid, &target, uid, deadline, maximum_fds)? {
-                    owners
-                        .entry(process_id)
-                        .or_default()
-                        .push(OwnerTask { tid, path: task });
+                let search = SocketFdSearch {
+                    target: &target,
+                    expected_uid: uid,
+                    deadline,
+                    maximum_fds,
+                    preferred_fd_name: preferred_fd_name.as_deref(),
+                };
+                if let Some(fd_path) = task_socket_fd(&task, process_id, tid, search)? {
+                    if preferred_fd_name.is_none() {
+                        preferred_fd_name = Some(
+                            fd_path
+                                .file_name()
+                                .ok_or_else(|| anyhow!("socket descriptor path has no file name"))?
+                                .to_os_string(),
+                        );
+                    }
+                    owners.entry(process_id).or_default().push(OwnerTask {
+                        tid,
+                        path: task,
+                        fd_path,
+                    });
                 }
             }
             ensure!(
                 owners.len() <= 1,
                 "socket is shared by multiple processes; attribution is ambiguous"
             );
+        }
+        if let Some(daemon_process_id) = self.daemon_process_id {
+            Self::reject_daemon_socket_owner(
+                &self.root.join(daemon_process_id.to_string()),
+                inode,
+                uid,
+                deadline,
+                maximum_fds,
+            )?;
         }
         ensure_within_deadline(deadline)?;
         owners
@@ -419,15 +492,41 @@ impl ProcfsResolver {
             .ok_or_else(|| anyhow!("no process owns the attributed socket inode"))
     }
 
+    fn reject_daemon_socket_owner(
+        process: &Path,
+        inode: u64,
+        expected_uid: u32,
+        deadline: Instant,
+        maximum_fds: usize,
+    ) -> Result<()> {
+        let daemon_uid = read_process_fs_uid(process, deadline)
+            .context("cannot verify the firewall daemon filesystem UID")?;
+        if daemon_uid != expected_uid {
+            // This is the same UID filter applied before every other task fd
+            // scan. A cross-UID descriptor holder is deliberately not an
+            // attributable owner (see the threat model).
+            return Ok(());
+        }
+        let target = format!("socket:[{inode}]");
+        ensure!(
+            find_socket_fd_bounded(process, &target, deadline, maximum_fds)
+                .context("cannot inspect the firewall daemon descriptor table")?
+                .is_none(),
+            "the firewall daemon unexpectedly owns the attributed application socket"
+        );
+        Ok(())
+    }
+
     fn capture_identity(
         process: &Path,
         pid: u32,
+        fd_path: &Path,
         inode: u64,
         expected_uid: u32,
         deadline: Instant,
     ) -> Result<ApplicationIdentity> {
         let socket_target = format!("socket:[{inode}]");
-        let fd_path = find_socket_fd(process, &socket_target, deadline)?;
+        let fd_path = verified_socket_fd(process, fd_path, &socket_target, deadline)?;
         let start_before = read_start_time(process, deadline)?;
         let uid_before = read_process_fs_uid(process, deadline)?;
         ensure!(uid_before == expected_uid, "process/socket uid mismatch");
@@ -582,33 +681,52 @@ fn enumerate_task_ids(
     Ok(Some(task_ids))
 }
 
-fn task_owns_socket(
+fn task_socket_fd(
     task: &Path,
     process_id: u32,
     task_id: u32,
-    target: &str,
-    expected_uid: u32,
-    deadline: Instant,
-    maximum_fds: usize,
-) -> Result<bool> {
-    let observed_fsuid = match read_process_fs_uid(task, deadline) {
+    search: SocketFdSearch<'_>,
+) -> Result<Option<PathBuf>> {
+    let observed_fsuid = match read_process_fs_uid(task, search.deadline) {
         Ok(uid) => uid,
         Err(error) => {
             if path_disappeared(task)? {
-                return Ok(false);
+                return Ok(None);
             }
             return Err(error)
                 .with_context(|| format!("cannot inspect filesystem UID for task {task_id}"));
         }
     };
-    if observed_fsuid != expected_uid {
-        return Ok(false);
+    if observed_fsuid != search.expected_uid {
+        return Ok(None);
+    }
+    if let Some(fd_name) = search.preferred_fd_name {
+        let preferred_path = task.join("fd").join(fd_name);
+        let preferred_link = match fs::read_link(&preferred_path) {
+            Ok(link) => link.to_str().map(ToOwned::to_owned),
+            // The fd number is only an optimization hint learned earlier in
+            // this exhaustive scan. Any miss or error falls back to the
+            // original bounded directory walk, including its zombie and
+            // disappearance handling; the hint is never authorization.
+            Err(_) => None,
+        };
+        ensure_within_deadline(search.deadline)?;
+        if preferred_link.as_deref() == Some(search.target) {
+            verify_socket_owner_uid(
+                task,
+                task_id,
+                observed_fsuid,
+                search.expected_uid,
+                search.deadline,
+            )?;
+            return Ok(Some(preferred_path));
+        }
     }
     let descriptors = match fs::read_dir(task.join("fd")) {
         Ok(entries) => entries,
         Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
             if path_disappeared(task)? {
-                return Ok(false);
+                return Ok(None);
             }
             bail!(
                 "cannot prove socket ownership: descriptor table for live task {task_id} is unavailable"
@@ -617,25 +735,25 @@ fn task_owns_socket(
         Err(error) => {
             if error.kind() == ErrorKind::PermissionDenied
                 && task_id == process_id
-                && task_is_stably_zombie(task, deadline)?
+                && task_is_stably_zombie(task, search.deadline)?
             {
                 // A terminated thread-group leader can remain as a zombie
                 // while workers continue. Linux has already run exit_files()
                 // for a zombie, so its inaccessible fd directory cannot hide
                 // a socket owner. Continue scanning the live worker tasks.
-                return Ok(false);
+                return Ok(None);
             }
             return Err(error)
                 .with_context(|| format!("cannot enumerate descriptor table for task {task_id}"));
         }
     };
-    ensure_within_deadline(deadline)?;
+    ensure_within_deadline(search.deadline)?;
     for (count, entry) in descriptors.enumerate() {
         ensure!(
-            count < maximum_fds,
+            count < search.maximum_fds,
             "cannot prove unique socket ownership: per-task fd bound exceeded"
         );
-        ensure_within_deadline(deadline)?;
+        ensure_within_deadline(search.deadline)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
@@ -653,18 +771,35 @@ fn task_owns_socket(
                     .with_context(|| format!("cannot inspect descriptor link for task {task_id}"));
             }
         };
-        ensure_within_deadline(deadline)?;
-        if link.as_deref() == Some(target) {
-            let owner_uid = read_process_fs_uid(task, deadline)
-                .with_context(|| format!("cannot verify socket owner task {task_id}"))?;
-            ensure!(
-                owner_uid == observed_fsuid && owner_uid == expected_uid,
-                "socket owner filesystem UID differs from the kernel socket UID"
-            );
-            return Ok(true);
+        ensure_within_deadline(search.deadline)?;
+        if link.as_deref() == Some(search.target) {
+            verify_socket_owner_uid(
+                task,
+                task_id,
+                observed_fsuid,
+                search.expected_uid,
+                search.deadline,
+            )?;
+            return Ok(Some(entry.path()));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+fn verify_socket_owner_uid(
+    task: &Path,
+    task_id: u32,
+    observed_fsuid: u32,
+    expected_uid: u32,
+    deadline: Instant,
+) -> Result<()> {
+    let owner_uid = read_process_fs_uid(task, deadline)
+        .with_context(|| format!("cannot verify socket owner task {task_id}"))?;
+    ensure!(
+        owner_uid == observed_fsuid && owner_uid == expected_uid,
+        "socket owner filesystem UID differs from the kernel socket UID"
+    );
+    Ok(())
 }
 
 fn equivalent_enforcement_identity(
@@ -787,23 +922,52 @@ fn parse_proc_endpoint(value: &str) -> Result<(IpAddr, u16)> {
     Ok((address, port))
 }
 
-fn find_socket_fd(process: &Path, target: &str, deadline: Instant) -> Result<PathBuf> {
+fn find_socket_fd_bounded(
+    process: &Path,
+    target: &str,
+    deadline: Instant,
+    maximum_fds: usize,
+) -> Result<Option<PathBuf>> {
+    ensure!(maximum_fds > 0, "per-task fd bound is zero");
     ensure_within_deadline(deadline)?;
     let entries = fs::read_dir(process.join("fd")).context("cannot enumerate process fds")?;
     ensure_within_deadline(deadline)?;
     for (count, entry) in entries.enumerate() {
         ensure_within_deadline(deadline)?;
-        ensure!(count < MAX_FDS_PER_TASK, "per-task fd bound exceeded");
+        ensure!(count < maximum_fds, "per-task fd bound exceeded");
         let entry = entry.context("cannot inspect process fd")?;
-        let link = fs::read_link(entry.path())
-            .ok()
-            .and_then(|link| link.to_str().map(ToOwned::to_owned));
+        let link = match fs::read_link(entry.path()) {
+            Ok(link) => link.to_str().map(ToOwned::to_owned),
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).context("cannot inspect process descriptor link");
+            }
+        };
         ensure_within_deadline(deadline)?;
         if link.as_deref() == Some(target) {
-            return Ok(entry.path());
+            return Ok(Some(entry.path()));
         }
     }
-    bail!("attributed socket fd is no longer owned by the process")
+    Ok(None)
+}
+
+fn verified_socket_fd(
+    process: &Path,
+    observed_fd_path: &Path,
+    target: &str,
+    deadline: Instant,
+) -> Result<PathBuf> {
+    ensure_within_deadline(deadline)?;
+    match fs::read_link(observed_fd_path) {
+        Ok(link) if link.to_str() == Some(target) => return Ok(observed_fd_path.to_path_buf()),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("cannot revalidate attributed socket descriptor");
+        }
+    }
+    find_socket_fd_bounded(process, target, deadline, MAX_FDS_PER_TASK)?
+        .ok_or_else(|| anyhow!("attributed socket fd is no longer owned by the process"))
 }
 
 fn read_process_fs_uid(process: &Path, deadline: Instant) -> Result<u32> {
@@ -970,6 +1134,39 @@ mod tests {
             format!("Name:\ttest\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
         )?;
         Ok(task)
+    }
+
+    fn create_process_fixture(
+        root: &Path,
+        process_id: u32,
+        uid: u32,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let process = root.join(process_id.to_string());
+        fs::create_dir_all(process.join("fd"))?;
+        fs::write(
+            process.join("status"),
+            format!("Name:\ttest\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )?;
+        Ok(process)
+    }
+
+    fn complete_identity_fixture(task: &Path, pid: u32) -> Result<(), Box<dyn Error>> {
+        let executable = task
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("task fixture has no process directory")?
+            .join("fixture-executable");
+        fs::write(&executable, b"fixture executable")?;
+        symlink(&executable, task.join("exe"))?;
+        fs::write(task.join("cmdline"), b"fixture-executable\0--test\0")?;
+        fs::write(task.join("cgroup"), b"0::/openshield-test\n")?;
+        let mut fields = vec!["S".to_owned(); 20];
+        fields[19] = "987654".to_owned();
+        fs::write(
+            task.join("stat"),
+            format!("{pid} (fixture) {}\n", fields.join(" ")),
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -1444,6 +1641,243 @@ mod tests {
         assert_eq!(
             owners.iter().map(|owner| owner.tid).collect::<Vec<_>>(),
             vec![200, 201]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validated_fd_number_hint_avoids_rewalking_a_shared_sibling_table()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let leader = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        let worker = create_task_fixture(directory.path(), 200, 201, 1_000)?;
+        symlink("socket:[77]", leader.join("fd/3"))?;
+        symlink("socket:[77]", worker.join("fd/3"))?;
+        // The second entry would exceed the deliberately tiny exhaustive-scan
+        // bound. A direct readlink of the already observed fd number is enough
+        // to prove that this sibling task exposes the same target socket.
+        symlink("socket:[88]", worker.join("fd/4"))?;
+
+        let resolver = ProcfsResolver::at(directory.path());
+        let owners = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            1,
+        )?;
+
+        assert_eq!(
+            owners.iter().map(|owner| owner.tid).collect::<Vec<_>>(),
+            vec![200, 201]
+        );
+        assert!(owners.iter().all(|owner| {
+            owner.fd_path.file_name().and_then(|name| name.to_str()) == Some("3")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_descriptor_table_is_checked_twice_instead_of_every_sibling_task()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let _daemon = create_process_fixture(directory.path(), 100, 1_000)?;
+        for task_id in 100..132 {
+            let task = create_task_fixture(directory.path(), 100, task_id, 1_000)?;
+            // A scan of any sibling table with the deliberately tiny bound
+            // below would fail. The daemon owns and shares one files table, so
+            // only /proc/<TGID>/fd needs to be inspected.
+            symlink("socket:[1]", task.join("fd/3"))?;
+            symlink("socket:[2]", task.join("fd/4"))?;
+        }
+        let external_owner = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        let external_fd = external_owner.join("fd/9");
+        symlink("socket:[77]", &external_fd)?;
+
+        let resolver = ProcfsResolver::at_with_daemon_process(directory.path(), 100);
+        let owners = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            1,
+        )?;
+
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].tid, 200);
+        assert_eq!(owners[0].fd_path, external_fd);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_owning_an_application_socket_is_denied_even_with_an_external_holder()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let daemon = create_process_fixture(directory.path(), 100, 1_000)?;
+        symlink("socket:[77]", daemon.join("fd/3"))?;
+        let external_owner = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        symlink("socket:[77]", external_owner.join("fd/9"))?;
+
+        let resolver = ProcfsResolver::at_with_daemon_process(directory.path(), 100);
+        let result = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            4,
+        );
+
+        assert!(result.is_err());
+        assert!(result.err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("firewall daemon unexpectedly owns")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn every_attribution_rescan_detects_a_new_external_socket_holder() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("self/net"))?;
+        fs::write(
+            directory.path().join("self/net/udp"),
+            "sl local_address rem_address st tx_queue tr retrnsmt uid timeout inode\n\
+             0: 0100007F:3039 0100007F:D431 01 00000000:00000000 00:00000000 00000000 1000 0 77\n",
+        )?;
+        let original_owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        complete_identity_fixture(&original_owner, 100)?;
+        symlink("socket:[77]", original_owner.join("fd/3"))?;
+        let resolver = ProcfsResolver::at(directory.path());
+        let connection = OutboundConnection {
+            source_address: "127.0.0.1".parse()?,
+            source_port: Some(12_345),
+            destination_address: "127.0.0.1".parse()?,
+            destination_port: Some(54_321),
+            protocol: TransportProtocol::Udp,
+            output_interface: InterfaceName::new("lo")?,
+            socket_uid: 1_000,
+        };
+
+        let initial = resolver.resolve(&connection)?;
+        assert_eq!(initial.pid, 100);
+
+        let transferred_holder = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        symlink("socket:[77]", transferred_holder.join("fd/9"))?;
+        let repeated = resolver.resolve(&connection);
+
+        assert!(repeated.is_err());
+        assert!(
+            repeated
+                .err()
+                .is_some_and(|error| error.to_string().contains("multiple processes"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_attribution_rescan_follows_a_socket_moved_to_another_fd() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        let old_fd = owner.join("fd/3");
+        let new_fd = owner.join("fd/9");
+        symlink("socket:[77]", &old_fd)?;
+        let resolver = ProcfsResolver::at(directory.path());
+
+        let initial = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            4,
+        )?;
+        assert_eq!(initial[0].fd_path, old_fd);
+
+        fs::remove_file(owner.join("fd/3"))?;
+        symlink("socket:[77]", &new_fd)?;
+        let repeated = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            4,
+        )?;
+
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].fd_path, new_fd);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_capture_revalidates_a_stale_fd_hint_before_falling_back()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let owner = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        complete_identity_fixture(&owner, 200)?;
+        let original_fd = owner.join("fd/3");
+        symlink("socket:[77]", &original_fd)?;
+        let resolver = ProcfsResolver::at(directory.path());
+        let mut owners = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            4,
+        )?;
+        let attributed = owners.pop().ok_or("owner disappeared")?;
+        assert_eq!(attributed.fd_path, original_fd);
+
+        // The common path rechecks only the exact descriptor returned by the
+        // exhaustive owner scan. If the process moved the socket concurrently,
+        // the bounded fallback must find it again in the same task rather than
+        // accepting the stale descriptor.
+        fs::remove_file(&attributed.fd_path)?;
+        symlink("socket:[88]", &attributed.fd_path)?;
+        symlink("socket:[77]", owner.join("fd/9"))?;
+        let identity = ProcfsResolver::capture_identity(
+            &attributed.path,
+            attributed.tid,
+            &attributed.fd_path,
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+        )?;
+
+        assert_eq!(identity.pid, 200);
+        assert_eq!(identity.uid, 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_capture_does_not_follow_a_socket_transferred_to_another_task()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let original_owner = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        complete_identity_fixture(&original_owner, 200)?;
+        let original_fd = original_owner.join("fd/3");
+        symlink("socket:[77]", &original_fd)?;
+        let resolver = ProcfsResolver::at(directory.path());
+        let mut owners = resolver.resolve_unique_process_tasks(
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+            4,
+        )?;
+        let attributed = owners.pop().ok_or("owner disappeared")?;
+
+        fs::remove_file(&attributed.fd_path)?;
+        let recipient = create_task_fixture(directory.path(), 300, 300, 1_000)?;
+        symlink("socket:[77]", recipient.join("fd/9"))?;
+        let result = ProcfsResolver::capture_identity(
+            &attributed.path,
+            attributed.tid,
+            &attributed.fd_path,
+            77,
+            1_000,
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result.err().is_some_and(|error| {
+                error.to_string().contains("no longer owned by the process")
+            })
         );
         Ok(())
     }
