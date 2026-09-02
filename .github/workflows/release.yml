@@ -375,11 +375,21 @@ jobs:
           E2E_LOG: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
         run: |
           set -o pipefail
+          e2e_status=0
           tests/e2e/server-learning-enforcing.sh "$BACKEND" "$BINARY_DIR" \
-            2>&1 | tee "$E2E_LOG"
+            2>&1 | tee "$E2E_LOG" || e2e_status=$?
+          if (( e2e_status != 0 )); then
+            failure_stage="$(grep -F 'OpenShield E2E failed during stage ' "$E2E_LOG" \
+              | tail -n 1 || true)"
+            if [[ -n "$failure_stage" ]]; then
+              printf '::error title=OpenShield %s E2E failed::%s\n' \
+                "$BACKEND" "$failure_stage"
+            fi
+          fi
+          exit "$e2e_status"
 
       - name: Preserve E2E failure diagnostics
-        if: steps.firewall_e2e.outcome == 'failure'
+        if: ${{ failure() && steps.firewall_e2e.outcome == 'failure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-failure-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}

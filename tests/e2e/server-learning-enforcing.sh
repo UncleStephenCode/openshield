@@ -170,9 +170,18 @@ cleanup() {
         printf 'OpenShield E2E failed during stage "%s" (%s)\n' "$stage_name" "$backend" >&2
         if [ -n "$client_id" ]; then
             docker exec "$client_id" sh -c \
-                'cat /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
-                 for save in /usr/sbin/iptables-legacy-save /usr/sbin/iptables-nft-save; do
-                     [ ! -x "$save" ] || "$save" -c -t filter 2>/dev/null || true
+                'printf "%s\n" "--- runtime ---"
+                 uname -a 2>/dev/null || true
+                 cat /tmp/openshield.exit-status /var/lib/openshield/state.json 2>/dev/null || true
+                 printf "%s\n" "--- daemon logs ---"
+                 cat /tmp/openshield.log /tmp/openshield-restart.log 2>/dev/null || true
+                 for save in \
+                     /usr/sbin/iptables-legacy-save /usr/sbin/ip6tables-legacy-save \
+                     /usr/sbin/iptables-nft-save /usr/sbin/ip6tables-nft-save; do
+                     [ ! -x "$save" ] || for table in mangle filter; do
+                         printf "%s\n" "--- $save -t $table ---"
+                         "$save" -c -t "$table" 2>&1 || true
+                     done
                  done' >&2 \
                 || true
         fi
