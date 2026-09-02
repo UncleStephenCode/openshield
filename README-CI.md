@@ -1,79 +1,39 @@
-# OpenShield GitHub CI/release files
+[English](README-CI.md) | [Русский](README-CI.ru.md)
 
-Copy the contents of this archive into the root of the OpenShield repository.
-The archive is additive: it does not replace the existing `packaging/` assets;
-it relies on the project's existing `packaging/stage-install.sh`, init files and
-compatibility scripts.
+# OpenShield CI and releases
 
-## What it adds
+The authoritative release-CI documentation is
+[`.github/README-CI.md`](.github/README-CI.md). The workflow itself is
+`.github/workflows/release.yml`, and its machine-readable support contract is
+`packaging/ci/release-matrix.json`.
 
-- `.github/workflows/ci.yml`: PR/main Rust and packaging validation.
-- `.github/workflows/release.yml`: tag-driven amd64 + arm64 static-musl builds,
-  Tumbleweed GNU builds for all five supported architectures, native package
-  generation, install smoke tests, firewall E2E, checksums and a GitHub Release.
-- `packaging/ci/nfpm.yaml`: common nFPM package definition.
-- `packaging/ci/scripts/build-release-package.sh`: builds DEB/RPM/APK/Arch packages.
-- `packaging/ci/scripts/test-release-package.sh`: installs packages in distribution containers.
-- `packaging/ci/hooks/*`: safe post-install hooks; they create runtime prerequisites
-  but deliberately do not enable or start OpenShield.
+The release graph is fail-closed:
 
-All GitHub Actions are pinned to commit SHAs. Cross, package-smoke, E2E client,
-and E2E server images are pinned to registry SHA-256 digests; downloaded Cross
-and nFPM release archives are verified against fixed SHA-256 values before use.
+```text
+Validation
+    -> Quality Gate
+    -> 7 binary builds
+    -> 18 package builds
+    -> 34 distribution/platform installations
+    -> pinned init-system container tests
+    -> 59 firewall E2E jobs
+    -> sealed release candidate and evidence
+    -> publication
+```
 
-## Release matrix
+The 59 firewall jobs comprise 32 nftables scenarios and 27 iptables fallback
+scenarios. Tumbleweed i586 executes both scenarios through the x86 runner's
+`linux/386` compatibility mode. Tumbleweed ppc64le and s390x are explicitly
+recorded as QEMU package smoke only and are not represented as full firewall or
+native-hardware certification.
 
-Binaries:
+Every published package is linked to its installation and firewall evidence by
+asset name and SHA-256. Before making any publication API request, the
+write-capable job independently verifies the tag, source revision, matrix hash,
+complete asset inventory, file sizes, digests, and `SHA256SUMS`.
 
-- amd64: `x86_64-unknown-linux-musl`
-- arm64: `aarch64-unknown-linux-musl`
-- openSUSE Tumbleweed: amd64 (`x86_64`), i586, arm64 (`aarch64`), ppc64le and
-  s390x GNU binaries
-
-Packages:
-
-- DEB: amd64, arm64
-- Fedora RPM: amd64, arm64
-- EL9 RPM: amd64, arm64
-- EL10 RPM: amd64, arm64
-- openSUSE RPM: amd64, arm64
-- openSUSE Tumbleweed RPM: amd64, i586, arm64, ppc64le, s390x
-- Alpine APK: amd64, arm64
-- Arch package: amd64
-
-Install smoke tests currently run on amd64 containers for Debian 12/13,
-Ubuntu 22.04/24.04/26.04, Fedora 43/44, Rocky/Alma 9 and 10,
-openSUSE Leap 16.0, a pinned openSUSE Tumbleweed snapshot, Alpine 3.23/3.24 and
-Arch Linux. Firewall E2E runs the corresponding artifact for each distribution:
-the static-musl amd64 artifact on Debian and the Tumbleweed GNU amd64 artifact
-on Tumbleweed. Both environments test nftables first and iptables as the
-fallback backend.
-
-## First test
-
-1. Merge the files into `main` and make sure the ordinary CI passes.
-2. Ensure `[workspace.package].version` in `Cargo.toml` is the desired version.
-3. Create and push the matching tag, for example:
-
-   git tag -a v0.1.18 -m 'OpenShield v0.1.18'
-   git push origin v0.1.18
-
-The release workflow refuses a tag whose version differs from Cargo.toml.
-
-Publishing is resumable. If the tag already has a GitHub Release, the workflow
-keeps matching assets, uploads only missing files, and refuses to delete or
-replace a file whose size or SHA-256 digest differs from the current build. A
-draft is published only after the complete remote asset set has been verified.
-A run triggered by creation of a tag automatically completes an existing
-matching release. Tag updates and force-pushes are not authorized to repair a
-published release. To recover an older tag through `workflow_dispatch`, run it
-from a revision containing this workflow, pass that tag as the `tag` input, and
-explicitly enable `repair_existing_release`. Re-running an older failed job uses
-its original workflow revision and does not pick up later workflow fixes.
-
-## Important
-
-The workflow uses GitHub-hosted `ubuntu-24.04-arm` for native arm64 builds.
-If that runner label is not available for the repository/account, change the
-arm64 row in `.github/workflows/release.yml` to an available ARM64 runner or a
-self-hosted ARM64 runner.
+To create a release, set `[workspace.package].version` in `Cargo.toml`, commit
+the complete change, and create the matching `vX.Y.Z` tag. Recovery of an
+already published release is allowed only through the explicit
+`workflow_dispatch` repair option; existing assets with different bytes are
+never overwritten.

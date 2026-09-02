@@ -179,6 +179,8 @@ of these init systems; by design it refuses to install directly into `/`.
 Package maintainers should use it with a fresh `DESTDIR`, install the staged
 files through their package manager, and run the platform-specific enablement
 step described in [packaging/README.md](packaging/README.md).
+The authoritative distribution/architecture release matrix and its gated
+build-to-publication flow are documented in [.github/README-CI.md](.github/README-CI.md).
 
 Releases provide separate GNU builds and RPMs for every main Tumbleweed
 installation architecture:

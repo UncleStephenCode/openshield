@@ -14,6 +14,44 @@ one layer must not be interpreted as a pass in another.
 
 The real Learning-to-Enforcing firewall workflow is a separate end-to-end test.
 
+## Release validation versus compatibility research
+
+The release pipeline has its own authoritative matrix:
+[`packaging/ci/release-matrix.json`](../../packaging/ci/release-matrix.json).
+It defines exactly 34 distribution/userspace and OCI-platform pairs for which a
+release package must be installed and its assigned container tests must pass.
+The release dependency graph is:
+
+```text
+Validation
+    -> Quality Gate
+    -> Binaries
+    -> Packages
+    -> Install Matrix
+    -> Container Tests
+    -> Firewall E2E
+    -> Release Evidence
+    -> Publish
+```
+
+The complete policy, architecture evidence levels, and publication boundary are
+documented in [the release CI guide](../../.github/README-CI.md). Compilation is
+allowed only after Validation and the Quality Gate. Publication is allowed only
+after the evidence stage has reconciled every required matrix row and release
+asset.
+
+The 34 release rows cover Debian 12/13, Ubuntu 22.04/24.04/26.04, Fedora 43/44,
+Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0, Alpine 3.23/3.24, and
+Tumbleweed on `amd64` and `arm64`; Arch Linux on `amd64`; and Tumbleweed
+additionally on i586 (`linux/386`), `ppc64le`, and `s390x`. Family/architecture
+packages may be built once, but installation and evidence remain separate for
+every distribution/platform row.
+
+This release matrix and the 60-row research matrix below serve different
+purposes. Passing the broad compatibility smoke does not add a release row, and
+removing an archived research image does not change the package-support
+contract. Do not derive release claims from `distros.tsv`.
+
 ## Distribution image matrix
 
 `distros.tsv` contains exactly 60 rows across Debian/Ubuntu, Alpine, Fedora,
@@ -91,13 +129,18 @@ not provide their standard libraries, so the stable matrix skips them. Building
 them requires a separately reviewed nightly `build-std` workflow; they are not
 claimed as stable release targets.
 
-Separate Tumbleweed GNU release binaries were linked and ELF-validated for
-x86_64, i586, AArch64, ppc64le, and s390x. The i586, AArch64, ppc64le, and
-s390x daemon and TUI binaries completed capability-free `--version` smoke tests
-under digest-pinned Cross QEMU images; i586 additionally ran in the pinned
-official Tumbleweed `linux/386` image. These are execution smokes, not firewall
-tests or hardware certification. No blanket runtime claim is made for x86, ARM,
-arm64, PowerPC, IBM Z, or RISC-V hardware.
+Release binaries are linked and ELF-validated for x86_64, i586, AArch64,
+ppc64le, and s390x where the authoritative matrix requires them. `amd64` and
+`arm64` release jobs run on native x86-64 and AArch64 runners. The Tumbleweed
+i586 package runs directly through the x86 runner's `linux/386` compatibility
+path, while the cross-built binary also receives a `qemu-runner` smoke check;
+the installed package then runs both full backend E2E scenarios, though this is
+not physical-i586 hardware. Tumbleweed `ppc64le` and
+`s390x` use digest-pinned Cross/QEMU environments for capability-free execution
+and package smoke only. QEMU evidence is never presented as a full firewall
+test, native execution, distribution-kernel coverage, or hardware
+certification. No blanket runtime claim is made for x86, ARM, arm64, PowerPC,
+IBM Z, or RISC-V hardware.
 Architecture aliases do not create additional targets: AMD64 means x86_64, and
 ARM64 means AArch64. `aarch` alone is not a Rust Linux target name.
 
@@ -133,6 +176,23 @@ The lifecycle fixtures mount a stub daemon. Their successful result does not
 mean a backend was selected or that real packets were filtered.
 
 ## Real firewall end-to-end workflow
+
+Release backend coverage follows the package dependency contract. DEB and RPM
+rows marked `full` (`amd64`, `arm64`, and Tumbleweed i586) run the complete Learning-to-Enforcing test
+twice: once with nftables preferred while both frontends are installed, and
+once with `nft` absent so the complete iptables/ip6tables fallback must be
+selected. APK and Arch rows run the complete nftables scenario because those
+released packages require nftables and do not declare iptables as an
+alternative dependency. The emulated Tumbleweed `ppc64le` and `s390x` rows are
+limited to package-install and QEMU execution smoke and are not recorded as
+complete backend E2E results.
+
+Every release image is pinned by SHA-256 digest and paired with an explicit OCI
+platform. The evidence stage records the image/platform identity, package and
+binary hashes, installation result, assigned backend results, and expected
+release-asset inventory. Docker still uses the runner kernel, so these results
+validate container userspace and isolated network-namespace behavior rather
+than the distribution's own kernel or a complete init boot.
 
 `../e2e/server-learning-enforcing.sh` creates a disposable Docker network with a
 client and HTTP server. It is designed to verify, separately for each backend:
