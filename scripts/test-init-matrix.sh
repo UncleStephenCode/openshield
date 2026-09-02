@@ -99,8 +99,36 @@ validate_sources() {
         || fail 'systemd ambient and bounding capability sets differ'
     [ "$(sed -n 's/^User=//p' "$systemd_unit")" = root ] \
         || fail 'systemd daemon user is not root'
-    [ "$(sed -n 's/^Group=//p' "$systemd_unit")" = openshield ] \
-        || fail 'systemd daemon effective group is not openshield'
+    [ "$(sed -n 's/^Group=//p' "$systemd_unit")" = root ] \
+        || fail 'systemd daemon primary group is not root'
+    [ "$(sed -n 's/^SupplementaryGroups=//p' "$systemd_unit")" = openshield ] \
+        || fail 'systemd daemon does not have the exact observation supplementary group'
+    if grep -Eq '^(RuntimeDirectory|StateDirectory)' "$systemd_unit"; then
+        fail 'systemd special directories would recursively change preserved ownership'
+    fi
+    [ "$(sed -n 's/^RequiresMountsFor=//p' "$systemd_unit")" \
+        = '/run/openshield /var/lib/openshield' ] \
+        || fail 'systemd unit does not retain explicit runtime/state mount dependencies'
+
+    tmpfiles=$package_directory/daemon/openshield.tmpfiles
+    for declaration in \
+        'd /run/openshield 0755 root root -' \
+        'z /run/openshield 0755 root root -' \
+        'd /var/lib/openshield 0700 root root -' \
+        'z /var/lib/openshield 0700 root root -' \
+        'f /run/xtables.lock 0600 root root -' \
+        'z /run/xtables.lock 0600 root root -'
+    do
+        grep -Fqx "$declaration" "$tmpfiles" \
+            || fail "missing tmpfiles declaration: $declaration"
+    done
+    [ "$(sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$tmpfiles" | wc -l)" -eq 6 ] \
+        || fail 'tmpfiles declaration exposes unexpected filesystem paths'
+    if command -v systemd-tmpfiles >/dev/null 2>&1 \
+        && systemd-tmpfiles --help | grep -Fq -- '--dry-run'; then
+        systemd-tmpfiles --create --dry-run "$tmpfiles" >/dev/null 2>&1 \
+            || fail 'systemd-tmpfiles rejected the create/relabel declaration'
+    fi
 
     [ "$(sed -n '1p' "$package_directory/s6/openshield/type")" = longrun ] \
         || fail 's6 service type is not longrun'
@@ -132,6 +160,7 @@ validate_sources() {
             systemd)
                 expect_file "$destination/usr/lib/systemd/system/openshield-daemon.service"
                 expect_file "$destination/usr/lib/sysusers.d/openshield.conf"
+                expect_file "$destination/usr/lib/tmpfiles.d/openshield.conf"
                 ;;
             openrc|sysvinit)
                 expect_executable "$destination/etc/init.d/openshield"

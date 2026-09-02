@@ -124,9 +124,10 @@ staged and checked separately: the unit with target stubs passed
 `systemd-analyze verify`, and offline
 `systemd-analyze security --offline=yes --threshold=100` passed with exposure
 2.7 (`OK`). Verification and the same 2.7 assessment were repeated with systemd
-installed inside the pinned Tumbleweed container. The tmpfiles declaration for
-the shared xtables lock also passed a rooted dry run. This matrix does not boot
-systemd in a container or as PID 1.
+installed inside the pinned Tumbleweed container. The full tmpfiles
+create/relabel declaration for the runtime directory, state directory, and
+shared xtables lock also passed repeated application and exact metadata checks.
+This matrix does not boot systemd in a container or as PID 1.
 
 The lifecycle fixtures mount a stub daemon. Their successful result does not
 mean a backend was selected or that real packets were filtered.

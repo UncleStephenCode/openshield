@@ -168,9 +168,10 @@ are broader than firewall administration alone.
 - The packaged unit installs `BlockAll` before its main process and reports
   systemd readiness only after the selected policy, fail-closed queue consumer,
   and IPC endpoints are active. It requires tmpfiles setup to pre-create the
-  standard root-owned `0600` `/run/xtables.lock` and grants write access to that
-  shared file rather than all of `/run`, preserving serialization with other
-  xtables processes. Once enabled, its
+  root-owned runtime/state directories and standard `0600` `/run/xtables.lock`,
+  and grants write access to those exact paths rather than all of `/run` or
+  `/var/lib`. Non-recursive relabeling preserves their policy-defined SELinux
+  contexts without altering stored state. Once enabled, its
   `RequiredBy=network-pre.target` installation dependency and
   `Before=network-pre.target` ordering make standard consumers depend on that
   successful readiness; the scope limitation is recorded below.
@@ -185,8 +186,9 @@ are broader than firewall administration alone.
 - UTC rollback cannot invalidate a rule update: revisions define ordering and
   persisted `updated_at` values are kept monotonic.
 - The packaged unit limits the daemon to `CAP_NET_ADMIN`, `CAP_NET_RAW`,
-  `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its effective `openshield` group
-  avoids retaining `CAP_CHOWN`; `CAP_NET_RAW` is required for legacy
+  `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. It keeps primary group `root` and
+  adds supplementary group `openshield`; the socket owner can select that
+  group without retaining `CAP_CHOWN`. `CAP_NET_RAW` is required for legacy
   xtables inspection and fallback operation; the syscall filter denies `ptrace`,
   `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_getfd`, and
   `open_by_handle_at`.

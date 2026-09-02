@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-02, OpenShield 0.1.16, Rust stable 1.98.0.
+Review snapshot: 2026-09-02, OpenShield 0.1.17, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -160,15 +160,16 @@ The normative boundary is defined by the
   exception. Its probes stop at the first rejected object. It never enables or
   starts a service on the host.
 - The systemd service retains `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_PTRACE`,
-  and `CAP_DAC_READ_SEARCH`. It uses the effective `openshield` group instead of
-  `CAP_CHOWN` for the observer socket, while `CAP_NET_RAW` is required for safe legacy xtables
+  and `CAP_DAC_READ_SEARCH`. It keeps `root` as the primary group and adds
+  `openshield` as a supplementary group. The socket owner may assign that group
+  to the observer socket without `CAP_CHOWN`, while `CAP_NET_RAW` is required for safe legacy xtables
   inspection and fallback operation; several process-memory syscalls remain
-  denied. A tmpfiles
-  rule creates the standard root-owned `0600` `/run/xtables.lock`; the unit
-  requires tmpfiles setup and makes only that shared lock, rather than all of
-  `/run`, additionally writable. This preserves serialization with other
-  xtables processes. The unit reduces attack surface but is not a sandbox
-  against a compromised daemon.
+  denied. Non-recursive tmpfiles rules create and relabel the root-owned
+  runtime/state directories and standard `0600` `/run/xtables.lock`; the unit
+  requires tmpfiles setup and makes only those exact paths, rather than all of
+  `/run` or `/var/lib`, writable. This preserves serialization with other
+  xtables processes without recursively changing saved state. The unit reduces
+  attack surface but is not a sandbox against a compromised daemon.
 
 ## Verification evidence
 
@@ -211,9 +212,10 @@ establish the properties of another.
   2.7 (`OK`). Verification and the same 2.7 assessment were repeated with
   systemd installed inside the pinned Tumbleweed container.
   Alpine/BusyBox also executed the staging helper, and unsafe staging-tree
-  fixtures, including symlink and writable-parent cases, were rejected. A
-  rooted tmpfiles dry run parsed the shared-lock declaration. These are
-  static/unit-fixture results, not a systemd boot or packet-filtering run.
+  fixtures, including symlink and writable-parent cases, were rejected. The
+  full tmpfiles create/relabel declaration was applied twice in the pinned
+  Tumbleweed container; exact root ownership/modes and idempotence passed. These
+  are packaging/unit-fixture results, not a systemd boot or packet-filtering run.
 - The TUI suite covers all 31 locale resources with 183 messages each and
   verifies exact key, placeholder, and newline parity. No non-English value is
   exactly equal to its English counterpart. A second regression checks every

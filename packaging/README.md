@@ -70,9 +70,11 @@ use the distribution's native preset/enable policy rather than creating an
 unverified generic symlink. None of these service files controls initramfs or a
 network path that ignores the init system's declared ordering.
 
-The daemon itself requires effective UID 0. Do not change the service account to
-the `openshield` group: that group authorizes read-only monitoring and is not the
-daemon's execution identity.
+The daemon itself requires effective UID 0. Its systemd primary group stays
+`root`; `openshield` is explicitly added as a supplementary group so the daemon
+can assign it to its own observation socket without `CAP_CHOWN`. That group
+authorizes read-only monitoring and is not the daemon's primary execution
+identity.
 
 ## Verification
 
@@ -95,8 +97,9 @@ semantics, runit and s6 lifecycle/quarantine hooks, dinit service parsing, and
 group-helper behavior. Alpine/BusyBox also executes the staging helper against
 an isolated package tree. Unsafe ownership, mode, link, and symlink fixtures are
 expected to be rejected. systemd is covered by static staging and separate
-`systemd-analyze` checks; the tmpfiles declaration was also parsed with a
-rooted dry run. The harness does not boot systemd in a container.
+`systemd-analyze` checks; the complete tmpfiles create/relabel declaration also
+passed idempotent application and exact metadata checks in pinned Tumbleweed.
+The harness does not boot systemd in a container.
 Stub daemons are used, so these checks do not exercise a real kernel firewall,
 NFQUEUE, boot sequence, or service-manager recovery after a firewall error.
 

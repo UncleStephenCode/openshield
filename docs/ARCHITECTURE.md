@@ -306,8 +306,10 @@ interface name. Application values remain typed identity data and are never
 interpreted as commands.
 
 The packaged systemd process retains `CAP_NET_ADMIN`, `CAP_NET_RAW`,
-`CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its effective `openshield` group gives a newly bound
-observation socket the required GID without `CAP_CHOWN`. Legacy xtables needs `CAP_NET_RAW` to open the
+`CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. It keeps primary group `root` and
+explicitly adds `openshield` as a supplementary group. As the socket owner it
+assigns that group to a new observation socket without `CAP_CHOWN`. Legacy
+xtables needs `CAP_NET_RAW` to open the
 raw IPv4/IPv6 sockets used for alternate-backend inspection and fallback;
 the last two capabilities let procfs access checks permit identity inspection
 across local UIDs. Its syscall filter explicitly denies `ptrace`, `process_vm_readv`,
@@ -368,8 +370,10 @@ The packaged systemd unit also installs `BlockAll` in `ExecStartPre` and
 process uses `Type=notify` and sends `READY=1` only after the persisted policy is
 active, the fail-closed NFQUEUE consumer is bound, and the fixed IPC sockets have
 been verified. It requires `systemd-tmpfiles-setup.service`; the package's
-tmpfiles rule creates the standard root-owned `0600` `/run/xtables.lock`, and
-the unit grants write access to that one shared lock instead of all of `/run`.
+tmpfiles rules create root-owned runtime/state directories and the standard
+`0600` `/run/xtables.lock`, then relabel those exact paths without recursively
+touching their contents. The unit grants write access only to those paths
+instead of all of `/run` or `/var/lib`.
 Its `[Install]` section contains
 `RequiredBy=network-pre.target`; after `systemctl enable openshield-daemon`, that
 success dependency combines with `Before=network-pre.target` so a standard

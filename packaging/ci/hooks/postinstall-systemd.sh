@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-# Create the read-only observation group and the shared xtables lock without
-# enabling or starting the firewall service.
+# Create the read-only observation group, root-owned service directories, and
+# shared xtables lock without enabling or starting the firewall service.
 if command -v systemd-sysusers >/dev/null 2>&1; then
     systemd-sysusers /usr/lib/sysusers.d/openshield.conf
 else

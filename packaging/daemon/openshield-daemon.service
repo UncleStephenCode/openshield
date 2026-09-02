@@ -3,6 +3,7 @@ Description=OpenShield host firewall daemon
 Documentation=https://github.com/UncleStephenCode/openshield
 After=local-fs.target systemd-tmpfiles-setup.service
 Requires=systemd-tmpfiles-setup.service
+RequiresMountsFor=/run/openshield /var/lib/openshield
 Before=network-pre.target
 Wants=network-pre.target
 
@@ -10,7 +11,8 @@ Wants=network-pre.target
 Type=notify
 NotifyAccess=main
 User=root
-Group=openshield
+Group=root
+SupplementaryGroups=openshield
 ExecStartPre=/usr/bin/openshield-daemon --install-fail-closed
 ExecStart=/usr/bin/openshield-daemon
 # The daemon performs the same non-persistent quarantine during graceful
@@ -32,11 +34,6 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 UMask=0077
-RuntimeDirectory=openshield
-RuntimeDirectoryMode=0755
-RuntimeDirectoryPreserve=yes
-StateDirectory=openshield
-StateDirectoryMode=0700
 
 # Filesystem and kernel hardening.
 ProtectSystem=strict
@@ -52,8 +49,10 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-# openshield.conf pre-creates the last path as root:root 0600. Keeping the
-# standard lock lets old and new xtables processes serialize with each other.
+# openshield.conf pre-creates all three paths as root:root and restores their
+# policy-defined SELinux labels. Do not use RuntimeDirectory= or StateDirectory=:
+# their ownership repair is recursive and can be denied on preserved LSM-labelled
+# files. Keeping the standard lock lets old and new xtables processes serialize.
 ReadWritePaths=/run/openshield /var/lib/openshield /run/xtables.lock
 
 # Runtime attack-surface reduction. nft/NFQUEUE use AF_NETLINK; the legacy

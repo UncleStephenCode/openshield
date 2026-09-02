@@ -22,6 +22,7 @@ RPM_METADATA_ASSERTIONS='set -eu
       package_arch=$(rpm -qp --qf "%{ARCH}" "$package")
       [ -n "$package_version" ] && [ -n "$package_arch" ]
       rpm -qp --requires "$package" | grep -Fqx "(nftables or iptables)"
+      rpm -qp --requires "$package" | grep -Fqx /usr/bin/systemd-tmpfiles
       rpm -qp --recommends "$package" | grep -Fqx nftables
       if [ "$EXPECT_TUMBLEWEED_RUNTIME" = true ]; then
         rpm -qp --requires "$package" | grep -Fqx glibc
@@ -47,7 +48,30 @@ RPM_INSTALL_ASSERTIONS='
       test -f /usr/lib/systemd/system/openshield-daemon.service
       test -f /usr/lib/sysusers.d/openshield.conf
       test -f /usr/lib/tmpfiles.d/openshield.conf
-      getent group openshield >/dev/null'
+      command -v systemd-tmpfiles >/dev/null
+      getent group openshield >/dev/null
+      [ "$(stat -c "%u:%g:%a" /run/openshield)" = 0:0:755 ]
+      [ "$(stat -c "%u:%g:%a" /var/lib/openshield)" = 0:0:700 ]
+      [ "$(stat -c "%u:%g:%a" /run/xtables.lock)" = 0:0:600 ]
+      test -d /run/openshield
+      test -d /var/lib/openshield
+      test -f /run/xtables.lock
+      unit=/usr/lib/systemd/system/openshield-daemon.service
+      [ "$(sed -n "s/^Group=//p" "$unit")" = root ]
+      [ "$(sed -n "s/^SupplementaryGroups=//p" "$unit")" = openshield ]
+      ! grep -Eq "^(RuntimeDirectory|StateDirectory)" "$unit"
+      ! grep -Eq "^(AmbientCapabilities|CapabilityBoundingSet)=.*CAP_CHOWN" "$unit"
+      runtime_probe=/run/openshield/.tmpfiles-nonrecursive-test
+      state_probe=/var/lib/openshield/.tmpfiles-nonrecursive-test
+      install -m 0600 /dev/null "$runtime_probe"
+      install -m 0600 /dev/null "$state_probe"
+      chown 0:1234 /run/openshield /var/lib/openshield "$runtime_probe" "$state_probe"
+      systemd-tmpfiles --create /usr/lib/tmpfiles.d/openshield.conf
+      [ "$(stat -c "%u:%g:%a" /run/openshield)" = 0:0:755 ]
+      [ "$(stat -c "%u:%g:%a" /var/lib/openshield)" = 0:0:700 ]
+      [ "$(stat -c "%u:%g:%a" "$runtime_probe")" = 0:1234:600 ]
+      [ "$(stat -c "%u:%g:%a" "$state_probe")" = 0:1234:600 ]
+      rm -f -- "$runtime_probe" "$state_probe"'
 
 case "$FAMILY" in
   deb)
