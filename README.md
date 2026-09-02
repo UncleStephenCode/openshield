@@ -280,8 +280,8 @@ arbitrary privileged ruleset editors.
 Compatibility claims are intentionally scoped:
 
 - final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 255 tests: 55 core,
-  137 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
+  all-target checks, clippy with warnings denied, and all 262 tests: 55 core,
+  144 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
   live-firewall end-to-end result;
 - both final static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in

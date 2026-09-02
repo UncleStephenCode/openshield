@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-02, OpenShield 0.1.17, Rust stable 1.98.0.
+Review snapshot: 2026-09-02, OpenShield 0.1.18, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -97,12 +97,24 @@ The normative boundary is defined by the
   stale supplied pin. Older two-field persisted application identities are
   rejected rather than silently repinned; network-only state is unaffected.
 - Attribution maps the queued packet tuple and kernel UID to one socket inode
-  and one stable process identity. It scans bounded fd tables only for tasks
-  whose filesystem UID equals the kernel socket UID, groups matching holders by
-  TGID, and rechecks process start time, executable path and full file version,
-  argv, cgroup, UID, and socket ownership. No matching-UID holder, multiple
-  matching TGIDs, incomplete scans, unstable identities, or exhausted bounds are
-  denied.
+  and one stable process identity. Every attribution attempt that reaches owner
+  resolution receives a fresh bounded enumeration of external PID/TID entries;
+  no userspace cross-packet identity or authorization-result cache was introduced.
+  It scans bounded fd tables only for tasks whose filesystem UID equals the
+  kernel socket UID, groups matching holders by TGID, and rechecks process start
+  time, executable path and full file version, argv, cgroup, UID, and socket
+  ownership. The daemon's shared fd table is checked immediately before the
+  external scan and again after that scan completes instead of once per self
+  task; a target socket or failed check is denied and the daemon is never accepted
+  as the application owner. Within one scan, a descriptor number found for one task is
+  tried first for later matching-UID tasks. Only an exact target link plus a
+  repeated UID check is accepted; every mismatch or read error falls back to a
+  complete bounded scan, and the hint is not retained across packets. The owner
+  scan's exact fd path is
+  revalidated before identity capture, falls back to a bounded rescan of that same
+  task if stale, and is rechecked after capture. The absence of a matching-UID
+  holder, multiple matching TGIDs, an incomplete scan, an unstable identity, or
+  exhausted bounds results in denial.
 - On cgroup v2, exactly one unified `0::/path` entry supplies the cgroup
   identity. On a v1-only host, bounded controller memberships are validated but
   no cgroup identity is returned. Executable path, full file version, filesystem
@@ -178,7 +190,7 @@ establish the properties of another.
 
 - Final Rust 1.98.0 verification passed `cargo fmt --all -- --check`, locked
   workspace all-target checks, workspace all-target clippy with warnings denied,
-  and all 255 workspace tests: 55 core, 137 daemon, 11 protocol, and 52 TUI.
+  and all 262 workspace tests: 55 core, 144 daemon, 11 protocol, and 52 TUI.
   This includes automatic-learning budgets, version pinning, fsuid-prefilter,
   and immutable policy-index cases. Daemon tests used mock backends and temporary
   Unix sockets and did not touch the host firewall. These are component results,
@@ -244,6 +256,21 @@ establish the properties of another.
   runs omitted `nft` and selected the fallback. These were local, isolated
   Docker network/container-namespace tests. They did not exercise or modify the
   host firewall and are not production certification.
+- The v0.1.18 procfs optimization was measured in the same SHA-256-pinned
+  Tumbleweed container image with `--network none`, private PID/network
+  namespaces, no privileged mode, and only the daemon's four packaged
+  capabilities. At 20
+  loopback UDP packets/s, the NFQUEUE worker fell from 6.3% CPU in v0.1.17 to
+  1.1%. At 500 packets/s it fell from 36.2% to 11.3%. On the former saturation
+  step, the v0.1.17 nftables worker used 100% of one core and the generator
+  managed to send 39,096 loopback datagrams in 20 seconds. With v0.1.18 the
+  generator sent, and the firewall counters reported as accepted, all 60,001
+  scheduled datagrams; the NFQUEUE worker used 48.7% on nftables and 47.7% on
+  the forced iptables fallback, with zero NFQUEUE drops. A five-second
+  `strace -c` sample at the 500-packets/s step reduced from about 890 to 176
+  syscalls per processed packet and from about 410 to 39 `readlink` calls per
+  packet. These are controlled regression measurements on one host kernel, not
+  a universal throughput claim.
 
 Commands and exact interpretation are documented in
 [the compatibility guide](../tests/compat/README.md).
@@ -279,15 +306,23 @@ Commands and exact interpretation are documented in
 - Procfs attribution and one bounded NFQUEUE consumer can be forced into
   fail-closed denial by process, thread, fd, or queue pressure. This is a
   material availability/DoS risk, not a fail-open path. In particular, the
-  current scan rejects more than 4,096 descriptors in a task whose filesystem
-  UID matches the socket UID, or more than 131,072 proc/task entries globally.
+  one bounded directory walk inspects at most 4,096 fd entries for a task whose
+  filesystem UID matches the socket UID and denies attribution if proof would
+  require a later entry; global enumeration admits at most 131,072 proc/task
+  entries.
   Unrelated-UID fd tables are skipped, but global process/task pressure and
-  matching-UID fd pressure can still deny application attribution. Immutable
-  cached packet policy removes the previous per-packet full-state clone and
-  indexes enabled rules by complete executable file version. A lookup scans only
-  the policy-ordered bucket for the observed version. Matching within that bucket
-  remains linear, and a legacy or root-edited state can concentrate many rules
-  under one pin despite the 256-rule automatic-insertion budget.
+  matching-UID fd pressure can still deny application attribution. The v0.1.18
+  self-TGID and scan-local fd-hint optimizations reduce the common-case scan cost.
+  Every completed owner scan still includes two shared self-table checks. The
+  optimizations do not cache authorization, skip the fresh external PID/TID scan
+  on each owner-resolution attempt, or alter its worst-case complexity. A
+  sustained packet stream or hostile procfs cardinality
+  can still saturate the queue consumer and deny legitimate traffic. The
+  immutable packet-policy cache removes the previous per-packet full-state clone
+  and indexes enabled rules by complete executable file version. A lookup scans
+  only the policy-ordered bucket for the observed version. Matching within that
+  bucket remains linear, and a legacy or root-edited state can concentrate many
+  rules under one pin despite the 256-rule automatic-insertion budget.
   The Learning admission index prevents already-known, saturated, or paused
   observations from filling the persistence queue, but classification follows
   mandatory procfs attribution. New eligible candidates can still fill the

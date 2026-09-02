@@ -87,13 +87,27 @@ are broader than firewall administration alone.
   ICMPv6 echo traffic. It maps the kernel UID and network tuple to exactly one
   socket inode and one owner, then repeats process start-time, socket-fd,
   executable path, complete file-version, command-line, cgroup, and filesystem-UID
-  checks. It enumerates processes and tasks, but scans a task's fd table only
-  when its filesystem UID equals the kernel socket UID; matching holders are
-  grouped by TGID. No matching-UID holder, different matching TGIDs, an incomplete
-  or unavailable live process/task scan, or candidate descriptor-bound exhaustion
-  produces DROP. Sibling holder TIDs in one TGID count as one process only if
-  their captured executable path/file version, argv, filesystem-UID, and cgroup
-  identities agree. A vanished
+  checks. Every attribution attempt that reaches owner resolution receives a
+  fresh bounded external PID/TID scan; there is no cross-packet process-identity
+  or authorization-result cache. The resolver scans a task's fd table only when
+  its filesystem UID equals the kernel socket UID; matching holders are grouped
+  by TGID. When the UIDs match, the
+  daemon's shared `/proc/<self>/fd` table is checked immediately before the
+  external scan and again after that scan completes: two bounded checks per
+  completed owner scan replace per-self-thread fd scans. A target socket or
+  failed check produces DROP, and self task fd tables
+  are excluded from attribution. Within one external scan, a descriptor number
+  found for one task is tried first on later matching-UID tasks. Only an exact
+  target link with a repeated UID check is accepted; a mismatch or read error
+  falls back to a complete bounded fd-table scan, and the hint is not retained
+  across packets. The absence of a matching-UID holder, different matching TGIDs,
+  an incomplete or unavailable live process/task scan, or candidate
+  descriptor-bound exhaustion produces DROP. Sibling holder TIDs in one TGID
+  count as one process only if their captured executable path/file version, argv,
+  filesystem-UID, and cgroup identities agree. The exact fd path found by the owner scan is not trusted as
+  authorization: it is revalidated before identity capture, a vanished or moved
+  hint triggers one bounded rescan of the same task, and the selected fd is
+  rechecked after capture. A vanished
   entry is skipped only after procfs confirms disappearance. `PermissionDenied`
   on a TGID-leader fd table is skipped only after two bounded `stat` reads
   confirm stable zombie state `Z`; every other error, non-zombie state, or
@@ -260,9 +274,10 @@ are broader than firewall administration alone.
   exec-lifecycle enforcement.
 - One bounded NFQUEUE consumer performs procfs work that is worst-case
   proportional to process/task enumeration plus the descriptor tables of tasks
-  whose filesystem UID matches the socket UID. The current limits are 4,096
-  descriptors per matching-UID task and 131,072 proc/task entries globally for a
-  scan. Process/thread floods, a matching-UID fd flood, queue pressure, or the
+  whose filesystem UID matches the socket UID. One directory walk inspects at
+  most 4,096 fd entries per matching-UID task and fails if proof requires a later
+  entry; one scan admits at most 131,072 proc/task entries globally.
+  Process/thread floods, a matching-UID fd flood, queue pressure, or the
   250 ms deadline can therefore deny legitimate traffic. This is an
   availability/denial-of-service risk, not a fail-open path. An incomplete live
   process/task enumeration remains globally fail-closed; an oversized fd table
@@ -270,6 +285,14 @@ are broader than firewall administration alone.
   UID fd tables are skipped. An inaccessible non-zombie candidate, a state that
   cannot be confirmed as a stable zombie, or an error other than the narrowly
   handled `PermissionDenied` case has the same fail-closed availability effect.
+  The v0.1.18 optimization replaces per-self-thread fd scans with two bounded
+  checks of the daemon's shared table and normally avoids rescanning the selected
+  external task's fd table during identity capture. The scan-local fd-number hint
+  can also avoid redundant sibling-table enumeration, but every miss falls back
+  to the complete bounded scan. These changes do not skip the fresh external
+  PID/TID scan, introduce an authorization-result cache, or change the worst-case
+  complexity. Sustained packet rates or hostile procfs cardinality can therefore
+  still saturate the consumer and deny legitimate traffic.
   The immutable application-policy cache removes a full-state clone from each
   packet and indexes enabled rules by complete executable file version. A lookup
   scans only the policy-ordered bucket for the observed version, rather than all
