@@ -286,7 +286,7 @@ jobs:
           - name: Rocky 9
             family: el9
             arch: amd64
-            image: rockylinux:9
+            image: rockylinux/rockylinux:9
           - name: AlmaLinux 9
             family: el9
             arch: amd64
@@ -294,7 +294,7 @@ jobs:
           - name: Rocky 10
             family: el10
             arch: amd64
-            image: rockylinux:10
+            image: rockylinux/rockylinux:10
           - name: AlmaLinux 10
             family: el10
             arch: amd64
