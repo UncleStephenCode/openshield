@@ -454,7 +454,7 @@ jobs:
       - name: Publish release safely
         shell: bash
         env:
-          ALLOW_PUBLISHED_REPAIR: ${{ github.event_name == 'workflow_dispatch' && inputs.repair_existing_release || false }}
+          ALLOW_PUBLISHED_REPAIR: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.event.created == true && github.event.deleted == false && github.event.forced == false) || (github.event_name == 'workflow_dispatch' && inputs.repair_existing_release == true) }}
           GH_TOKEN: ${{ github.token }}
           EXPECTED_TAG_REF_SHA: ${{ needs.version.outputs.tag_ref_sha }}
           SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
@@ -751,7 +751,7 @@ jobs:
             }
             if [[ "$initial_release_was_draft" == false \
               && "$ALLOW_PUBLISHED_REPAIR" != true ]]; then
-              echo '::error::Published release is incomplete; use the explicit workflow_dispatch repair option'
+              echo '::error::Published release is incomplete and this run is not authorized to repair it'
               exit 1
             fi
             verify_release_tag

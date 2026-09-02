@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-02, OpenShield 0.1.13, Rust stable 1.98.0.
+Review snapshot: 2026-09-02, OpenShield 0.1.14, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
