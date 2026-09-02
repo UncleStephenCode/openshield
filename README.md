@@ -118,7 +118,7 @@ the root-owned `/run/openshield` directory:
 
 | Path | Owner and mode | Authorization |
 | --- | --- | --- |
-| `/run/openshield/control.sock` | `root:root`, `0600` | mode and rule mutations; Linux `SO_PEERCRED` must report UID 0 |
+| `/run/openshield/control.sock` | UID 0, `0600` | mode and rule mutations; Linux `SO_PEERCRED` must report UID 0 |
 | `/run/openshield/observe.sock` | `root:openshield`, `0660` | read-only status, rules, events, and counters; peer must be root or a member of `openshield` |
 
 Observation is not public. The daemon authenticates the peer with
@@ -179,6 +179,23 @@ of these init systems; by design it refuses to install directly into `/`.
 Package maintainers should use it with a fresh `DESTDIR`, install the staged
 files through their package manager, and run the platform-specific enablement
 step described in [packaging/README.md](packaging/README.md).
+
+Releases provide separate GNU builds and RPMs for every main Tumbleweed
+installation architecture:
+
+| `uname -m` family | Release suffix | RPM architecture |
+| --- | --- | --- |
+| `x86_64` | `tumbleweed-amd64` | `x86_64` |
+| `i586` / `i686` | `tumbleweed-i586` | `i586` |
+| `aarch64` | `tumbleweed-arm64` | `aarch64` |
+| `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` |
+| `s390x` | `tumbleweed-s390x` | `s390x` |
+
+Install the matching Tumbleweed RPM with `zypper`. Its dependency is
+`(nftables or iptables)` and it recommends nftables, so a normal installation
+selects nftables. An existing iptables-only host remains supported when nftables
+is unavailable or recommendations are deliberately disabled; runtime discovery
+still tries a fully usable nftables backend first.
 
 For a manual systemd installation, install both binaries, the unit, and the
 sysusers and tmpfiles declarations. Create the group and the shared xtables lock
@@ -258,8 +275,8 @@ arbitrary privileged ruleset editors.
 Compatibility claims are intentionally scoped:
 
 - final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 247 tests: 55 core,
-  129 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
+  all-target checks, clippy with warnings denied, and all 255 tests: 55 core,
+  137 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
   live-firewall end-to-end result;
 - both final static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
@@ -267,16 +284,21 @@ Compatibility claims are intentionally scoped:
 - all six service layouts passed static validation; dedicated container
   supervisor checks passed for OpenRC, SysVinit, runit, s6, and dinit, while
   systemd is checked separately rather than booted as PID 1 in that matrix;
-- `cargo check --workspace --all-targets --locked` passed for 21 stable Rust
+- `cargo check --workspace --all-targets --locked` passed for all 23 stable Rust
   Linux targets covering x86, x86_64/amd64, ARMv5/6/7 (soft- and hard-float
   variants where Rust provides them), arm64/aarch64, and RISC-V 64 with the
   listed GNU or musl environments;
 - the two RISC-V 32 targets are Rust Tier 3 and were skipped because stable
   rustup does not ship their standard libraries; they require an explicitly
   separate nightly `build-std` workflow;
+- separate Tumbleweed GNU release binaries were linked and ELF-validated for
+  x86_64, i586, AArch64, ppc64le, and s390x. The four non-host builds completed
+  capability-free `--version` smoke tests under pinned Cross QEMU images, and
+  i586 additionally ran in the pinned official Tumbleweed `linux/386` image;
 - non-native `cargo check` proves source-level compilation, not operation on
-  physical hardware. arm64 execution was not available on the test host because
-  no binfmt/QEMU handler was installed.
+  physical hardware. The explicit QEMU smokes above do not replace native
+  hardware validation; no transparent binfmt handler was installed on the test
+  host.
 
 The 60-image smoke matrix does not boot each image's init system and does not
 exercise its kernel, firewall backend, NFQUEUE, package manager, or upgrade
@@ -284,12 +306,15 @@ path. Archive and rolling images are compatibility probes, not supported-life
 guarantees. See [tests/compat/README.md](tests/compat/README.md) for exact rows,
 commands, and interpretation.
 
-The final Rust 1.98.0 Debian Bookworm release binaries passed the isolated
+The final Rust 1.98.0 release binaries passed the isolated
 `tests/e2e/server-learning-enforcing.sh` workflow separately with nftables and
-iptables. Both runs covered Learning, UDP/TCP Enforcing, an explicit inbound
-allow, and restart. They ran in disposable namespaces on a local Unix-socket
-Docker engine; they neither tested nor modified the host firewall and are not
-production certification.
+iptables on Debian Bookworm and a pinned openSUSE Tumbleweed snapshot. The
+nftables scenarios installed both frontends and still selected nftables; the
+iptables scenarios omitted `nft` and selected the compatibility backend. Every
+run covered Learning, UDP/TCP Enforcing, an explicit inbound allow, and restart.
+They ran in disposable namespaces on a local Unix-socket Docker engine; they
+neither tested nor modified the host firewall and are not production
+certification.
 
 ## TUI localization
 
@@ -326,10 +351,13 @@ native technical review.
   by an already privileged `AF_PACKET`/`CAP_NET_RAW` process.
 - Learning is a bounded operator-controlled trust window, not a verdict that a
   local executable or remote endpoint is benign.
-- The packaged daemon retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
-  `CAP_DAC_READ_SEARCH` for firewall and cross-UID procfs attribution. The
-  systemd syscall filter reduces attack surface but is not process-memory or
-  filesystem isolation after daemon compromise.
+- The packaged systemd service retains `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+  `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its effective group is
+  `openshield`, so the
+  observation socket needs no `CAP_CHOWN`; `CAP_NET_RAW` is required to inspect
+  and operate the legacy xtables fallback, and the last two capabilities
+  permit cross-UID procfs attribution. The systemd syscall filter reduces attack
+  surface but is not process-memory or filesystem isolation after compromise.
 - The workspace, matrices, and audit reduce known risk; they do not prove the
   absence of vulnerabilities or certify every Linux distribution, kernel,
   architecture, boot path, or hardware implementation.

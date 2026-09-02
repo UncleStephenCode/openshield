@@ -482,18 +482,32 @@ fn set_socket_group(path: &Path, expected_uid: u32, observer_gid: u32) -> Result
     // The verified runtime directory is root-owned and not writable by group
     // or others. The socket is still 0600 here, so changing its group cannot
     // expose an interval in which an untrusted user may connect.
-    chown(path, None, Some(Gid::from_raw(observer_gid))).with_context(|| {
-        format!(
-            "cannot assign {} group ownership to {}",
-            OBSERVE_GROUP_NAME,
-            path.display()
-        )
-    })?;
+    let before = fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect group ownership on {}", path.display()))?;
+    ensure!(
+        before.file_type().is_socket() && before.uid() == expected_uid,
+        "socket identity changed before its observation group was assigned"
+    );
+    // The systemd unit uses Group=openshield, so a newly bound socket already
+    // has the required GID. Avoiding a redundant chown keeps CAP_CHOWN out of
+    // the service capability set. Other init systems run the daemon as normal
+    // root and retain the existing chown path when the initial GID differs.
+    if before.gid() != observer_gid {
+        chown(path, None, Some(Gid::from_raw(observer_gid))).with_context(|| {
+            format!(
+                "cannot assign {} group ownership to {}",
+                OBSERVE_GROUP_NAME,
+                path.display()
+            )
+        })?;
+    }
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("cannot verify group ownership on {}", path.display()))?;
     ensure!(
-        metadata.uid() == expected_uid,
-        "socket owner changed while its observation group was assigned"
+        metadata.file_type().is_socket()
+            && metadata.uid() == expected_uid
+            && metadata.gid() == observer_gid,
+        "socket identity changed while its observation group was assigned"
     );
     Ok(())
 }

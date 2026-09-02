@@ -56,7 +56,7 @@ scripts/test-distro-matrix.sh smoke /absolute/musl/release-directory
 
 ## Матрица целей Rust
 
-`targets.tsv` содержит 23 встроенных имени Linux-целей. Проверка файла:
+`targets.tsv` содержит 25 встроенных имен Linux-целей. Проверка файла:
 
 ```console
 scripts/check-target-matrix.sh validate
@@ -71,7 +71,7 @@ scripts/check-target-matrix.sh check --install
 Стенд выполняет проверки целей с одним заданием Cargo, чтобы ограничить пиковое потребление
 памяти и обеспечить детерминированную работу на узлах с ограниченными ресурсами.
 
-Завершённый стабильный прогон проверил 21/21 доступных целей без ошибок:
+Завершённый стабильный прогон проверил 23/23 доступных стабильных целей без ошибок:
 
 | Семейство архитектур | Охваченные варианты |
 | --- | --- |
@@ -79,6 +79,8 @@ scripts/check-target-matrix.sh check --install
 | x86_64 / amd64 | GNU и musl |
 | ARM | ARMv5, ARMv6 и ARMv7; программная и аппаратная плавающая точка, где её предоставляет Rust-цель; GNU и musl по списку |
 | arm64 / aarch64 | GNU и musl |
+| PowerPC 64 LE | `powerpc64le` GNU |
+| IBM Z | `s390x` GNU |
 | RISC-V 64 | `riscv64gc` GNU/musl и `riscv64a23` GNU |
 
 `riscv32gc-unknown-linux-gnu` и
@@ -87,9 +89,13 @@ scripts/check-target-matrix.sh check --install
 Для сборки нужен отдельно проверенный процесс на nightly с `build-std`; они не заявлены как
 стабильные релизные цели.
 
-Ненативные задания были только проверками компиляции. Общая гарантия работы на
-оборудовании x86, ARM, arm64 и RISC-V не даётся. В частности, на тестовом узле не было
-обработчика binfmt/QEMU для запуска arm64. Псевдонимы архитектур не создают новых целей:
+Отдельные GNU-файлы для Tumbleweed скомпонованы и проверены по ELF для x86_64,
+i586, AArch64, ppc64le и s390x. Демон и TUI для i586, AArch64, ppc64le и s390x
+выполнили тест `--version` без полномочий в закреплённых по digest Cross-образах
+с QEMU; i586 дополнительно запустился в закреплённом официальном образе
+Tumbleweed `linux/386`. Это тесты запуска, а не проверка фаервола или
+сертификация оборудования. Общая гарантия работы на оборудовании x86, ARM,
+arm64, PowerPC, IBM Z и RISC-V не даётся. Псевдонимы архитектур не создают новых целей:
 AMD64 — это x86_64, ARM64 — AArch64, а отдельного имени Rust-цели `aarch` нет.
 
 ## Матрица систем инициализации
@@ -113,9 +119,11 @@ runit и s6, компиляцию зависимостей s6, разбор dini
 BusyBox `addgroup` и shadow `groupadd`. systemd подготавливается статически и
 проверяется отдельно: unit-файл с заглушками целей прошёл `systemd-analyze verify`,
 а автономная команда `systemd-analyze security --offline=yes --threshold=100`
-прошла с оценкой поверхности 2,6 (`OK`). Матрица не загружает systemd в контейнере
-и не запускает его как PID 1. Декларация tmpfiles для общей блокировки xtables также
-прошла проверку сухим запуском с отдельным корнем.
+прошла с оценкой поверхности 2,7 (`OK`). Проверка и та же оценка 2,7 были
+повторены с systemd, установленным внутри закреплённого контейнера Tumbleweed.
+Матрица не загружает systemd в контейнере и не запускает его как PID 1.
+Декларация tmpfiles для общей блокировки xtables также прошла проверку сухим
+запуском с отдельным корнем.
 
 В стендах жизненного цикла демон заменён заглушкой. Их успех не означает, что был
 выбран бэкенд или фильтровались реальные пакеты.
@@ -136,12 +144,21 @@ BusyBox `addgroup` и shadow `groupadd`. systemd подготавливаетс�
 - карантина `BlockAll` в ядре при штатной остановке без замены сохранённого `Enforcing`;
 - перезапуска в сохранённый режим.
 
-Соберите демон, совместимый с тестовым контейнером Debian Bookworm, затем запустите
-каждый бэкенд явно:
+Соберите демон, совместимый с выбранной пользовательской средой клиента, затем
+явно запустите каждый бэкенд. По умолчанию используется Debian Bookworm:
 
 ```console
 tests/e2e/server-learning-enforcing.sh nftables /absolute/bookworm/release-directory
 tests/e2e/server-learning-enforcing.sh iptables /absolute/bookworm/release-directory
+```
+
+Закреплённый снимок Tumbleweed выбирается без изменения сценария:
+
+```console
+CLIENT_FAMILY=tumbleweed CLIENT_IMAGE='opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045' \
+  tests/e2e/server-learning-enforcing.sh nftables /absolute/tumbleweed/release-directory
+CLIENT_FAMILY=tumbleweed CLIENT_IMAGE='opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045' \
+  tests/e2e/server-learning-enforcing.sh iptables /absolute/tumbleweed/release-directory
 ```
 
 Сценарий устанавливает пакеты в одноразовом клиентском контейнере, поэтому ему нужен доступ
@@ -149,13 +166,18 @@ tests/e2e/server-learning-enforcing.sh iptables /absolute/bookworm/release-direc
 сценарий не применяет правила к хосту. До создания ресурсов он читает активную точку подключения
 через `docker context inspect` и отказывается работать с любым URI, не соответствующим `unix:///*`.
 
-Итоговые релизные двоичные файлы для Debian Bookworm, собранные на Rust 1.98.0,
-прошли оба прогона:
+Итоговые релизные двоичные файлы для Debian Bookworm и Tumbleweed, собранные на
+Rust 1.98.0, прошли оба прогона в соответствующих пользовательских средах:
 
 ```text
 PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
 PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
 ```
+
+В каждом прогоне nftables были установлены оба интерфейса и выбран nftables. В
+каждом прогоне iptables команда `nft` отсутствовала и был выбран бэкенд
+совместимости. Поэтому результат подтверждает именно приоритет и резервный выбор,
+а не только принудительно заданное имя.
 
 Эти результаты охватывают работу сценария внутри одноразовых сетевых и контейнерных пространств имён
 локального Docker Engine через Unix-сокет. Они не проверяли и не изменяли фаервол хоста и не сертифицируют ядра,

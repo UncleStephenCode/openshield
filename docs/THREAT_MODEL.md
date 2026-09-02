@@ -53,7 +53,8 @@ are broader than firewall administration alone.
 ## Controls inherited from the OpenSnitch audit
 
 - Sockets are under a verified root-owned directory, never predictable paths in
-  `/tmp`. Control is `root:root` `0600` and checks `SO_PEERCRED` UID 0.
+  `/tmp`. Control is owned by UID 0, has mode `0600`, and checks `SO_PEERCRED`
+  UID 0; its group does not participate in authorization.
   Observation is `root:openshield` `0660` and checks `SO_PEERCRED` plus a
   bounded stable primary/supplementary-group identity before serving data.
 - There is no unauthenticated TCP/gRPC management endpoint and no TLS fail-open
@@ -183,8 +184,10 @@ are broader than firewall administration alone.
   transport errors as ambiguous, warns against retrying, and reloads state.
 - UTC rollback cannot invalidate a rule update: revisions define ordering and
   persisted `updated_at` values are kept monotonic.
-- The packaged unit limits the daemon to `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
-  `CAP_DAC_READ_SEARCH`; its syscall filter denies `ptrace`,
+- The packaged unit limits the daemon to `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+  `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its effective `openshield` group
+  avoids retaining `CAP_CHOWN`; `CAP_NET_RAW` is required for legacy
+  xtables inspection and fallback operation; the syscall filter denies `ptrace`,
   `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_getfd`, and
   `open_by_handle_at`.
 

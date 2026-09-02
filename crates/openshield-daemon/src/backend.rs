@@ -51,7 +51,7 @@ const MAX_FIREWALL_STDERR_BYTES: usize = 64 * 1024;
 const XT_WAIT_SECONDS: &str = "5";
 const XTABLES_LIST_ARGS: [&str; 6] = ["--wait", XT_WAIT_SECONDS, "-t", "filter", "-n", "-L"];
 const LEGACY_BACKEND_UNAVAILABLE_SUFFIX: &str =
-    " (legacy): Cannot initialize: iptables who? (do you need to insmod?)";
+    ": Cannot initialize: iptables who? (do you need to insmod?)";
 // `--test --noflush` validates every xtables extension and control-flow
 // primitive used by the compatibility compiler without changing live rules.
 // A bundle which merely understands an empty filter table is not sufficient:
@@ -357,6 +357,18 @@ struct XtablesBundle {
     command: &'static str,
     restore: &'static str,
     save: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum XtablesWorld {
+    Legacy,
+    Nft,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct XtablesIdentity {
+    resolved: PathBuf,
+    world: XtablesWorld,
 }
 
 const IPV4_XTABLES_BUNDLES: [XtablesBundle; 12] = [
@@ -909,29 +921,109 @@ fn active_alternate_xtables_world(
     candidates: &[XtablesBundle],
     selected_save: &Path,
 ) -> Result<bool> {
-    let selected = fs::canonicalize(selected_save).with_context(|| {
+    let selected = identify_xtables_world(selected_save).with_context(|| {
         format!(
-            "cannot resolve selected xtables-save executable {}",
+            "cannot identify selected xtables backend through {}",
             selected_save.display()
         )
     })?;
-    active_xtables_worlds(candidates, Some(&selected))
+    let inspection = active_xtables_worlds(candidates, Some(&selected));
+    let selected_after = identify_xtables_world(selected_save).with_context(|| {
+        format!(
+            "cannot re-identify selected xtables backend through {}",
+            selected_save.display()
+        )
+    })?;
+    ensure_xtables_identity_unchanged(&selected, &selected_after)
+        .context("selected xtables backend changed during alternate-backend inspection")?;
+    inspection
 }
 
-fn active_xtables_worlds(candidates: &[XtablesBundle], excluded: Option<&Path>) -> Result<bool> {
-    let mut inspected = HashSet::new();
+fn ensure_xtables_identity_unchanged(
+    before: &XtablesIdentity,
+    after: &XtablesIdentity,
+) -> Result<()> {
+    ensure!(before == after, "xtables executable identity changed");
+    Ok(())
+}
+
+fn xtables_world_is_covered(
+    world: XtablesWorld,
+    excluded: Option<&XtablesIdentity>,
+    inspected: &HashSet<XtablesWorld>,
+) -> bool {
+    excluded.is_some_and(|excluded| excluded.world == world) || inspected.contains(&world)
+}
+
+fn active_xtables_worlds(
+    candidates: &[XtablesBundle],
+    excluded: Option<&XtablesIdentity>,
+) -> Result<bool> {
+    let mut inspected_paths = HashSet::new();
+    let mut inspected_worlds = HashSet::new();
     let mut failures = Vec::new();
     for candidate in candidates {
         let save = Path::new(candidate.save);
         if validate_xtables_binary(save, candidates).is_err() {
             continue;
         }
-        let resolved = fs::canonicalize(save)
-            .with_context(|| format!("cannot resolve xtables-save path {}", save.display()))?;
-        if excluded == Some(resolved.as_path()) || !inspected.insert(resolved.clone()) {
+        let identity_before = match identify_xtables_world(save) {
+            Ok(identity) => identity,
+            Err(error) => {
+                failures.push(format!(
+                    "{}: cannot identify xtables backend: {error:#}",
+                    save.display()
+                ));
+                continue;
+            }
+        };
+        if excluded.is_some_and(|excluded| excluded.resolved == identity_before.resolved)
+            || !inspected_paths.insert(identity_before.resolved.clone())
+        {
             continue;
         }
-        match inspect_xtables_world(|table| inspect_xtables_table(save, &resolved, table)) {
+
+        let duplicate_world =
+            xtables_world_is_covered(identity_before.world, excluded, &inspected_worlds);
+        let inspection = if duplicate_world {
+            None
+        } else {
+            Some(inspect_xtables_world(|table| {
+                inspect_xtables_table(save, &identity_before.resolved, table)
+            }))
+        };
+        let identity_after = identify_xtables_world(save);
+        match identity_after {
+            Ok(identity_after)
+                if ensure_xtables_identity_unchanged(&identity_before, &identity_after).is_ok() => {
+            }
+            Ok(_) => {
+                failures.push(format!(
+                    "{}: xtables executable identity changed during inspection",
+                    save.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "{}: cannot re-identify xtables backend: {error:#}",
+                    save.display()
+                ));
+                continue;
+            }
+        }
+        if duplicate_world {
+            continue;
+        }
+        inspected_worlds.insert(identity_before.world);
+        let Some(inspection) = inspection else {
+            failures.push(format!(
+                "{}: internal xtables inspection state is inconsistent",
+                save.display()
+            ));
+            continue;
+        };
+        match inspection {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => failures.push(format!("{}: {error:#}", save.display())),
@@ -943,6 +1035,120 @@ fn active_xtables_worlds(candidates: &[XtablesBundle], excluded: Option<&Path>) 
         failures.join("; ")
     );
     Ok(false)
+}
+
+fn identify_xtables_world(save: &Path) -> Result<XtablesIdentity> {
+    let resolved_before = fs::canonicalize(save)
+        .with_context(|| format!("cannot resolve xtables-save path {}", save.display()))?;
+    let captured = capture_command_output(
+        save,
+        &["--version"],
+        NFT_QUERY_TIMEOUT,
+        MAX_FIREWALL_STDERR_BYTES,
+    )?;
+    ensure!(
+        captured.status.success(),
+        "{} --version exited with status {}",
+        save.display(),
+        captured.status
+    );
+    ensure!(
+        captured.stderr.is_empty(),
+        "{} --version wrote an unexpected diagnostic",
+        save.display()
+    );
+    let world = parse_xtables_world_version(save, &resolved_before, &captured.stdout)?;
+    let resolved_after = fs::canonicalize(save)
+        .with_context(|| format!("cannot re-resolve xtables-save path {}", save.display()))?;
+    ensure!(
+        resolved_after == resolved_before,
+        "xtables-save executable changed while its backend was identified"
+    );
+    Ok(XtablesIdentity {
+        resolved: resolved_before,
+        world,
+    })
+}
+
+fn parse_xtables_world_version(
+    save: &Path,
+    resolved: &Path,
+    output: &[u8],
+) -> Result<XtablesWorld> {
+    let output = std::str::from_utf8(output).context("xtables version output is not UTF-8")?;
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    let output = output.strip_suffix('\r').unwrap_or(output);
+    ensure!(
+        !output.contains(['\n', '\r']),
+        "xtables version output contains multiple lines"
+    );
+    let (versioned_program, explicit_world) = if let Some(prefix) = output.strip_suffix(" (legacy)")
+    {
+        (prefix, Some(XtablesWorld::Legacy))
+    } else if let Some(prefix) = output.strip_suffix(" (nf_tables)") {
+        (prefix, Some(XtablesWorld::Nft))
+    } else {
+        (output, None)
+    };
+    let (program, version) = versioned_program
+        .rsplit_once(" v")
+        .ok_or_else(|| anyhow!("xtables version output has no version separator"))?;
+    let save_name = save
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("xtables-save path has no UTF-8 file name"))?;
+    let valid_program = if save_name.starts_with("ip6tables") {
+        matches!(program, "ip6tables-save" | "ip6tables-nft-save")
+    } else if save_name.starts_with("iptables") {
+        matches!(program, "iptables-save" | "iptables-nft-save")
+    } else {
+        false
+    };
+    ensure!(valid_program, "unexpected xtables version program name");
+    let version_components = version
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid xtables version")?;
+    ensure!(
+        version_components.len() >= 2,
+        "xtables version must contain at least major and minor components"
+    );
+    let resolved_world = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| match name {
+            "xtables-multi"
+            | "xtables-legacy-multi"
+            | "iptables-legacy-save"
+            | "ip6tables-legacy-save" => Some(XtablesWorld::Legacy),
+            "xtables-compat-multi"
+            | "xtables-nft-multi"
+            | "iptables-compat-save"
+            | "ip6tables-compat-save"
+            | "iptables-nft-save"
+            | "ip6tables-nft-save" => Some(XtablesWorld::Nft),
+            _ => None,
+        });
+    if let Some(world) = explicit_world {
+        ensure!(
+            resolved_world.is_none_or(|resolved_world| resolved_world == world),
+            "xtables backend marker conflicts with the resolved executable"
+        );
+        return Ok(world);
+    }
+
+    // Pre-1.8 releases did not print a backend marker, but nft-compatible
+    // `xtables-compat-multi` already existed. Accept markerless output only
+    // when the trusted canonical executable itself proves the world. Unknown
+    // alternatives dispatchers and all markerless 1.8+ output fail closed.
+    let predates_explicit_marker = (version_components[0], version_components[1]) < (1, 8);
+    ensure!(
+        predates_explicit_marker,
+        "iptables 1.8 or newer must report an explicit backend marker"
+    );
+    resolved_world
+        .ok_or_else(|| anyhow!("markerless xtables version has an unknown resolved executable"))
 }
 
 #[derive(Debug)]
@@ -1031,12 +1237,12 @@ fn is_proven_absent_legacy_backend(
         .is_some_and(|name| {
             matches!(
                 name,
-                "xtables-legacy-multi" | "iptables-legacy-save" | "ip6tables-legacy-save"
+                "xtables-multi"
+                    | "xtables-legacy-multi"
+                    | "iptables-legacy-save"
+                    | "ip6tables-legacy-save"
             )
         });
-    if !resolved_is_legacy {
-        return false;
-    }
     let program_prefix = if save_name.starts_with("ip6tables") {
         "ip6tables-save v"
     } else if save_name.starts_with("iptables") {
@@ -1052,16 +1258,21 @@ fn is_proven_absent_legacy_backend(
     if diagnostic.contains(['\n', '\r']) {
         return false;
     }
-    let Some(version) = diagnostic
-        .strip_prefix(program_prefix)
-        .and_then(|diagnostic| diagnostic.strip_suffix(LEGACY_BACKEND_UNAVAILABLE_SUFFIX))
-    else {
+    let Some(version_line) = diagnostic.strip_suffix(LEGACY_BACKEND_UNAVAILABLE_SUFFIX) else {
         return false;
     };
-    !version.is_empty()
-        && version.split('.').all(|component| {
-            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    if !version_line.starts_with(program_prefix)
+        || !matches!(
+            parse_xtables_world_version(save, resolved, version_line.as_bytes()),
+            Ok(XtablesWorld::Legacy)
+        )
+    {
+        return false;
+    }
+    // The parser requires a known legacy executable for markerless output. For
+    // 1.8+ output, retain the explicit resolved-path check so a generic
+    // alternatives dispatcher cannot spoof backend absence.
+    !version_line.ends_with(" (legacy)") || resolved_is_legacy
 }
 
 fn active_nft_artifacts() -> Result<bool> {
@@ -2426,15 +2637,17 @@ mod tests {
 
     use super::{
         FirewallCounters, InterfaceName, LearnedEndpoint, PortRange, TransportProtocol,
-        XtablesBundle, XtablesTableInspection, XtablesTools, add_firewall_counters,
-        attempt_both_families, inspect_xtables_world, is_proven_absent_legacy_backend,
-        parse_counters, parse_learned_endpoints, parse_xtables_save, verify_base_chains,
-        verify_table,
+        XtablesBundle, XtablesIdentity, XtablesTableInspection, XtablesTools, XtablesWorld,
+        add_firewall_counters, attempt_both_families, ensure_xtables_identity_unchanged,
+        inspect_xtables_world, is_proven_absent_legacy_backend, parse_counters,
+        parse_learned_endpoints, parse_xtables_save, parse_xtables_world_version,
+        verify_base_chains, verify_table, xtables_world_is_covered,
     };
     use anyhow::Result;
     use serde_json::{Value, json};
     use std::{
         cell::RefCell,
+        collections::HashSet,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
     };
 
@@ -2990,15 +3203,147 @@ COMMIT
             diagnostic,
         ));
 
-        let ipv4_save = std::path::Path::new("/usr/sbin/iptables-legacy-save");
-        let ipv4_diagnostic = b"iptables-save v1.4.21 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n";
+        let ipv4_save = std::path::Path::new("/usr/sbin/iptables-save");
+        let old_legacy_binary = std::path::Path::new("/usr/sbin/xtables-multi");
+        let ipv4_diagnostic =
+            b"iptables-save v1.4.21: Cannot initialize: iptables who? (do you need to insmod?)\n";
         assert!(is_proven_absent_legacy_backend(
             ipv4_save,
-            legacy_binary,
+            old_legacy_binary,
             Some(1),
             b"",
             ipv4_diagnostic,
         ));
+    }
+
+    #[test]
+    fn xtables_world_version_recognizes_legacy_and_nft_aliases() -> Result<()> {
+        assert_eq!(
+            parse_xtables_world_version(
+                std::path::Path::new("/usr/sbin/iptables-save"),
+                std::path::Path::new("/usr/bin/alts"),
+                b"iptables-save v1.8.13 (legacy)\n",
+            )?,
+            XtablesWorld::Legacy
+        );
+        assert_eq!(
+            parse_xtables_world_version(
+                std::path::Path::new("/usr/sbin/iptables-nft-save"),
+                std::path::Path::new("/usr/sbin/xtables-nft-multi"),
+                b"iptables-nft-save v1.8.13 (nf_tables)\n",
+            )?,
+            XtablesWorld::Nft
+        );
+        assert_eq!(
+            parse_xtables_world_version(
+                std::path::Path::new("/usr/sbin/ip6tables-save"),
+                std::path::Path::new("/usr/sbin/xtables-nft-multi"),
+                b"ip6tables-save v1.8.9 (nf_tables)\n",
+            )?,
+            XtablesWorld::Nft
+        );
+        assert_eq!(
+            parse_xtables_world_version(
+                std::path::Path::new("/usr/sbin/iptables-save"),
+                std::path::Path::new("/usr/sbin/xtables-multi"),
+                b"iptables-save v1.4.21\n",
+            )?,
+            XtablesWorld::Legacy
+        );
+        assert_eq!(
+            parse_xtables_world_version(
+                std::path::Path::new("/usr/sbin/iptables-save"),
+                std::path::Path::new("/usr/sbin/xtables-compat-multi"),
+                b"iptables-save v1.6.2\n",
+            )?,
+            XtablesWorld::Nft
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn xtables_world_version_rejects_unknown_or_ambiguous_output() {
+        let save = std::path::Path::new("/usr/sbin/iptables-save");
+        let unknown_dispatcher = std::path::Path::new("/usr/bin/alts");
+        for output in [
+            b"iptables-save v1.8.13\n".as_slice(),
+            b"iptables-save v1.8.13 (unknown)\n".as_slice(),
+            b"iptables-save v1.8.13 (legacy)\nwarning\n".as_slice(),
+            b"ip6tables-save v1.8.13 (legacy)\n".as_slice(),
+            b"iptables-save v1.8.x (legacy)\n".as_slice(),
+        ] {
+            assert!(parse_xtables_world_version(save, unknown_dispatcher, output).is_err());
+        }
+        assert!(
+            parse_xtables_world_version(
+                save,
+                std::path::Path::new("/usr/sbin/xtables-multi"),
+                b"iptables-save v1.8.0\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_xtables_world_version(
+                save,
+                std::path::Path::new("/usr/sbin/xtables-nft-multi"),
+                b"iptables-save v1.8.13 (legacy)\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn xtables_world_deduplication_distinguishes_selected_and_alternate_backends() {
+        let selected_path = std::path::Path::new("/usr/sbin/iptables-legacy-save");
+        let selected = XtablesIdentity {
+            resolved: selected_path.to_path_buf(),
+            world: XtablesWorld::Legacy,
+        };
+        let mut inspected = HashSet::new();
+
+        assert!(xtables_world_is_covered(
+            XtablesWorld::Legacy,
+            Some(&selected),
+            &inspected
+        ));
+        assert!(!xtables_world_is_covered(
+            XtablesWorld::Nft,
+            Some(&selected),
+            &inspected
+        ));
+        inspected.insert(XtablesWorld::Nft);
+        assert!(xtables_world_is_covered(
+            XtablesWorld::Nft,
+            Some(&selected),
+            &inspected
+        ));
+    }
+
+    #[test]
+    fn xtables_identity_stability_rejects_path_and_backend_switches() {
+        let legacy = XtablesIdentity {
+            resolved: std::path::PathBuf::from("/usr/sbin/xtables-legacy-multi"),
+            world: XtablesWorld::Legacy,
+        };
+        assert!(ensure_xtables_identity_unchanged(&legacy, &legacy).is_ok());
+
+        let changed_world = XtablesIdentity {
+            resolved: legacy.resolved.clone(),
+            world: XtablesWorld::Nft,
+        };
+        assert!(ensure_xtables_identity_unchanged(&legacy, &changed_world).is_err());
+
+        let changed_path = XtablesIdentity {
+            resolved: std::path::PathBuf::from("/usr/bin/alts"),
+            world: XtablesWorld::Legacy,
+        };
+        assert!(ensure_xtables_identity_unchanged(&legacy, &changed_path).is_err());
+
+        let changed_both = XtablesIdentity {
+            resolved: std::path::PathBuf::from("/usr/sbin/xtables-nft-multi"),
+            world: XtablesWorld::Nft,
+        };
+        assert!(ensure_xtables_identity_unchanged(&legacy, &changed_both).is_err());
     }
 
     #[test]
@@ -3042,6 +3387,12 @@ COMMIT
                 status: Some(1),
                 stdout: b"",
                 stderr: b"ip6tables-save v1.8.9 (legacy): Permission denied\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: b"ip6tables-save v1.8.13 (legacy): Cannot initialize: Permission denied (you must be root)\n",
                 resolved: legacy_binary,
             },
             AmbiguousCase { status: Some(1), stdout: b"", stderr: diagnostic, resolved: nft_binary },

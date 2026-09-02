@@ -16,7 +16,7 @@ sockets below the root-owned `/run/openshield` directory:
 
 | Socket | Mode | Operations |
 | --- | ---: | --- |
-| `control.sock` | `root:root`, `0600` | change mode; create, update, enable, disable, or delete rules |
+| `control.sock` | UID 0, `0600` | change mode; create, update, enable, disable, or delete rules |
 | `observe.sock` | `root:openshield`, `0660` | read a sanitized snapshot and subscribe to bounded events |
 
 Filesystem permissions are defense in depth. Every connection is authenticated
@@ -305,9 +305,12 @@ typed IP networks, ports, protocols, directions, and a strictly validated
 interface name. Application values remain typed identity data and are never
 interpreted as commands.
 
-The packaged process retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
-`CAP_DAC_READ_SEARCH` so procfs access checks permit identity inspection across
-local UIDs. Its syscall filter explicitly denies `ptrace`, `process_vm_readv`,
+The packaged systemd process retains `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+`CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its effective `openshield` group gives a newly bound
+observation socket the required GID without `CAP_CHOWN`. Legacy xtables needs `CAP_NET_RAW` to open the
+raw IPv4/IPv6 sockets used for alternate-backend inspection and fallback;
+the last two capabilities let procfs access checks permit identity inspection
+across local UIDs. Its syscall filter explicitly denies `ptrace`, `process_vm_readv`,
 `process_vm_writev`, `kcmp`, `pidfd_getfd`, and `open_by_handle_at`, and it does
 not normally read process memory or environments. This deny list is not memory
 isolation: `CAP_SYS_PTRACE` can authorize a compromised daemon to open

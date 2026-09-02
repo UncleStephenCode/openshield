@@ -20,11 +20,25 @@ Run `systemd-sysusers` and `systemd-tmpfiles --create` before starting the
 service. The daemon deliberately refuses partial startup when the required
 `openshield` group cannot be resolved.
 
+## RPM firewall and runtime dependencies
+
+Every RPM declares the rich dependency `(nftables or iptables)` and recommends
+`nftables`. A normal solver therefore installs the preferred nftables frontend,
+while an iptables-only installation remains valid when nftables is unavailable
+or recommendations are disabled. At runtime OpenShield still selects nftables
+first and uses `iptables`/`ip6tables` only as its fallback.
+
+The Tumbleweed-specific GNU RPMs for `x86_64`, `i586`, `aarch64`, `ppc64le`,
+and `s390x` are dynamically linked. They additionally require the official
+Tumbleweed `glibc` and `libgcc_s1` runtime packages. These dependencies are not
+added to the separate static-musl RPM builds.
+
 ## Runtime objects
 
 The service creates or verifies:
 
-- `/run/openshield/control.sock`, `root:root` and `0600`, for UID-0 mutation;
+- `/run/openshield/control.sock`, owned by UID 0 and mode `0600`, for UID-0
+  mutation (its group is intentionally irrelevant at that mode);
 - `/run/openshield/observe.sock`, `root:openshield` and `0660`, for read-only
   monitoring by root and members of `openshield`;
 - `/run/openshield/daemon.lock`, a root-owned regular `0600` singleton lock;
@@ -77,10 +91,13 @@ metadata, and locks the same persistent inode before state or firewall changes.
 
 ## Privileges and hardening
 
-The service runs as root and retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
-`CAP_DAC_READ_SEARCH`. The latter capabilities are needed to associate a queued
-socket inode with protected `/proc/<pid>` metadata across local UIDs. The syscall
-filter denies direct inspection calls including `ptrace`, `process_vm_*`,
+The service runs with UID 0 and effective group `openshield`; this gives a new
+observation socket the required GID without retaining `CAP_CHOWN`. It retains
+`CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Legacy xtables requires
+`CAP_NET_RAW` to open the raw IPv4/IPv6 sockets used for alternate-backend
+inspection and fallback operation. The last two capabilities are needed to
+associate a queued socket inode with protected `/proc/<pid>` metadata across
+local UIDs. The syscall filter denies direct inspection calls including `ptrace`, `process_vm_*`,
 `kcmp`, `pidfd_getfd`, and `open_by_handle_at`.
 
 This is attack-surface reduction, not complete isolation. After daemon

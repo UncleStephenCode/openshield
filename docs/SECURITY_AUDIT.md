@@ -15,9 +15,9 @@ The normative boundary is defined by the
 ### Local authorization and bounded IPC
 
 - Policy mutation is available only through `/run/openshield/control.sock`.
-  The socket is `root:root` `0600`, and the daemon additionally requires Linux
-  `SO_PEERCRED` UID 0. Filesystem permissions are therefore not the sole
-  authorization check.
+  The socket is owned by UID 0 with mode `0600`; its group does not participate
+  in authorization. The daemon additionally requires Linux `SO_PEERCRED` UID 0.
+  Filesystem permissions are therefore not the sole authorization check.
 - Read-only observation uses `/run/openshield/observe.sock`, owned by
   `root:openshield` with mode `0660`. The daemon accepts root, a peer whose
   primary GID is `openshield`, or a peer whose bounded, stable procfs credential
@@ -159,8 +159,11 @@ The normative boundary is defined by the
   safely permissioned, with the conventional system-owned sticky `/tmp`
   exception. Its probes stop at the first rejected object. It never enables or
   starts a service on the host.
-- The systemd service retains `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, and
-  `CAP_DAC_READ_SEARCH` and denies several process-memory syscalls. A tmpfiles
+- The systemd service retains `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_PTRACE`,
+  and `CAP_DAC_READ_SEARCH`. It uses the effective `openshield` group instead of
+  `CAP_CHOWN` for the observer socket, while `CAP_NET_RAW` is required for safe legacy xtables
+  inspection and fallback operation; several process-memory syscalls remain
+  denied. A tmpfiles
   rule creates the standard root-owned `0600` `/run/xtables.lock`; the unit
   requires tmpfiles setup and makes only that shared lock, rather than all of
   `/run`, additionally writable. This preserves serialization with other
@@ -174,7 +177,7 @@ establish the properties of another.
 
 - Final Rust 1.98.0 verification passed `cargo fmt --all -- --check`, locked
   workspace all-target checks, workspace all-target clippy with warnings denied,
-  and all 247 workspace tests: 55 core, 129 daemon, 11 protocol, and 52 TUI.
+  and all 255 workspace tests: 55 core, 137 daemon, 11 protocol, and 52 TUI.
   This includes automatic-learning budgets, version pinning, fsuid-prefilter,
   and immutable policy-index cases. Daemon tests used mock backends and temporary
   Unix sockets and did not touch the host firewall. These are component results,
@@ -189,21 +192,24 @@ establish the properties of another.
   `tests/compat/distros.tsv`. This establishes startup compatibility of those
   artifacts with the selected container userspaces, not firewall operation or
   certification of 60 distributions.
-- `cargo check --workspace --all-targets --locked` completed for all 21 Linux
+- `cargo check --workspace --all-targets --locked` completed for all 23 Linux
   targets whose standard libraries were available from stable Rust 1.98.0. The
   two recorded RISC-V 32 targets are Tier 3 and were skipped because stable
   rustup does not provide their standard libraries; a separately reviewed
   nightly `build-std` workflow would be required.
-- The cross-target jobs were compilation checks, not links or hardware runs.
-  In particular, arm64 execution was unavailable on the test host because it
-  had no binfmt/QEMU handler.
+- Separate Tumbleweed GNU binaries were linked and ELF-validated for x86_64,
+  i586, AArch64, ppc64le, and s390x. The four non-host daemon/TUI pairs ran
+  capability-free `--version` smokes under digest-pinned Cross QEMU images;
+  i586 also ran in the pinned official Tumbleweed `linux/386` image. These are
+  execution smokes, not hardware or firewall certification.
 - Static staging checks covered all six init layouts. Isolated container
   parser/supervisor fixtures passed for OpenRC, SysVinit, runit, s6, and dinit,
   including lifecycle quarantine and group creation. systemd is staged and
   analyzed separately rather than booted as PID 1 in that container matrix. The
   staged unit with target stubs passed `systemd-analyze verify`; offline
   `systemd-analyze security --offline=yes --threshold=100` passed with exposure
-  2.6 (`OK`).
+  2.7 (`OK`). Verification and the same 2.7 assessment were repeated with
+  systemd installed inside the pinned Tumbleweed container.
   Alpine/BusyBox also executed the staging helper, and unsafe staging-tree
   fixtures, including symlink and writable-parent cases, were rejected. A
   rooted tmpfiles dry run parsed the shared-lock declaration. These are
@@ -224,16 +230,18 @@ establish the properties of another.
 - `tests/e2e/server-learning-enforcing.sh` defines separate disposable nftables
   and iptables workflows for observation authorization, Learning, application
   attribution, Enforcing, coexistence, inbound allow, shutdown quarantine, and
-  restart. Final Rust 1.98.0 Debian Bookworm release runs passed for both
-  backends and printed:
+  restart. Final Rust 1.98.0 release runs passed for both backends on Debian
+  Bookworm and the pinned openSUSE Tumbleweed snapshot and printed:
 
   ```text
   PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
   PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
   ```
 
-  These were local, isolated Docker network/container-namespace tests. They did
-  not exercise or modify the host firewall and are not production certification.
+  The nftables runs installed both frontends and selected nftables; the iptables
+  runs omitted `nft` and selected the fallback. These were local, isolated
+  Docker network/container-namespace tests. They did not exercise or modify the
+  host firewall and are not production certification.
 
 Commands and exact interpretation are documented in
 [the compatibility guide](../tests/compat/README.md).

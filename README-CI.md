@@ -9,32 +9,45 @@ compatibility scripts.
 
 - `.github/workflows/ci.yml`: PR/main Rust and packaging validation.
 - `.github/workflows/release.yml`: tag-driven amd64 + arm64 static-musl builds,
-  native package generation, install smoke tests, firewall E2E, checksums and a
-  GitHub Release.
+  Tumbleweed GNU builds for all five supported architectures, native package
+  generation, install smoke tests, firewall E2E, checksums and a GitHub Release.
 - `packaging/ci/nfpm.yaml`: common nFPM package definition.
 - `packaging/ci/scripts/build-release-package.sh`: builds DEB/RPM/APK/Arch packages.
 - `packaging/ci/scripts/test-release-package.sh`: installs packages in distribution containers.
 - `packaging/ci/hooks/*`: safe post-install hooks; they create runtime prerequisites
   but deliberately do not enable or start OpenShield.
 
+All GitHub Actions are pinned to commit SHAs. Cross, package-smoke, E2E client,
+and E2E server images are pinned to registry SHA-256 digests; downloaded Cross
+and nFPM release archives are verified against fixed SHA-256 values before use.
+
 ## Release matrix
 
 Binaries:
+
 - amd64: `x86_64-unknown-linux-musl`
 - arm64: `aarch64-unknown-linux-musl`
+- openSUSE Tumbleweed: amd64 (`x86_64`), i586, arm64 (`aarch64`), ppc64le and
+  s390x GNU binaries
 
 Packages:
+
 - DEB: amd64, arm64
 - Fedora RPM: amd64, arm64
 - EL9 RPM: amd64, arm64
 - EL10 RPM: amd64, arm64
 - openSUSE RPM: amd64, arm64
+- openSUSE Tumbleweed RPM: amd64, i586, arm64, ppc64le, s390x
 - Alpine APK: amd64, arm64
 - Arch package: amd64
 
 Install smoke tests currently run on amd64 containers for Debian 12/13,
 Ubuntu 22.04/24.04/26.04, Fedora 43/44, Rocky/Alma 9 and 10,
-openSUSE Leap 16.0, Alpine 3.23/3.24 and Arch Linux.
+openSUSE Leap 16.0, a pinned openSUSE Tumbleweed snapshot, Alpine 3.23/3.24 and
+Arch Linux. Firewall E2E runs the corresponding artifact for each distribution:
+the static-musl amd64 artifact on Debian and the Tumbleweed GNU amd64 artifact
+on Tumbleweed. Both environments test nftables first and iptables as the
+fallback backend.
 
 ## First test
 
