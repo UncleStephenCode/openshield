@@ -42,10 +42,21 @@ openSUSE Leap 16.0, Alpine 3.23/3.24 and Arch Linux.
 2. Ensure `[workspace.package].version` in `Cargo.toml` is the desired version.
 3. Create and push the matching tag, for example:
 
-   git tag -a v0.1.0 -m 'OpenShield v0.1.0'
-   git push origin v0.1.0
+   git tag -a v0.1.14 -m 'OpenShield v0.1.14'
+   git push origin v0.1.14
 
 The release workflow refuses a tag whose version differs from Cargo.toml.
+
+Publishing is resumable. If the tag already has a GitHub Release, the workflow
+keeps matching assets, uploads only missing files, and refuses to delete or
+replace a file whose size or SHA-256 digest differs from the current build. A
+draft is published only after the complete remote asset set has been verified.
+A run triggered by creation of a tag automatically completes an existing
+matching release. Tag updates and force-pushes are not authorized to repair a
+published release. To recover an older tag through `workflow_dispatch`, run it
+from a revision containing this workflow, pass that tag as the `tag` input, and
+explicitly enable `repair_existing_release`. Re-running an older failed job uses
+its original workflow revision and does not pick up later workflow fixes.
 
 ## Important
 

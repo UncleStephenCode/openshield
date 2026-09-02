@@ -47,8 +47,11 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(10);
 // the execution input bounded while leaving headroom for all 10,000 rules.
 const MAX_POLICY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NFT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FIREWALL_STDERR_BYTES: usize = 64 * 1024;
 const XT_WAIT_SECONDS: &str = "5";
 const XTABLES_LIST_ARGS: [&str; 6] = ["--wait", XT_WAIT_SECONDS, "-t", "filter", "-n", "-L"];
+const LEGACY_BACKEND_UNAVAILABLE_SUFFIX: &str =
+    " (legacy): Cannot initialize: iptables who? (do you need to insmod?)";
 // `--test --noflush` validates every xtables extension and control-flow
 // primitive used by the compatibility compiler without changing live rules.
 // A bundle which merely understands an empty filter table is not sufficient:
@@ -925,25 +928,13 @@ fn active_xtables_worlds(candidates: &[XtablesBundle], excluded: Option<&Path>) 
         }
         let resolved = fs::canonicalize(save)
             .with_context(|| format!("cannot resolve xtables-save path {}", save.display()))?;
-        if excluded == Some(resolved.as_path()) || !inspected.insert(resolved) {
+        if excluded == Some(resolved.as_path()) || !inspected.insert(resolved.clone()) {
             continue;
         }
-        for table in ["filter", "mangle"] {
-            let captured = match capture_command(
-                save,
-                &["-c", "-t", table],
-                NFT_QUERY_TIMEOUT,
-                MAX_NFT_OUTPUT_BYTES,
-            ) {
-                Ok(captured) => captured,
-                Err(error) => {
-                    failures.push(format!("{} ({table}): {error:#}", save.display()));
-                    continue;
-                }
-            };
-            if parse_xtables_save(&captured)?.has_openshield_artifacts() {
-                return Ok(true);
-            }
+        match inspect_xtables_world(|table| inspect_xtables_table(save, &resolved, table)) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => failures.push(format!("{}: {error:#}", save.display())),
         }
     }
     ensure!(
@@ -952,6 +943,125 @@ fn active_xtables_worlds(candidates: &[XtablesBundle], excluded: Option<&Path>) 
         failures.join("; ")
     );
     Ok(false)
+}
+
+#[derive(Debug)]
+enum XtablesTableInspection {
+    Captured(Vec<u8>),
+    BackendAbsent,
+}
+
+fn inspect_xtables_world<Capture>(mut capture: Capture) -> Result<bool>
+where
+    Capture: FnMut(&str) -> Result<XtablesTableInspection>,
+{
+    let mut absent_tables = 0_u8;
+    let mut captured_tables = 0_u8;
+    for table in ["filter", "mangle"] {
+        match capture(table)? {
+            XtablesTableInspection::Captured(captured) => {
+                captured_tables = captured_tables
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("xtables captured-table count overflow"))?;
+                if parse_xtables_save(&captured)?.has_openshield_artifacts() {
+                    return Ok(true);
+                }
+            }
+            XtablesTableInspection::BackendAbsent => {
+                absent_tables = absent_tables
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("xtables absent-table count overflow"))?;
+            }
+        }
+    }
+    ensure!(
+        (absent_tables == 0 && captured_tables == 2)
+            || (absent_tables == 2 && captured_tables == 0),
+        "xtables backend availability changed or differed between filter and mangle inspection"
+    );
+    Ok(false)
+}
+
+fn inspect_xtables_table(
+    save: &Path,
+    resolved: &Path,
+    table: &str,
+) -> Result<XtablesTableInspection> {
+    let captured = capture_command_output(
+        save,
+        &["-c", "-t", table],
+        NFT_QUERY_TIMEOUT,
+        MAX_NFT_OUTPUT_BYTES,
+    )?;
+    if captured.status.success() {
+        return Ok(XtablesTableInspection::Captured(captured.stdout));
+    }
+    if is_proven_absent_legacy_backend(
+        save,
+        resolved,
+        captured.status.code(),
+        &captured.stdout,
+        &captured.stderr,
+    ) {
+        return Ok(XtablesTableInspection::BackendAbsent);
+    }
+    bail!(
+        "{save} ({table}) exited with status {status}",
+        save = save.display(),
+        status = captured.status
+    )
+}
+
+fn is_proven_absent_legacy_backend(
+    save: &Path,
+    resolved: &Path,
+    status_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
+    if status_code != Some(1) || !stdout.is_empty() {
+        return false;
+    }
+    let Some(save_name) = save.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let resolved_is_legacy = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "xtables-legacy-multi" | "iptables-legacy-save" | "ip6tables-legacy-save"
+            )
+        });
+    if !resolved_is_legacy {
+        return false;
+    }
+    let program_prefix = if save_name.starts_with("ip6tables") {
+        "ip6tables-save v"
+    } else if save_name.starts_with("iptables") {
+        "iptables-save v"
+    } else {
+        return false;
+    };
+    let Ok(diagnostic) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    let diagnostic = diagnostic.strip_suffix('\n').unwrap_or(diagnostic);
+    let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
+    if diagnostic.contains(['\n', '\r']) {
+        return false;
+    }
+    let Some(version) = diagnostic
+        .strip_prefix(program_prefix)
+        .and_then(|diagnostic| diagnostic.strip_suffix(LEGACY_BACKEND_UNAVAILABLE_SUFFIX))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.split('.').all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn active_nft_artifacts() -> Result<bool> {
@@ -1082,6 +1192,19 @@ fn run_command_with_input(
     Ok(())
 }
 
+#[derive(Debug)]
+struct CapturedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct BoundedCommandStream {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
 fn capture_command(
     path: &Path,
     args: &[&str],
@@ -1092,49 +1215,132 @@ fn capture_command(
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start trusted executable {}", path.display()))?;
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout.take() else {
         terminate_child(&mut child);
         bail!("trusted executable stdout pipe was not created");
     };
-    let reader = match thread::Builder::new()
-        .name("openshield-xtables-reader".to_owned())
-        .spawn(move || -> Result<(Vec<u8>, bool)> {
-            let mut captured = Vec::new();
-            let mut overflow = false;
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let read = stdout
-                    .read(&mut chunk)
-                    .context("failed to read xtables output")?;
-                if read == 0 {
-                    break;
-                }
-                let remaining = maximum.saturating_sub(captured.len());
-                let keep = remaining.min(read);
-                captured.extend_from_slice(&chunk[..keep]);
-                overflow |= keep != read;
-            }
-            Ok((captured, overflow))
-        }) {
+    let reader = match spawn_bounded_command_reader(stdout, maximum, "openshield-firewall-stdout") {
         Ok(reader) => reader,
         Err(error) => {
             terminate_child(&mut child);
-            return Err(error).context("failed to create bounded xtables output reader");
+            return Err(error).context("failed to create bounded firewall stdout reader");
         }
     };
     let status_result = wait_with_timeout(&mut child, timeout);
-    let output_result = reader
+    let stdout_result = reader
         .join()
-        .map_err(|_| anyhow!("xtables output reader terminated unexpectedly"))?;
+        .map_err(|_| anyhow!("firewall stdout reader terminated unexpectedly"));
     let status = status_result?;
-    let (output, overflow) = output_result?;
+    let stdout = stdout_result??;
     ensure!(
         status.success(),
-        "{} exited with status {status}",
-        path.display()
+        "{} exited with status {}",
+        path.display(),
+        status
     );
-    ensure!(!overflow, "xtables output exceeded {maximum} bytes");
-    Ok(output)
+    ensure!(
+        !stdout.overflow,
+        "{} stdout exceeded {maximum} bytes",
+        path.display(),
+    );
+    Ok(stdout.bytes)
+}
+
+fn capture_command_output(
+    path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    maximum_stdout: usize,
+) -> Result<CapturedCommandOutput> {
+    let mut child = trusted_command(path, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start trusted executable {}", path.display()))?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_child(&mut child);
+        bail!("trusted executable stdout pipe was not created");
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_child(&mut child);
+        bail!("trusted executable stderr pipe was not created");
+    };
+    let stdout_reader =
+        match spawn_bounded_command_reader(stdout, maximum_stdout, "openshield-firewall-stdout") {
+            Ok(reader) => reader,
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(error).context("failed to create bounded firewall stdout reader");
+            }
+        };
+    let stderr_reader = match spawn_bounded_command_reader(
+        stderr,
+        MAX_FIREWALL_STDERR_BYTES,
+        "openshield-firewall-stderr",
+    ) {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_child(&mut child);
+            let _ignored = stdout_reader.join();
+            return Err(error).context("failed to create bounded firewall stderr reader");
+        }
+    };
+    let status_result = wait_with_timeout(&mut child, timeout);
+    let stdout_result = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("firewall stdout reader terminated unexpectedly"));
+    let stderr_result = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("firewall stderr reader terminated unexpectedly"));
+    let status = status_result?;
+    let stdout = stdout_result??;
+    let stderr = stderr_result??;
+    ensure!(
+        !stdout.overflow,
+        "{} stdout exceeded {maximum_stdout} bytes",
+        path.display(),
+    );
+    ensure!(
+        !stderr.overflow,
+        "{} stderr exceeded {MAX_FIREWALL_STDERR_BYTES} bytes",
+        path.display(),
+    );
+    Ok(CapturedCommandOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn spawn_bounded_command_reader<Reader>(
+    mut reader: Reader,
+    maximum: usize,
+    thread_name: &str,
+) -> Result<thread::JoinHandle<Result<BoundedCommandStream>>>
+where
+    Reader: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let mut overflow = false;
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let read = reader
+                    .read(&mut chunk)
+                    .context("failed to read firewall subprocess output")?;
+                if read == 0 {
+                    break;
+                }
+                let remaining = maximum.saturating_sub(bytes.len());
+                let keep = remaining.min(read);
+                bytes.extend_from_slice(&chunk[..keep]);
+                overflow |= keep != read;
+            }
+            Ok(BoundedCommandStream { bytes, overflow })
+        })
+        .context("cannot spawn bounded firewall output reader")
 }
 
 fn trusted_command(path: &Path, args: &[&str]) -> Command {
@@ -2220,8 +2426,10 @@ mod tests {
 
     use super::{
         FirewallCounters, InterfaceName, LearnedEndpoint, PortRange, TransportProtocol,
-        XtablesBundle, XtablesTools, add_firewall_counters, attempt_both_families, parse_counters,
-        parse_learned_endpoints, parse_xtables_save, verify_base_chains, verify_table,
+        XtablesBundle, XtablesTableInspection, XtablesTools, add_firewall_counters,
+        attempt_both_families, inspect_xtables_world, is_proven_absent_legacy_backend,
+        parse_counters, parse_learned_endpoints, parse_xtables_save, verify_base_chains,
+        verify_table,
     };
     use anyhow::Result;
     use serde_json::{Value, json};
@@ -2766,6 +2974,148 @@ COMMIT
             b"*filter\n:INPUT ACCEPT [0:0]\n[0:0] -A INPUT -j OPENSHIELD_IN\nCOMMIT\n",
         )?;
         assert!(dispatcher.has_openshield_artifacts());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_enoprotoopt_diagnostic_proves_backend_absence() {
+        let legacy_save = std::path::Path::new("/usr/sbin/ip6tables-legacy-save");
+        let legacy_binary = std::path::Path::new("/usr/sbin/xtables-legacy-multi");
+        let diagnostic = b"ip6tables-save v1.8.9 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n";
+        assert!(is_proven_absent_legacy_backend(
+            legacy_save,
+            legacy_binary,
+            Some(1),
+            b"",
+            diagnostic,
+        ));
+
+        let ipv4_save = std::path::Path::new("/usr/sbin/iptables-legacy-save");
+        let ipv4_diagnostic = b"iptables-save v1.4.21 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n";
+        assert!(is_proven_absent_legacy_backend(
+            ipv4_save,
+            legacy_binary,
+            Some(1),
+            b"",
+            ipv4_diagnostic,
+        ));
+    }
+
+    #[test]
+    fn legacy_backend_absence_classifier_rejects_ambiguous_failures() {
+        struct AmbiguousCase<'a> {
+            status: Option<i32>,
+            stdout: &'a [u8],
+            stderr: &'a [u8],
+            resolved: &'a std::path::Path,
+        }
+
+        let legacy_save = std::path::Path::new("/usr/sbin/ip6tables-legacy-save");
+        let legacy_binary = std::path::Path::new("/usr/sbin/xtables-legacy-multi");
+        let nft_binary = std::path::Path::new("/usr/sbin/xtables-nft-multi");
+        let diagnostic = b"ip6tables-save v1.8.9 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n";
+        let ambiguous = [
+            AmbiguousCase { status: Some(0), stdout: b"", stderr: diagnostic, resolved: legacy_binary },
+            AmbiguousCase { status: Some(2), stdout: b"", stderr: diagnostic, resolved: legacy_binary },
+            AmbiguousCase { status: None, stdout: b"", stderr: diagnostic, resolved: legacy_binary },
+            AmbiguousCase { status: Some(1), stdout: b"unexpected", stderr: diagnostic, resolved: legacy_binary },
+            AmbiguousCase { status: Some(1), stdout: b"", stderr: b"", resolved: legacy_binary },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: b"warning\nip6tables-save v1.8.9 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: b"ip6tables-save v1.8.9 (nf_tables): Cannot initialize: iptables who? (do you need to insmod?)\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: b"ip6tables-save v1.8.9: Cannot initialize: iptables who? (do you need to insmod?)\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: b"ip6tables-save v1.8.9 (legacy): Permission denied\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase { status: Some(1), stdout: b"", stderr: diagnostic, resolved: nft_binary },
+        ];
+        for case in ambiguous {
+            assert!(!is_proven_absent_legacy_backend(
+                legacy_save,
+                case.resolved,
+                case.status,
+                case.stdout,
+                case.stderr,
+            ));
+        }
+    }
+
+    #[test]
+    fn alternate_xtables_world_accepts_only_consistent_backend_absence() -> Result<()> {
+        assert!(!inspect_xtables_world(|_table| {
+            Ok(XtablesTableInspection::BackendAbsent)
+        })?);
+
+        assert!(!inspect_xtables_world(|table| {
+            Ok(XtablesTableInspection::Captured(
+                format!("*{table}\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n").into_bytes(),
+            ))
+        })?);
+
+        let mixed = inspect_xtables_world(|table| {
+            if table == "filter" {
+                Ok(XtablesTableInspection::BackendAbsent)
+            } else {
+                Ok(XtablesTableInspection::Captured(
+                    b"*mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n".to_vec(),
+                ))
+            }
+        });
+        assert!(mixed.is_err());
+
+        let ambiguous = inspect_xtables_world(|table| {
+            if table == "filter" {
+                Ok(XtablesTableInspection::Captured(
+                    b"*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n".to_vec(),
+                ))
+            } else {
+                Err(anyhow::anyhow!("injected permission failure"))
+            }
+        });
+        assert!(ambiguous.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn alternate_xtables_world_detects_artifacts_despite_partial_absence() -> Result<()> {
+        let detected = inspect_xtables_world(|table| {
+            if table == "filter" {
+                Ok(XtablesTableInspection::Captured(
+                    b"*filter\n:INPUT ACCEPT [0:0]\n:OPENSHIELD_IN - [0:0]\nCOMMIT\n".to_vec(),
+                ))
+            } else {
+                Ok(XtablesTableInspection::BackendAbsent)
+            }
+        })?;
+        assert!(detected);
+
+        let detected = inspect_xtables_world(|table| {
+            if table == "filter" {
+                Ok(XtablesTableInspection::BackendAbsent)
+            } else {
+                Ok(XtablesTableInspection::Captured(
+                    b"*mangle\n:OUTPUT ACCEPT [0:0]\n:OPENSHIELD_MARK - [0:0]\nCOMMIT\n".to_vec(),
+                ))
+            }
+        })?;
+        assert!(detected);
         Ok(())
     }
 

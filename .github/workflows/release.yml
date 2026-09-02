@@ -10,17 +10,23 @@ on:
         description: Existing vX.Y.Z tag to package
         required: true
         type: string
+      repair_existing_release:
+        description: Upload missing files to an already published release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  NFPM_VERSION: v2.43.4
+  NFPM_VERSION: v2.47.0
+  NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
 
 jobs:
   version:
@@ -29,11 +35,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      tag_ref_sha: ${{ steps.version.outputs.tag_ref_sha }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - id: version
         shell: bash
@@ -59,18 +68,30 @@ jobs:
             echo "::error::Tag $TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
             exit 1
           }
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Cannot resolve the release source commit"
+            exit 1
+          }
+          TAG_REF_SHA="$(git rev-parse "refs/tags/$TAG")"
+          [[ "$TAG_REF_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Cannot resolve the release tag object"
+            exit 1
+          }
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_ref_sha=$TAG_REF_SHA" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
   quality:
     name: Release quality gate
     needs: version
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-      - uses: Swatinem/rust-cache@v2
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
@@ -91,13 +112,10 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
 
       - name: Install musl build tools
         run: |
@@ -120,16 +138,15 @@ jobs:
           file dist/*
           ./dist/openshield-daemon --version
           ./dist/openshield-tui --version
-          tar -C dist -cJf "openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz" \
+          tar -C dist -cJf "$PWD/dist/openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz" \
             openshield-daemon openshield-tui
+          test -s "dist/openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.arch }}
-          path: |
-            dist/openshield-daemon
-            dist/openshield-tui
-            openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz
+          # A single directory keeps every downloaded entry at artifact root.
+          path: dist/
           if-no-files-found: error
           retention-days: 7
 
@@ -168,27 +185,65 @@ jobs:
             arch: amd64
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: binary-${{ matrix.arch }}
-          path: release-artifact
+          path: ${{ runner.temp }}/binary-${{ matrix.arch }}
 
       - name: Prepare binaries
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/binary-${{ matrix.arch }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
-          mkdir -p release-bin
-          install -m 0755 release-artifact/openshield-daemon release-bin/openshield-daemon
-          install -m 0755 release-artifact/openshield-tui release-bin/openshield-tui
+          set -euo pipefail
+          case "$TARGET_ARCH" in
+            amd64) expected_machine='Advanced Micro Devices X86-64' ;;
+            arm64) expected_machine='AArch64' ;;
+            *) echo "::error::Unsupported package architecture: $TARGET_ARCH"; exit 1 ;;
+          esac
+          for binary in openshield-daemon openshield-tui; do
+            source="$ARTIFACT_DIR/$binary"
+            [[ -f "$source" && ! -L "$source" ]] || {
+              echo "::error::Missing or unsafe binary artifact: $binary"
+              exit 1
+            }
+            machine="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            [[ "$machine" == "$expected_machine" ]] || {
+              echo "::error::Unexpected architecture for $binary: $machine (expected $expected_machine)"
+              exit 1
+            }
+          done
+          install -d -m 0755 release-bin
+          install -m 0755 "$ARTIFACT_DIR/openshield-daemon" release-bin/openshield-daemon
+          install -m 0755 "$ARTIFACT_DIR/openshield-tui" release-bin/openshield-tui
+          if [[ "$TARGET_ARCH" == amd64 ]]; then
+            ./release-bin/openshield-daemon --version
+            ./release-bin/openshield-tui --version
+          fi
 
       - name: Install nFPM
+        shell: bash
         env:
           VERSION: ${{ env.NFPM_VERSION }}
+          EXPECTED_SHA256: ${{ env.NFPM_SHA256 }}
         run: |
-          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin nfpm
+          set -euo pipefail
+          archive="$RUNNER_TEMP/nfpm-${VERSION#v}-linux-x86_64.tar.gz"
+          extract_dir="$RUNNER_TEMP/nfpm-${VERSION#v}"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum --check --strict -
+          mkdir -m 0700 "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir" nfpm
+          [[ -f "$extract_dir/nfpm" && ! -L "$extract_dir/nfpm" ]]
+          sudo install -m 0755 "$extract_dir/nfpm" /usr/local/bin/nfpm
           nfpm --version
 
       - name: Build package
@@ -196,9 +251,9 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           ARCH: ${{ matrix.arch }}
           FAMILY: ${{ matrix.family }}
-        run: packaging/ci/scripts/build-release-package.sh
+        run: bash packaging/ci/scripts/build-release-package.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.family }}-${{ matrix.arch }}
           path: dist/*
@@ -243,7 +298,7 @@ jobs:
           - name: Rocky 9
             family: el9
             arch: amd64
-            image: rockylinux:9
+            image: rockylinux/rockylinux:9
           - name: AlmaLinux 9
             family: el9
             arch: amd64
@@ -251,7 +306,7 @@ jobs:
           - name: Rocky 10
             family: el10
             arch: amd64
-            image: rockylinux:10
+            image: rockylinux/rockylinux:10
           - name: AlmaLinux 10
             family: el10
             arch: amd64
@@ -274,10 +329,11 @@ jobs:
             image: archlinux:base
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-      - uses: actions/download-artifact@v4
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: package-${{ matrix.family }}-${{ matrix.arch }}
           path: dist
@@ -285,18 +341,73 @@ jobs:
         env:
           FAMILY: ${{ matrix.family }}
           IMAGE: ${{ matrix.image }}
-        run: packaging/ci/scripts/test-release-package.sh
+        run: bash packaging/ci/scripts/test-release-package.sh
 
   e2e:
-    name: Firewall E2E
-    needs: [version, quality]
+    name: Firewall E2E / ${{ matrix.backend }}
+    needs: [version, quality, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [nftables, iptables]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-amd64
+          path: ${{ runner.temp }}/binary-amd64
+
+      - name: Prepare E2E daemon
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/binary-amd64
+          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          source="$ARTIFACT_DIR/openshield-daemon"
+          [[ -f "$source" && ! -L "$source" ]] || {
+            echo '::error::Missing or unsafe daemon artifact'
+            exit 1
+          }
+          install -d -m 0755 "$BINARY_DIR"
+          install -m 0755 "$source" "$BINARY_DIR/openshield-daemon"
+          "$BINARY_DIR/openshield-daemon" --version
+
       - name: Run isolated firewall E2E
-        run: tests/e2e/server-learning-enforcing.sh
+        id: firewall_e2e
+        shell: bash
+        env:
+          BACKEND: ${{ matrix.backend }}
+          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
+          E2E_LOG: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
+        run: |
+          set -o pipefail
+          e2e_status=0
+          tests/e2e/server-learning-enforcing.sh "$BACKEND" "$BINARY_DIR" \
+            2>&1 | tee "$E2E_LOG" || e2e_status=$?
+          if (( e2e_status != 0 )); then
+            failure_stage="$(grep -F 'OpenShield E2E failed during stage ' "$E2E_LOG" \
+              | tail -n 1 || true)"
+            if [[ -n "$failure_stage" ]]; then
+              printf '::error title=OpenShield %s E2E failed::%s\n' \
+                "$BACKEND" "$failure_stage"
+            fi
+          fi
+          exit "$e2e_status"
+
+      - name: Preserve E2E failure diagnostics
+        if: ${{ failure() && steps.firewall_e2e.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-failure-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     name: Publish GitHub Release
@@ -305,32 +416,411 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.version.outputs.tag }}
-      - uses: actions/download-artifact@v4
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: package-*
           path: release
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-*
           path: binaries
-          merge-multiple: true
       - name: Collect archives and checksums
         shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          find binaries -maxdepth 1 -type f -name '*.tar.xz' -exec cp {} release/ \;
+          for arch in amd64 arm64; do
+            archive="openshield-$VERSION-linux-$arch.tar.xz"
+            source="binaries/binary-$arch/$archive"
+            [[ -f "$source" && ! -L "$source" && -s "$source" ]] || {
+              echo "::error::Missing or unsafe release archive: $archive"
+              exit 1
+            }
+            [[ ! -e "release/$archive" ]] || {
+              echo "::error::Duplicate release archive: $archive"
+              exit 1
+            }
+            install -m 0644 "$source" "release/$archive"
+          done
           cd release
-          sha256sum * | sort -k2 > SHA256SUMS
+          sha256sum -- * | sort -k2 > SHA256SUMS
           ls -lah
-      - name: Create release
+      - name: Publish release safely
+        shell: bash
         env:
+          ALLOW_PUBLISHED_REPAIR: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.event.created == true && github.event.deleted == false && github.event.forced == false) || (github.event_name == 'workflow_dispatch' && inputs.repair_existing_release == true) }}
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_TAG_REF_SHA: ${{ needs.version.outputs.tag_ref_sha }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create "${{ needs.version.outputs.tag }}" release/* \
-            --verify-tag \
-            --generate-notes \
-            --title "OpenShield ${{ needs.version.outputs.tag }}"
+          set -euo pipefail
+          export LC_ALL=C
+          command -v jq >/dev/null || {
+            echo '::error::jq is required for release manifest verification'
+            exit 1
+          }
+          command -v curl >/dev/null || {
+            echo '::error::curl is required for release asset upload'
+            exit 1
+          }
+          [[ "$ALLOW_PUBLISHED_REPAIR" =~ ^(true|false)$ ]] || {
+            echo '::error::Invalid published-release repair flag'
+            exit 1
+          }
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo '::error::Unsafe GITHUB_REPOSITORY value'
+            exit 1
+          }
+
+          verify_release_tag() {
+            local tag_ref_sha tag_commit_sha
+            git fetch --force --no-tags origin "refs/tags/$TAG:refs/tags/$TAG" || return 1
+            tag_ref_sha="$(git rev-parse "refs/tags/$TAG")" || return 1
+            tag_commit_sha="$(git rev-parse "refs/tags/$TAG^{commit}")" || return 1
+            [[ "$tag_ref_sha" == "$EXPECTED_TAG_REF_SHA" ]] || {
+              echo "::error::Release tag object $TAG moved from $EXPECTED_TAG_REF_SHA to $tag_ref_sha"
+              return 1
+            }
+            [[ "$tag_commit_sha" == "$SOURCE_SHA" ]] || {
+              echo "::error::Release tag $TAG moved from $SOURCE_SHA to $tag_commit_sha"
+              return 1
+            }
+          }
+
+          release_lookup="$RUNNER_TEMP/openshield-release-lookup.json"
+          release_json="$RUNNER_TEMP/openshield-release.json"
+          remote_assets_json="$RUNNER_TEMP/openshield-release-assets.json"
+          remote_assets_tsv="$RUNNER_TEMP/openshield-release-assets.tsv"
+
+          lookup_release() {
+            local repository_owner repository_name
+            repository_owner="${GITHUB_REPOSITORY%%/*}"
+            repository_name="${GITHUB_REPOSITORY#*/}"
+            gh api graphql \
+              -f query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){id databaseId}}}' \
+              -f owner="$repository_owner" \
+              -f name="$repository_name" \
+              -f tag="$TAG" > "$release_lookup" || return 1
+            jq -e \
+              '((.errors // []) | length == 0) and (.data.repository != null)' \
+              "$release_lookup" >/dev/null || return 1
+            release_node="$(jq -r '.data.repository.release.id // empty' "$release_lookup")" || return 1
+            release_database_id="$(jq -r '.data.repository.release.databaseId // empty' "$release_lookup")" || return 1
+            if [[ -z "$release_node" ]]; then
+              [[ -z "$release_database_id" ]] || return 1
+            else
+              [[ "$release_database_id" =~ ^[0-9]+$ ]] || return 1
+            fi
+          }
+
+          read_release() {
+            [[ "$release_database_id" =~ ^[0-9]+$ ]] || return 1
+            gh api "repos/$GITHUB_REPOSITORY/releases/$release_database_id" \
+              > "$release_json" || return 1
+            release_id="$(jq -er '.id | select(type == "number") | tostring' "$release_json")" || return 1
+            release_tag="$(jq -er '.tag_name | select(type == "string")' "$release_json")" || return 1
+            release_body="$(jq -er '(.body // "") | select(type == "string")' "$release_json")" || return 1
+            release_upload_url="$(jq -er '.upload_url | select(type == "string")' "$release_json")" || return 1
+            release_is_draft="$(jq -er '.draft | select(type == "boolean") | if . then "true" else "false" end' "$release_json")" || return 1
+            release_is_prerelease="$(jq -er '.prerelease | select(type == "boolean") | if . then "true" else "false" end' "$release_json")" || return 1
+            release_is_immutable="$(jq -er '(.immutable // false) | select(type == "boolean") | if . then "true" else "false" end' "$release_json")" || return 1
+            [[ "$release_tag" == "$TAG" ]] || {
+              echo "::error::GitHub returned release tag $release_tag while $TAG was requested"
+              return 1
+            }
+            expected_upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets{?name,label}"
+            [[ "$release_upload_url" == "$expected_upload_url" ]] || {
+              echo '::error::GitHub returned an unexpected release upload URL'
+              return 1
+            }
+          }
+
+          fetch_remote_assets() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+              > "$remote_assets_json" || return 1
+            jq -e '
+              type == "array" and length < 100 and all(.[];
+                ((.id | type) == "number") and
+                ((.name | type) == "string") and
+                ((.size | type) == "number") and
+                ((.state | type) == "string") and
+                ((.digest == null) or ((.digest | type) == "string"))
+              )
+            ' "$remote_assets_json" >/dev/null || {
+              echo '::error::Invalid or paginated GitHub release asset response'
+              return 1
+            }
+            jq -r '.[] | [.id, .name, .size, .state, (.digest // "")] | @tsv' \
+              "$remote_assets_json" > "$remote_assets_tsv" || return 1
+          }
+
+          compare_remote_assets() {
+            local remote_id name remote_size remote_state remote_digest
+            local downloaded_asset downloaded_size downloaded_hash
+            declare -A remote_seen=()
+            missing_assets=()
+            while IFS=$'\t' read -r remote_id name remote_size remote_state remote_digest; do
+              [[ "$remote_id" =~ ^[0-9]+$ && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
+                echo '::error::Unsafe GitHub release asset metadata'
+                return 1
+              }
+              [[ -z "${remote_seen[$name]+present}" ]] || {
+                echo "::error::Duplicate GitHub release asset: $name"
+                return 1
+              }
+              remote_seen["$name"]=1
+              [[ -n "${local_paths[$name]+present}" ]] || {
+                echo "::error::Unexpected GitHub release asset: $name"
+                return 1
+              }
+              [[ "$remote_state" == uploaded ]] || {
+                echo "::error::GitHub release asset $name is not fully uploaded"
+                return 1
+              }
+              [[ "$remote_size" == "${local_sizes[$name]}" ]] || {
+                echo "::error::GitHub release asset $name has an unexpected size"
+                return 1
+              }
+              if [[ -z "$remote_digest" ]]; then
+                downloaded_asset="$RUNNER_TEMP/openshield-release-asset-$remote_id"
+                gh api -H 'Accept: application/octet-stream' \
+                  "repos/$GITHUB_REPOSITORY/releases/assets/$remote_id" \
+                  > "$downloaded_asset" || return 1
+                downloaded_size="$(stat -c '%s' -- "$downloaded_asset")" || return 1
+                [[ "$downloaded_size" == "$remote_size" ]] || {
+                  echo "::error::Downloaded GitHub release asset $name has an unexpected size"
+                  return 1
+                }
+                read -r downloaded_hash _ < <(sha256sum -- "$downloaded_asset") || return 1
+                remote_digest="sha256:$downloaded_hash"
+              fi
+              [[ "$remote_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                echo "::error::GitHub release asset $name has no trustworthy SHA-256 digest"
+                return 1
+              }
+              [[ "$remote_digest" == "${local_digests[$name]}" ]] || {
+                echo "::error::GitHub release asset $name differs from the current build"
+                return 1
+              }
+            done < "$remote_assets_tsv"
+            for name in "${local_names[@]}"; do
+              if [[ -z "${remote_seen[$name]+present}" ]]; then
+                missing_assets+=("$name")
+              fi
+            done
+          }
+
+          verify_release_tag
+
+          tag_version="${TAG#v}"
+          tag_without_build="${tag_version%%+*}"
+          expected_prerelease=false
+          if [[ "$tag_without_build" == *-* ]]; then
+            expected_prerelease=true
+          fi
+
+          shopt -s nullglob
+          local_assets=(release/*)
+          hidden_assets=(release/.[!.]* release/..?*)
+          shopt -u nullglob
+          (( ${#local_assets[@]} > 0 && ${#local_assets[@]} < 100 )) || {
+            echo '::error::Release asset set is empty or exceeds the verification bound'
+            exit 1
+          }
+          (( ${#hidden_assets[@]} == 0 )) || {
+            echo '::error::Hidden release assets are not allowed'
+            exit 1
+          }
+          declare -A local_paths=()
+          declare -A local_sizes=()
+          declare -A local_digests=()
+          local_names=()
+          local_manifest="$RUNNER_TEMP/openshield-local-release-manifest"
+          : > "$local_manifest"
+          for asset in "${local_assets[@]}"; do
+            [[ -f "$asset" && ! -L "$asset" && -s "$asset" ]] || {
+              echo "::error::Unsafe local release asset: $asset"
+              exit 1
+            }
+            name="${asset##*/}"
+            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
+              echo "::error::Unsafe local release asset name: $name"
+              exit 1
+            }
+            [[ -z "${local_paths[$name]+present}" ]] || {
+              echo "::error::Duplicate local release asset: $name"
+              exit 1
+            }
+            size="$(stat -c '%s' -- "$asset")"
+            read -r digest _ < <(sha256sum -- "$asset")
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "::error::Cannot hash local release asset: $name"
+              exit 1
+            }
+            local_paths["$name"]="$asset"
+            local_sizes["$name"]="$size"
+            local_digests["$name"]="sha256:$digest"
+            local_names+=("$name")
+            printf '%s\t%s\tsha256:%s\n' "$name" "$size" "$digest" >> "$local_manifest"
+          done
+          sort -o "$local_manifest" "$local_manifest"
+          read -r manifest_digest _ < <(sha256sum -- "$local_manifest")
+          echo "Release manifest SHA-256: $manifest_digest"
+          release_marker="<!-- openshield-release:v1 tag-ref=$EXPECTED_TAG_REF_SHA source=$SOURCE_SHA manifest=$manifest_digest -->"
+
+          lookup_release
+          if [[ -z "$release_node" ]]; then
+            create_options=(
+              "$TAG"
+              --draft
+              --verify-tag
+              --generate-notes
+              --notes "$release_marker"
+              --title "OpenShield $TAG"
+            )
+            if [[ "$expected_prerelease" == true ]]; then
+              create_options+=(--prerelease)
+            fi
+            create_status=0
+            gh release create "${create_options[@]}" || create_status=$?
+            if (( create_status != 0 )); then
+              echo '::warning::Release creation failed; checking for a concurrently created draft'
+            fi
+            lookup_release
+            if [[ -z "$release_node" ]]; then
+              echo '::error::GitHub Release was not created'
+              if (( create_status != 0 )); then
+                exit "$create_status"
+              fi
+              exit 1
+            fi
+          fi
+
+          read_release
+          initial_release_id="$release_id"
+          initial_release_node="$release_node"
+          initial_release_was_draft="$release_is_draft"
+          [[ "$release_is_prerelease" == "$expected_prerelease" ]] || {
+            echo "::error::Existing release prerelease state does not match tag $TAG"
+            exit 1
+          }
+          if [[ "$release_is_draft" == true ]] \
+            && ! grep -Fqx -- "$release_marker" <<< "$release_body"; then
+            echo '::error::Existing draft is not owned by this source and asset manifest'
+            exit 1
+          fi
+
+          verify_release_identity() {
+            local expected_draft_state=$1
+            lookup_release || return 1
+            [[ "$release_node" == "$initial_release_node" \
+              && "$release_database_id" == "$initial_release_id" ]] || {
+              echo '::error::GitHub release identity changed during publication'
+              return 1
+            }
+            read_release || return 1
+            [[ "$release_id" == "$initial_release_id" ]] || return 1
+            [[ "$release_is_draft" == "$expected_draft_state" ]] || {
+              echo '::error::GitHub release publication state changed unexpectedly'
+              return 1
+            }
+            [[ "$release_is_prerelease" == "$expected_prerelease" ]] || {
+              echo '::error::GitHub release prerelease state changed unexpectedly'
+              return 1
+            }
+            if [[ "$initial_release_was_draft" == true ]] \
+              && ! grep -Fqx -- "$release_marker" <<< "$release_body"; then
+              echo '::error::GitHub release draft ownership marker changed'
+              return 1
+            fi
+          }
+
+          fetch_remote_assets
+          compare_remote_assets
+          if (( ${#missing_assets[@]} > 0 )); then
+            [[ "$release_is_immutable" == false ]] || {
+              echo '::error::Immutable release is missing expected assets'
+              exit 1
+            }
+            if [[ "$initial_release_was_draft" == false \
+              && "$ALLOW_PUBLISHED_REPAIR" != true ]]; then
+              echo '::error::Published release is incomplete and this run is not authorized to repair it'
+              exit 1
+            fi
+            verify_release_tag
+            upload_response="$RUNNER_TEMP/openshield-release-upload-response.json"
+            for name in "${missing_assets[@]}"; do
+              verify_release_tag
+              verify_release_identity "$initial_release_was_draft"
+              echo "Uploading missing release asset: $name"
+              # Never use --clobber here: gh deletes the existing asset before
+              # uploading its replacement. Digest mismatches must require an
+              # explicit operator decision instead of destructive recovery.
+              encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header 'Accept: application/vnd.github+json' \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                --data-binary "@${local_paths[$name]}" \
+                --output "$upload_response" \
+                "${release_upload_url%%\{*}?name=$encoded_name"
+              jq -e --arg name "$name" --argjson size "${local_sizes[$name]}" '
+                (.name == $name) and (.size == $size) and (.state == "uploaded")
+              ' "$upload_response" >/dev/null || {
+                echo "::error::GitHub returned an invalid upload response for $name"
+                exit 1
+              }
+            done
+          fi
+
+          read_release
+          [[ "$release_id" == "$initial_release_id" ]] || {
+            echo '::error::GitHub release identity changed during asset upload'
+            exit 1
+          }
+          fetch_remote_assets
+          compare_remote_assets
+          (( ${#missing_assets[@]} == 0 )) || {
+            echo '::error::GitHub release is still missing expected assets'
+            exit 1
+          }
+
+          if [[ "$initial_release_was_draft" == true ]]; then
+            verify_release_tag
+            verify_release_identity true
+            make_latest=legacy
+            if [[ "$expected_prerelease" == true ]]; then
+              make_latest=false
+            fi
+            gh api --method PATCH \
+              -F draft=false \
+              -F prerelease="$expected_prerelease" \
+              -f make_latest="$make_latest" \
+              "repos/$GITHUB_REPOSITORY/releases/$initial_release_id" >/dev/null
+          fi
+
+          verify_release_tag
+          verify_release_identity false
+          [[ "$release_id" == "$initial_release_id" && "$release_is_draft" == false ]] || {
+            echo '::error::GitHub release was replaced or remains a draft'
+            exit 1
+          }
+          [[ "$release_is_prerelease" == "$expected_prerelease" ]] || {
+            echo '::error::Published release prerelease state changed unexpectedly'
+            exit 1
+          }
+          fetch_remote_assets
+          compare_remote_assets
+          (( ${#missing_assets[@]} == 0 )) || {
+            echo '::error::Published release asset verification failed'
+            exit 1
+          }

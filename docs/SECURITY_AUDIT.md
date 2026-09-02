@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-01, OpenShield 0.1.0, Rust stable 1.98.0.
+Review snapshot: 2026-09-02, OpenShield 0.1.14, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -57,6 +57,11 @@ The normative boundary is defined by the
   installed rule bodies, and keeps its dispatch jumps first in the relevant
   built-in chains. It refuses ambiguous coexistence with old OpenShield
   artifacts in nftables or another xtables implementation.
+- An installed legacy userspace frontend whose kernel protocol is unavailable
+  is treated as an empty alternate xtables world only after both `filter` and
+  `mangle` inspections return the exact bounded `ENOPROTOOPT` diagnostic with
+  an empty stdout. Mixed results, permission failures, timeouts, malformed or
+  oversized output, and every other error remain fail-closed.
 - xtables has no transaction that spans IPv4 and IPv6. OpenShield therefore
   validates both programs and puts both families into `BlockAll` before applying
   either requested policy. Failure can cause temporary denial but must not
