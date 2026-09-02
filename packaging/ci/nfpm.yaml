@@ -30,6 +30,12 @@ overrides:
       - nftables | iptables
   rpm:
     depends:
+      - ${RPM_FIREWALL_DEPENDENCY}
+      # The pinned nFPM version omits empty dependency values. These two
+      # entries are populated only for the dynamically linked Tumbleweed RPMs.
+      - ${RPM_C_RUNTIME_DEPENDENCY}
+      - ${RPM_UNWIND_RUNTIME_DEPENDENCY}
+    recommends:
       - nftables
   apk:
     depends:

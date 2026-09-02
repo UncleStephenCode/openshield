@@ -10,7 +10,7 @@ Wants=network-pre.target
 Type=notify
 NotifyAccess=main
 User=root
-Group=root
+Group=openshield
 ExecStartPre=/usr/bin/openshield-daemon --install-fail-closed
 ExecStart=/usr/bin/openshield-daemon
 # The daemon performs the same non-persistent quarantine during graceful
@@ -22,12 +22,14 @@ RestartSec=2s
 TimeoutStopSec=10s
 KillMode=mixed
 
+# CAP_NET_ADMIN manages policy. CAP_NET_RAW lets legacy xtables open the raw
+# IPv4/IPv6 sockets required for alternate-backend inspection and fallback.
 # CAP_SYS_PTRACE and read/search-only DAC bypass are required solely to bind a
 # queued socket inode to /proc/<pid>/{fd,exe,cmdline,cgroup,status}. Selected
 # direct inspection syscalls are denied below, but this is not process-memory
 # isolation; see docs/THREAT_MODEL.md.
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 UMask=0077
 RuntimeDirectory=openshield

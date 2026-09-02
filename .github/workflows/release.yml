@@ -25,6 +25,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CROSS_VERSION: v0.2.5
+  CROSS_SHA256: 642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad
   NFPM_VERSION: v2.47.0
   NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
 
@@ -150,6 +152,162 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-tumbleweed:
+    name: Build Tumbleweed / ${{ matrix.arch }}
+    needs: [version, quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            native: true
+          - arch: i586
+            runner: ubuntu-24.04
+            target: i586-unknown-linux-gnu
+            cross: true
+            native: false
+            smoke_image: ghcr.io/cross-rs/i586-unknown-linux-gnu@sha256:87cddacc45ea10d3953e1aeeaedb08c42607f18a24aa1bde58599d08499b9096
+            smoke_runner: /qemu-runner
+            smoke_arch: i586
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cross: false
+            native: true
+          - arch: ppc64le
+            runner: ubuntu-24.04
+            target: powerpc64le-unknown-linux-gnu
+            cross: true
+            native: false
+            smoke_image: ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu@sha256:de5114adcd786f6a41eb07379459aaae94de73670303e202ea3603d250c19091
+            smoke_runner: /linux-runner
+            smoke_arch: powerpc64le
+          - arch: s390x
+            runner: ubuntu-24.04
+            target: s390x-unknown-linux-gnu
+            cross: true
+            native: false
+            smoke_image: ghcr.io/cross-rs/s390x-unknown-linux-gnu@sha256:0d8edc92c39158abe211fddfc9617bf5b7865c2ae0f58873f9cf0c58bb315271
+            smoke_runner: /linux-runner
+            smoke_arch: s390x
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Install pinned cross
+        if: ${{ matrix.cross }}
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ env.CROSS_SHA256 }}
+          VERSION: ${{ env.CROSS_VERSION }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cross-${VERSION#v}-x86_64-unknown-linux-gnu.tar.gz"
+          extract_dir="$RUNNER_TEMP/cross-${VERSION#v}"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/cross-rs/cross/releases/download/$VERSION/cross-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum --check --strict -
+          mkdir -m 0700 "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir" cross cross-util
+          [[ -f "$extract_dir/cross" && ! -L "$extract_dir/cross" ]]
+          [[ -f "$extract_dir/cross-util" && ! -L "$extract_dir/cross-util" ]]
+          sudo install -m 0755 "$extract_dir/cross" "$extract_dir/cross-util" /usr/local/bin/
+          cross --version
+
+      - name: Build Tumbleweed binaries
+        shell: bash
+        env:
+          USE_CROSS: ${{ matrix.cross }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$USE_CROSS" == true ]]; then
+            cross build --release --locked --target "$TARGET" \
+              -p openshield-daemon -p openshield-tui
+          else
+            cargo build --release --locked --target "$TARGET" \
+              -p openshield-daemon -p openshield-tui
+          fi
+
+      - name: Verify and stage Tumbleweed binaries
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          NATIVE: ${{ matrix.native }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            amd64) expected_class=ELF64; expected_endian='little endian'; expected_machine='Advanced Micro Devices X86-64' ;;
+            i586) expected_class=ELF32; expected_endian='little endian'; expected_machine='Intel 80386' ;;
+            arm64) expected_class=ELF64; expected_endian='little endian'; expected_machine='AArch64' ;;
+            ppc64le) expected_class=ELF64; expected_endian='little endian'; expected_machine='PowerPC64' ;;
+            s390x) expected_class=ELF64; expected_endian='big endian'; expected_machine='IBM S/390' ;;
+            *) echo "::error::Unsupported Tumbleweed architecture: $ARCH"; exit 1 ;;
+          esac
+          mkdir -m 0755 dist
+          for binary in openshield-daemon openshield-tui; do
+            source="target/$TARGET/release/$binary"
+            [[ -f "$source" && ! -L "$source" ]] || {
+              echo "::error::Missing or unsafe Tumbleweed binary: $binary"
+              exit 1
+            }
+            elf_class="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Class:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            elf_data="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Data:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            elf_machine="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            [[ "$elf_class" == "$expected_class" \
+              && "$elf_data" == *"$expected_endian"* \
+              && "$elf_machine" == "$expected_machine" ]] || {
+              echo "::error::Unexpected ELF identity for $binary: $elf_class / $elf_data / $elf_machine"
+              exit 1
+            }
+            install -m 0755 "$source" "dist/$binary"
+          done
+          file dist/openshield-daemon dist/openshield-tui
+          if [[ "$NATIVE" == true ]]; then
+            ./dist/openshield-daemon --version
+            ./dist/openshield-tui --version
+          fi
+          archive="openshield-$VERSION-linux-tumbleweed-$ARCH.tar.xz"
+          tar -C dist -cJf "$PWD/dist/$archive" openshield-daemon openshield-tui
+          [[ -s "dist/$archive" ]]
+
+      - name: Run cross-architecture smoke test
+        if: ${{ matrix.cross }}
+        shell: bash
+        env:
+          SMOKE_ARCH: ${{ matrix.smoke_arch }}
+          SMOKE_IMAGE: ${{ matrix.smoke_image }}
+          SMOKE_RUNNER: ${{ matrix.smoke_runner }}
+        run: |
+          set -euo pipefail
+          [[ "$SMOKE_IMAGE" == *@sha256:* ]]
+          for binary in openshield-daemon openshield-tui; do
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --mount "type=bind,src=$PWD/dist,dst=/opt/openshield,readonly" \
+              --entrypoint "$SMOKE_RUNNER" \
+              "$SMOKE_IMAGE" "$SMOKE_ARCH" "/opt/openshield/$binary" --version
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-tumbleweed-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   package:
     name: Package ${{ matrix.family }} / ${{ matrix.arch }}
     needs: [version, build]
@@ -260,9 +418,99 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  package-tumbleweed:
+    name: Package Tumbleweed / ${{ matrix.arch }}
+    needs: [version, build-tumbleweed]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, i586, arm64, ppc64le, s390x]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-tumbleweed-${{ matrix.arch }}
+          path: ${{ runner.temp }}/binary-tumbleweed-${{ matrix.arch }}
+
+      - name: Prepare Tumbleweed binaries
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_DIR: ${{ runner.temp }}/binary-tumbleweed-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            amd64) expected_class=ELF64; expected_endian='little endian'; expected_machine='Advanced Micro Devices X86-64' ;;
+            i586) expected_class=ELF32; expected_endian='little endian'; expected_machine='Intel 80386' ;;
+            arm64) expected_class=ELF64; expected_endian='little endian'; expected_machine='AArch64' ;;
+            ppc64le) expected_class=ELF64; expected_endian='little endian'; expected_machine='PowerPC64' ;;
+            s390x) expected_class=ELF64; expected_endian='big endian'; expected_machine='IBM S/390' ;;
+            *) echo "::error::Unsupported Tumbleweed package architecture: $ARCH"; exit 1 ;;
+          esac
+          install -d -m 0755 release-bin
+          for binary in openshield-daemon openshield-tui; do
+            source="$ARTIFACT_DIR/$binary"
+            [[ -f "$source" && ! -L "$source" ]] || {
+              echo "::error::Missing or unsafe Tumbleweed binary artifact: $binary"
+              exit 1
+            }
+            elf_class="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Class:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            elf_data="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Data:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            elf_machine="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+            [[ "$elf_class" == "$expected_class" \
+              && "$elf_data" == *"$expected_endian"* \
+              && "$elf_machine" == "$expected_machine" ]] || {
+              echo "::error::Unexpected ELF identity for $binary: $elf_class / $elf_data / $elf_machine"
+              exit 1
+            }
+            install -m 0755 "$source" "release-bin/$binary"
+          done
+          if [[ "$ARCH" == amd64 ]]; then
+            ./release-bin/openshield-daemon --version
+            ./release-bin/openshield-tui --version
+          fi
+
+      - name: Install nFPM
+        shell: bash
+        env:
+          VERSION: ${{ env.NFPM_VERSION }}
+          EXPECTED_SHA256: ${{ env.NFPM_SHA256 }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/nfpm-${VERSION#v}-linux-x86_64.tar.gz"
+          extract_dir="$RUNNER_TEMP/nfpm-${VERSION#v}"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum --check --strict -
+          mkdir -m 0700 "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir" nfpm
+          [[ -f "$extract_dir/nfpm" && ! -L "$extract_dir/nfpm" ]]
+          sudo install -m 0755 "$extract_dir/nfpm" /usr/local/bin/nfpm
+          nfpm --version
+
+      - name: Build Tumbleweed RPM
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          FAMILY: tumbleweed
+        run: bash packaging/ci/scripts/build-release-package.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-tumbleweed-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   package-test:
     name: Test ${{ matrix.name }} package
-    needs: [version, package]
+    needs: [version, package, package-tumbleweed]
     strategy:
       fail-fast: false
       matrix:
@@ -270,63 +518,67 @@ jobs:
           - name: Debian 12
             family: deb
             arch: amd64
-            image: debian:12
+            image: debian:12@sha256:6ebd97fa83deb272194a2cf015b3d26a4d538e9ad3a7a79d544c8af5b0a01443
           - name: Debian 13
             family: deb
             arch: amd64
-            image: debian:13
+            image: debian:13@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
           - name: Ubuntu 22.04
             family: deb
             arch: amd64
-            image: ubuntu:22.04
+            image: ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
           - name: Ubuntu 24.04
             family: deb
             arch: amd64
-            image: ubuntu:24.04
+            image: ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
           - name: Ubuntu 26.04
             family: deb
             arch: amd64
-            image: ubuntu:26.04
+            image: ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
           - name: Fedora 43
             family: fedora
             arch: amd64
-            image: fedora:43
+            image: fedora:43@sha256:a651ddf48ea28a06ed4e1e6519f51c9f47e7a5a138722ade87369b8fbb7e5b42
           - name: Fedora 44
             family: fedora
             arch: amd64
-            image: fedora:44
+            image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
           - name: Rocky 9
             family: el9
             arch: amd64
-            image: rockylinux/rockylinux:9
+            image: rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
           - name: AlmaLinux 9
             family: el9
             arch: amd64
-            image: almalinux:9
+            image: almalinux:9@sha256:d2515c769e7b73f95c4fde38c0a505336ff38f14990c0b7253b77060a049a743
           - name: Rocky 10
             family: el10
             arch: amd64
-            image: rockylinux/rockylinux:10
+            image: rockylinux/rockylinux:10@sha256:827d37bc128288ccf160ee318bb3cb92d591164cb217e92f8bc61e3982ae1834
           - name: AlmaLinux 10
             family: el10
             arch: amd64
-            image: almalinux:10
+            image: almalinux:10@sha256:cc24bc5b6ac7e284f2f62a07bdaa1b15d3319fdcf46413c6b8fe9fa245068ddd
           - name: openSUSE Leap 16.0
             family: opensuse
             arch: amd64
-            image: opensuse/leap:16.0
+            image: opensuse/leap:16.0@sha256:f239b4819f4dd322d99509f1b5b14f2107bf23857f9ccd3c14333f0928a2bcc6
+          - name: openSUSE Tumbleweed 20260830
+            family: tumbleweed
+            arch: amd64
+            image: opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045
           - name: Alpine 3.23
             family: alpine
             arch: amd64
-            image: alpine:3.23
+            image: alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
           - name: Alpine 3.24
             family: alpine
             arch: amd64
-            image: alpine:3.24
+            image: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
           - name: Arch Linux
             family: arch
             arch: amd64
-            image: archlinux:base
+            image: archlinux:base@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -344,12 +596,28 @@ jobs:
         run: bash packaging/ci/scripts/test-release-package.sh
 
   e2e:
-    name: Firewall E2E / ${{ matrix.backend }}
-    needs: [version, quality, build]
+    name: Firewall E2E / ${{ matrix.family }} / ${{ matrix.backend }}
+    needs: [version, quality, build, build-tumbleweed]
     strategy:
       fail-fast: false
       matrix:
-        backend: [nftables, iptables]
+        include:
+          - family: debian
+            backend: nftables
+            artifact_name: binary-amd64
+            image: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+          - family: debian
+            backend: iptables
+            artifact_name: binary-amd64
+            image: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+          - family: tumbleweed
+            backend: nftables
+            artifact_name: binary-tumbleweed-amd64
+            image: opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045
+          - family: tumbleweed
+            backend: iptables
+            artifact_name: binary-tumbleweed-amd64
+            image: opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -359,14 +627,14 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: binary-amd64
-          path: ${{ runner.temp }}/binary-amd64
+          name: ${{ matrix.artifact_name }}
+          path: ${{ runner.temp }}/e2e-daemon-artifact
 
       - name: Prepare E2E daemon
         shell: bash
         env:
-          ARTIFACT_DIR: ${{ runner.temp }}/binary-amd64
-          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
+          ARTIFACT_DIR: ${{ runner.temp }}/e2e-daemon-artifact
+          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.family }}-${{ matrix.backend }}
         run: |
           set -euo pipefail
           source="$ARTIFACT_DIR/openshield-daemon"
@@ -383,8 +651,10 @@ jobs:
         shell: bash
         env:
           BACKEND: ${{ matrix.backend }}
-          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.backend }}
-          E2E_LOG: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
+          BINARY_DIR: ${{ runner.temp }}/openshield-e2e-bin-${{ matrix.family }}-${{ matrix.backend }}
+          CLIENT_FAMILY: ${{ matrix.family }}
+          CLIENT_IMAGE: ${{ matrix.image }}
+          E2E_LOG: ${{ runner.temp }}/openshield-e2e-${{ matrix.family }}-${{ matrix.backend }}.log
         run: |
           set -o pipefail
           e2e_status=0
@@ -394,8 +664,8 @@ jobs:
             failure_stage="$(grep -F 'OpenShield E2E failed during stage ' "$E2E_LOG" \
               | tail -n 1 || true)"
             if [[ -n "$failure_stage" ]]; then
-              printf '::error title=OpenShield %s E2E failed::%s\n' \
-                "$BACKEND" "$failure_stage"
+              printf '::error title=OpenShield %s/%s E2E failed::%s\n' \
+                "$CLIENT_FAMILY" "$BACKEND" "$failure_stage"
             fi
           fi
           exit "$e2e_status"
@@ -404,14 +674,14 @@ jobs:
         if: ${{ failure() && steps.firewall_e2e.outcome == 'failure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-failure-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/openshield-e2e-${{ matrix.backend }}.log
+          name: e2e-failure-${{ matrix.family }}-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openshield-e2e-${{ matrix.family }}-${{ matrix.backend }}.log
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Publish GitHub Release
-    needs: [version, build, package, package-test, e2e]
+    needs: [version, build, build-tumbleweed, package, package-tumbleweed, package-test, e2e]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -444,6 +714,19 @@ jobs:
             }
             [[ ! -e "release/$archive" ]] || {
               echo "::error::Duplicate release archive: $archive"
+              exit 1
+            }
+            install -m 0644 "$source" "release/$archive"
+          done
+          for arch in amd64 i586 arm64 ppc64le s390x; do
+            archive="openshield-$VERSION-linux-tumbleweed-$arch.tar.xz"
+            source="binaries/binary-tumbleweed-$arch/$archive"
+            [[ -f "$source" && ! -L "$source" && -s "$source" ]] || {
+              echo "::error::Missing or unsafe Tumbleweed release archive: $archive"
+              exit 1
+            }
+            [[ ! -e "release/$archive" ]] || {
+              echo "::error::Duplicate Tumbleweed release archive: $archive"
               exit 1
             }
             install -m 0644 "$source" "release/$archive"

@@ -69,6 +69,8 @@ while IFS="$tab" read -r target architecture libc_name tier execution extra; do
         armv7-unknown-linux-musleabihf:armv7-hardfloat:musl:2:qemu-or-hardware | \
         aarch64-unknown-linux-gnu:arm64-aarch64:glibc:1:qemu-or-hardware | \
         aarch64-unknown-linux-musl:arm64-aarch64:musl:2:qemu-or-hardware | \
+        powerpc64le-unknown-linux-gnu:powerpc64le:glibc:2:qemu-or-hardware | \
+        s390x-unknown-linux-gnu:s390x:glibc:2:qemu-or-hardware | \
         riscv64gc-unknown-linux-gnu:riscv64-gc:glibc:2:qemu-or-hardware | \
         riscv64gc-unknown-linux-musl:riscv64-gc:musl:2:qemu-or-hardware | \
         riscv64a23-unknown-linux-gnu:riscv64-a23:glibc:2:qemu-or-hardware | \
@@ -115,6 +117,6 @@ while IFS="$tab" read -r target architecture libc_name tier execution extra; do
     fi
 done < "$matrix"
 
-[ "$count" -eq 23 ] || { printf 'expected 23 matrix rows, found %s\n' "$count" >&2; exit 1; }
+[ "$count" -eq 25 ] || { printf 'expected 25 matrix rows, found %s\n' "$count" >&2; exit 1; }
 printf 'targets: %s; checked: %s; skipped: %s; failures: %s\n' "$count" "$checked" "$skipped" "$failed"
 [ "$failed" -eq 0 ]

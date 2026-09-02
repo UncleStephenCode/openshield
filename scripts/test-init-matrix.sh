@@ -87,6 +87,21 @@ validate_sources() {
         /bin/sh -n "$shell_file"
     done
 
+    systemd_unit=$package_directory/daemon/openshield-daemon.service
+    expected_capabilities='CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH'
+    ambient_capabilities=$(sed -n 's/^AmbientCapabilities=//p' "$systemd_unit")
+    bounding_capabilities=$(sed -n 's/^CapabilityBoundingSet=//p' "$systemd_unit")
+    [ "$ambient_capabilities" = "$expected_capabilities" ] \
+        || fail 'systemd AmbientCapabilities is not the exact required capability set'
+    [ "$bounding_capabilities" = "$expected_capabilities" ] \
+        || fail 'systemd CapabilityBoundingSet is not the exact required capability set'
+    [ "$ambient_capabilities" = "$bounding_capabilities" ] \
+        || fail 'systemd ambient and bounding capability sets differ'
+    [ "$(sed -n 's/^User=//p' "$systemd_unit")" = root ] \
+        || fail 'systemd daemon user is not root'
+    [ "$(sed -n 's/^Group=//p' "$systemd_unit")" = openshield ] \
+        || fail 'systemd daemon effective group is not openshield'
+
     [ "$(sed -n '1p' "$package_directory/s6/openshield/type")" = longrun ] \
         || fail 's6 service type is not longrun'
     grep -q '^type = process$' "$package_directory/dinit/openshield" \

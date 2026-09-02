@@ -10,6 +10,9 @@ BIN_DIR="$REPO_ROOT/release-bin"
 OUT_DIR="$REPO_ROOT/dist"
 ROOT_DIR="$REPO_ROOT/.package-root"
 CONFIG="$REPO_ROOT/packaging/ci/nfpm.yaml"
+RPM_FIREWALL_DEPENDENCY='(nftables or iptables)'
+RPM_C_RUNTIME_DEPENDENCY=
+RPM_UNWIND_RUNTIME_DEPENDENCY=
 
 [[ -x "$BIN_DIR/openshield-daemon" ]] || { echo "missing $BIN_DIR/openshield-daemon" >&2; exit 2; }
 [[ -x "$BIN_DIR/openshield-tui" ]] || { echo "missing $BIN_DIR/openshield-tui" >&2; exit 2; }
@@ -48,6 +51,16 @@ case "$FAMILY" in
     PACKAGER=rpm
     PACKAGE_RELEASE=1.opensuse16
     ;;
+  tumbleweed)
+    INIT=systemd
+    PACKAGER=rpm
+    PACKAGE_RELEASE=1.tumbleweed
+    # These GNU binaries are dynamically linked. Unlike rpmbuild, nFPM does
+    # not discover their ELF dependencies, so name the official Tumbleweed
+    # runtime packages explicitly.
+    RPM_C_RUNTIME_DEPENDENCY=glibc
+    RPM_UNWIND_RUNTIME_DEPENDENCY=libgcc_s1
+    ;;
   arch)
     INIT=systemd
     PACKAGER=archlinux
@@ -61,7 +74,8 @@ esac
 
 "$REPO_ROOT/packaging/stage-install.sh" "$ROOT_DIR" "$INIT" "$BIN_DIR"
 
-export PACKAGE_RELEASE VERSION ARCH
+export PACKAGE_RELEASE RPM_C_RUNTIME_DEPENDENCY RPM_FIREWALL_DEPENDENCY
+export RPM_UNWIND_RUNTIME_DEPENDENCY VERSION ARCH
 
 (cd "$REPO_ROOT" && nfpm package --config "$CONFIG" --packager "$PACKAGER" --target "$OUT_DIR/")
 

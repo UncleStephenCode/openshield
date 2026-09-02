@@ -11,6 +11,15 @@ binary_directory=$2
 case "$backend" in nftables|iptables) ;; *) usage; exit 2 ;; esac
 case "$binary_directory" in /*) ;; *) printf '%s\n' 'binary directory must be absolute' >&2; exit 2 ;; esac
 [ -x "$binary_directory/openshield-daemon" ] || { printf '%s\n' 'missing daemon binary' >&2; exit 2; }
+client_family=${CLIENT_FAMILY:-debian}
+client_image=${CLIENT_IMAGE:-rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922}
+server_image=${SERVER_IMAGE:-python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285}
+case "$client_family" in debian|tumbleweed) ;; *) printf '%s\n' 'unsupported E2E client family' >&2; exit 2 ;; esac
+for image in "$client_image" "$server_image"; do
+    case "$image" in
+        ''|-*|*[!A-Za-z0-9._/:@-]*) printf '%s\n' 'unsafe E2E image' >&2; exit 2 ;;
+    esac
+done
 
 command -v docker >/dev/null 2>&1 || {
     printf '%s\n' 'docker is not installed' >&2
@@ -81,8 +90,18 @@ start_daemon() {
         log_file=$1
         pid_file=$2
         status_file=$3
+        exact_caps=$4
         temporary_status="${status_file}.tmp"
-        /opt/openshield/openshield-daemon >"$log_file" 2>&1 &
+        if [ "$exact_caps" = true ]; then
+            setpriv \
+                --regid openshield --clear-groups \
+                --bounding-set=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
+                --inh-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
+                --ambient-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
+                -- /opt/openshield/openshield-daemon >"$log_file" 2>&1 &
+        else
+            /opt/openshield/openshield-daemon >"$log_file" 2>&1 &
+        fi
         child_pid=$!
         printf "%s\n" "$child_pid" >"$pid_file"
         if wait "$child_pid"; then
@@ -94,7 +113,53 @@ start_daemon() {
         mv -f "$temporary_status" "$status_file"
         exit "$child_status"
     ' openshield-daemon-supervisor \
-        "$daemon_log" "$daemon_pid_file" "$daemon_exit_file"
+        "$daemon_log" "$daemon_pid_file" "$daemon_exit_file" \
+        "$use_exact_unit_capabilities"
+}
+
+install_fail_closed_preflight() {
+    docker exec "$client" /bin/sh -c '
+        log_file=$1
+        if ! setpriv \
+            --regid openshield --clear-groups \
+            --bounding-set=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
+            --inh-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
+            --ambient-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
+            -- /opt/openshield/openshield-daemon --install-fail-closed \
+            >"$log_file" 2>&1; then
+            cat "$log_file" >&2
+            exit 1
+        fi
+    ' openshield-fail-closed-preflight /tmp/openshield-preflight.log
+}
+
+assert_exact_unit_process_state() {
+    docker exec "$client" /bin/sh -c '
+        pid_file=$1
+        pid=$(cat "$pid_file")
+        case "$pid" in ""|*[!0-9]*) exit 1 ;; esac
+        status=/proc/$pid/status
+        expected_gid=$(getent group openshield | cut -d: -f3)
+        expected_caps=0000000000083004
+        [ -n "$expected_gid" ] && [ -r "$status" ]
+
+        set -- $(sed -n "s/^Uid:[[:space:]]*//p" "$status")
+        [ "$#" -eq 4 ] && [ "$1" = 0 ] && [ "$2" = 0 ] \
+            && [ "$3" = 0 ] && [ "$4" = 0 ]
+        set -- $(sed -n "s/^Gid:[[:space:]]*//p" "$status")
+        [ "$#" -eq 4 ] && [ "$1" = "$expected_gid" ] \
+            && [ "$2" = "$expected_gid" ] && [ "$3" = "$expected_gid" ] \
+            && [ "$4" = "$expected_gid" ]
+        [ -z "$(sed -n "s/^Groups:[[:space:]]*//p" "$status")" ]
+        [ "$(sed -n "s/^NoNewPrivs:[[:space:]]*//p" "$status")" = 1 ]
+        for field in CapInh CapPrm CapEff CapBnd CapAmb; do
+            value=$(sed -n "s/^$field:[[:space:]]*//p" "$status")
+            [ "$value" = "$expected_caps" ] || exit 1
+        done
+    ' openshield-unit-state "$daemon_pid_file" || {
+        printf '%s\n' 'daemon process does not match the packaged systemd identity and capabilities' >&2
+        return 1
+    }
 }
 
 wait_for_daemon_ready() {
@@ -205,37 +270,76 @@ server_id=$(docker create --name "$server_name" --label "$resource_label" --netw
     --read-only --cap-drop ALL --security-opt no-new-privileges \
     --security-opt label=disable \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
-    python:3.13-slim python3 -m http.server 18081 --bind 0.0.0.0)
+    "$server_image" python3 -m http.server 18081 --bind 0.0.0.0)
 docker start "$server_id" >/dev/null
 
 client_id=$(docker create --name "$client_name" --label "$resource_label" --network "$network_id" \
-    --cap-add NET_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH \
+    --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH \
     --security-opt no-new-privileges --security-opt label=disable \
     --env PYTHONDONTWRITEBYTECODE=1 \
     --mount "type=bind,src=$binary_directory,dst=/opt/openshield,readonly" \
     --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
-    rust:1.98.0-bookworm sleep infinity)
+    "$client_image" sleep infinity)
 docker start "$client_id" >/dev/null
 client=$client_id
 server=$server_id
 
 begin_stage 'provision firewall client'
-if [ "$backend" = nftables ]; then
-    packages='nftables curl netcat-openbsd python3 passwd util-linux'
-else
-    packages='iptables curl netcat-openbsd python3 passwd util-linux'
-fi
-docker exec "$client" apt-get update >/dev/null
-# shellcheck disable=SC2086
-docker exec "$client" apt-get install -y --no-install-recommends $packages >/dev/null
+use_exact_unit_capabilities=true
+case "$client_family" in
+    debian)
+        if [ "$backend" = nftables ]; then
+            # Install both frontends: selecting nftables must demonstrate
+            # preference, not just the absence of the compatibility backend.
+            packages='nftables iptables curl netcat-openbsd python3 passwd util-linux'
+        else
+            packages='iptables curl netcat-openbsd python3 passwd util-linux'
+        fi
+        docker exec "$client" apt-get update >/dev/null
+        # shellcheck disable=SC2086
+        docker exec "$client" apt-get install -y --no-install-recommends $packages >/dev/null
+        ;;
+    tumbleweed)
+        if [ "$backend" = nftables ]; then
+            # Keep legacy xtables installed so nftables activation exercises
+            # alternate-backend inspection with the exact systemd capability set.
+            packages='nftables iptables curl netcat-openbsd python3 shadow util-linux'
+        else
+            packages='iptables curl netcat-openbsd python3 shadow util-linux'
+        fi
+        # shellcheck disable=SC2086
+        docker exec "$client" zypper --non-interactive install $packages >/dev/null
+        ;;
+esac
 docker exec "$client" groupadd --system openshield
 docker exec "$client" useradd --system --no-create-home --shell /usr/sbin/nologin observer
 docker exec "$client" useradd --system --no-create-home --shell /usr/sbin/nologin outsider
 docker exec "$client" usermod --append --groups openshield observer
 
+if [ "$backend" = nftables ]; then
+    docker exec "$client" sh -c \
+        'command -v nft >/dev/null && command -v iptables-save >/dev/null' || {
+        printf '%s\n' 'nftables preference scenario does not have both backends installed' >&2
+        exit 1
+    }
+else
+    if docker exec "$client" sh -c 'command -v nft >/dev/null'; then
+        printf '%s\n' 'iptables fallback scenario unexpectedly has nftables installed' >&2
+        exit 1
+    fi
+    docker exec "$client" sh -c 'command -v iptables-save >/dev/null' || {
+        printf '%s\n' 'iptables fallback scenario has no xtables frontend' >&2
+        exit 1
+    }
+fi
+
+begin_stage 'install systemd-equivalent fail-closed preflight'
+install_fail_closed_preflight
+
 begin_stage 'start daemon and select backend'
 start_daemon /tmp/openshield.log
 wait_for_daemon_ready /tmp/openshield.log 'initial daemon'
+assert_exact_unit_process_state
 if [ "$backend" = nftables ]; then
     expected_backend=nftables
 else
@@ -247,6 +351,12 @@ docker exec "$client" grep -Fq "firewall_backend=\"$expected_backend\"" \
         printf 'daemon did not select expected backend: %s\n' "$expected_backend" >&2
         exit 1
     }
+observer_gid=$(docker exec "$client" getent group openshield | cut -d: -f3)
+socket_gid=$(docker exec "$client" stat -c '%g' /run/openshield/observe.sock)
+[ -n "$observer_gid" ] && [ "$socket_gid" = "$observer_gid" ] || {
+    printf '%s\n' 'observation socket does not have the openshield group' >&2
+    exit 1
+}
 
 begin_stage 'verify IPC access control'
 status=$(docker exec "$client" python3 /opt/ipc_client.py status)
@@ -472,6 +582,7 @@ fi
 begin_stage 'restart with persisted policy'
 start_daemon /tmp/openshield-restart.log
 wait_for_daemon_ready /tmp/openshield-restart.log 'restarted daemon'
+assert_exact_unit_process_state
 status=$(docker exec "$client" python3 /opt/ipc_client.py status)
 case "$status" in *'"mode": "enforcing"'*) ;; *) printf 'unexpected restart status: %s\n' "$status" >&2; exit 1 ;; esac
 docker exec "$client" curl --fail --silent --show-error --max-time 5 \
