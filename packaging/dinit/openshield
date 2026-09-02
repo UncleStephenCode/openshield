@@ -1,0 +1,5 @@
+type = process
+command = /usr/bin/openshield-daemon
+restart = true
+restart-delay = 2
+depends-on: openshield-preflight

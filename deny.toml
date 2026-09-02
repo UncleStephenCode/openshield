@@ -1,0 +1,20 @@
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "GPL-3.0-only",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"

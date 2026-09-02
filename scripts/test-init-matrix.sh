@@ -1,0 +1,351 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+usage() {
+    printf '%s\n' \
+        'usage: scripts/test-init-matrix.sh validate' \
+        '       scripts/test-init-matrix.sh manifests' \
+        '       scripts/test-init-matrix.sh containers' \
+        '       scripts/test-init-matrix.sh containers-clean'
+}
+
+mode=${1:-}
+case "$mode" in
+    validate|manifests|containers|containers-clean)
+        [ "$#" -eq 1 ] || { usage >&2; exit 2; }
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+repository_directory=$(CDPATH= cd -- "$script_directory/.." && pwd -P)
+package_directory=$repository_directory/packaging
+fixture_directory=$repository_directory/tests/compat
+
+temporary_directory=$(mktemp -d /tmp/openshield-init-matrix.XXXXXX)
+new_images=$temporary_directory/new-images
+: > "$new_images"
+clean_images=false
+[ "$mode" = containers-clean ] && clean_images=true
+
+cleanup() {
+    if [ "$clean_images" = true ] && command -v docker >/dev/null 2>&1; then
+        while IFS= read -r cleanup_image; do
+            [ -n "$cleanup_image" ] || continue
+            docker image rm "$cleanup_image" >/dev/null 2>&1 \
+                || printf 'WARN image cleanup failed: %s\n' "$cleanup_image" >&2
+        done < "$new_images"
+    fi
+    case "$temporary_directory" in
+        /tmp/openshield-init-matrix.*)
+            rm -rf -- "$temporary_directory"
+            ;;
+        *)
+            printf 'refusing unsafe temporary cleanup: %s\n' "$temporary_directory" >&2
+            ;;
+    esac
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+    printf 'FAIL %s\n' "$*" >&2
+    exit 1
+}
+
+expect_file() {
+    [ -f "$1" ] || fail "missing staged file: $1"
+}
+
+expect_executable() {
+    [ -f "$1" ] && [ -x "$1" ] || fail "staged file is not executable: $1"
+}
+
+validate_sources() {
+    for shell_file in \
+        "$package_directory/ensure-group.sh" \
+        "$package_directory/stage-install.sh" \
+        "$package_directory/openrc/openshield" \
+        "$package_directory/sysvinit/openshield" \
+        "$package_directory/runit/openshield/run" \
+        "$package_directory/runit/openshield/finish" \
+        "$package_directory/runit/openshield/check" \
+        "$package_directory/s6/openshield/run" \
+        "$package_directory/s6/openshield/finish" \
+        "$package_directory/dinit/dinit-preflight" \
+        "$fixture_directory/init-stub-daemon.sh" \
+        "$fixture_directory/init-stub-group.sh"
+    do
+        /bin/sh -n "$shell_file"
+    done
+
+    [ "$(sed -n '1p' "$package_directory/s6/openshield/type")" = longrun ] \
+        || fail 's6 service type is not longrun'
+    grep -q '^type = process$' "$package_directory/dinit/openshield" \
+        || fail 'dinit daemon is not a process service'
+    grep -q '^type = scripted$' "$package_directory/dinit/openshield-preflight" \
+        || fail 'dinit preflight is not a scripted service'
+    grep -q '^stop-command = /usr/bin/openshield-daemon --install-fail-closed$' \
+        "$package_directory/dinit/openshield-preflight" \
+        || fail 'dinit stop path is not fail-closed'
+    grep -q '^[[:space:]]*before net$' "$package_directory/openrc/openshield" \
+        || fail 'OpenRC service is not ordered before net'
+
+    binary_directory=$temporary_directory/bin
+    install -d -m 0755 "$binary_directory"
+    install -m 0755 /bin/true "$binary_directory/openshield-daemon"
+    install -m 0755 /bin/true "$binary_directory/openshield-tui"
+
+    for init_system in systemd openrc sysvinit runit s6 dinit; do
+        destination=$temporary_directory/stage-$init_system
+        install -d -m 0755 "$destination"
+        "$package_directory/stage-install.sh" "$destination" "$init_system" "$binary_directory" \
+            >/dev/null
+        expect_executable "$destination/usr/bin/openshield-daemon"
+        expect_executable "$destination/usr/bin/openshield-tui"
+        expect_executable "$destination/usr/libexec/openshield/ensure-group"
+        expect_file "$destination/usr/share/openshield/LICENSE"
+        case "$init_system" in
+            systemd)
+                expect_file "$destination/usr/lib/systemd/system/openshield-daemon.service"
+                expect_file "$destination/usr/lib/sysusers.d/openshield.conf"
+                ;;
+            openrc|sysvinit)
+                expect_executable "$destination/etc/init.d/openshield"
+                ;;
+            runit)
+                expect_executable "$destination/etc/sv/openshield/run"
+                expect_executable "$destination/etc/sv/openshield/finish"
+                expect_executable "$destination/etc/sv/openshield/check"
+                ;;
+            s6)
+                expect_executable "$destination/etc/s6/sv/openshield/run"
+                expect_executable "$destination/etc/s6/sv/openshield/finish"
+                expect_file "$destination/etc/s6/sv/openshield/type"
+                expect_file "$destination/etc/s6/sv/openshield/timeout-kill"
+                expect_file "$destination/etc/s6/sv/openshield/timeout-finish"
+                expect_file "$destination/etc/s6/sv/openshield/dependencies.d/mount-filesystems"
+                ;;
+            dinit)
+                expect_file "$destination/etc/dinit.d/openshield"
+                expect_file "$destination/etc/dinit.d/openshield-preflight"
+                expect_executable "$destination/usr/libexec/openshield/dinit-preflight"
+                ;;
+        esac
+    done
+
+    redirect_target=$temporary_directory/redirect-target
+    redirect_destination=$temporary_directory/redirect-destination
+    install -d -m 0755 "$redirect_target"
+    ln -s "$redirect_target" "$redirect_destination"
+    if "$package_directory/stage-install.sh" "$redirect_destination" openrc "$binary_directory" \
+        >/dev/null 2>&1; then
+        fail 'stage installer accepted a symbolic-link DESTDIR'
+    fi
+
+    tainted_destination=$temporary_directory/tainted-destination
+    install -d -m 0755 "$tainted_destination"
+    ln -s "$redirect_target" "$tainted_destination/redirect"
+    if "$package_directory/stage-install.sh" "$tainted_destination" openrc "$binary_directory" \
+        >/dev/null 2>&1; then
+        fail 'stage installer accepted a symlink inside DESTDIR'
+    fi
+
+    writable_destination=$temporary_directory/writable-destination
+    install -d -m 0755 "$writable_destination"
+    install -d -m 0777 "$writable_destination/untrusted"
+    if "$package_directory/stage-install.sh" "$writable_destination" openrc "$binary_directory" \
+        >/dev/null 2>&1; then
+        fail 'stage installer accepted a writable directory inside DESTDIR'
+    fi
+
+    linked_destination=$temporary_directory/linked-destination
+    linked_target=$temporary_directory/linked-target
+    install -d -m 0755 "$linked_destination"
+    : > "$linked_target"
+    ln "$linked_target" "$linked_destination/prepared-hardlink"
+    if "$package_directory/stage-install.sh" "$linked_destination" openrc "$binary_directory" \
+        >/dev/null 2>&1; then
+        fail 'stage installer accepted a multiply-linked file inside DESTDIR'
+    fi
+
+    printf '%s\n' \
+        'PASS static: shell syntax, staged layouts, modes, and unsafe-tree rejection'
+}
+
+require_local_docker() {
+    command -v docker >/dev/null 2>&1 || fail 'docker is not installed'
+    docker_host=$(docker context inspect --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null) \
+        || fail 'cannot inspect the active Docker context'
+    case "$docker_host" in
+        unix:///*) ;;
+        *) fail "refusing non-local Docker endpoint: $docker_host" ;;
+    esac
+}
+
+record_new_images() {
+    for container_image in \
+        alpine:3.22 \
+        devuan/devuan:daedalus \
+        voidlinux/voidlinux:latest \
+        artixlinux/artixlinux:base-openrc \
+        artixlinux/artixlinux:base-s6 \
+        artixlinux/artixlinux:base-dinit
+    do
+        docker image inspect "$container_image" >/dev/null 2>&1 \
+            || printf '%s\n' "$container_image" >> "$new_images"
+    done
+}
+
+check_manifests() {
+    require_local_docker
+    manifest_failures=0
+    for container_image in \
+        alpine:3.22 \
+        devuan/devuan:daedalus \
+        voidlinux/voidlinux:latest \
+        artixlinux/artixlinux:base-openrc \
+        artixlinux/artixlinux:base-s6 \
+        artixlinux/artixlinux:base-dinit
+    do
+        if docker buildx imagetools inspect "$container_image" >/dev/null 2>&1; then
+            printf 'PASS manifest: %s\n' "$container_image"
+        else
+            printf 'FAIL manifest: %s\n' "$container_image" >&2
+            manifest_failures=$((manifest_failures + 1))
+        fi
+    done
+    [ "$manifest_failures" -eq 0 ] || fail "$manifest_failures init images unavailable"
+}
+
+run_container_checks() {
+    require_local_docker
+    record_new_images
+
+    # These two overlays are intentionally writable: groupadd/addgroup must
+    # update their own ephemeral /etc.  They have no network or host mounts
+    # other than the read-only helper under test.
+    docker run --rm --network none --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --mount "type=bind,src=$package_directory,dst=/pkg,readonly" \
+        --mount "type=bind,src=$repository_directory/LICENSE,dst=/LICENSE,readonly" \
+        alpine:3.22 /bin/sh -ec \
+        'for script in /pkg/ensure-group.sh /pkg/stage-install.sh /pkg/openrc/openshield /pkg/sysvinit/openshield /pkg/runit/openshield/run /pkg/runit/openshield/finish /pkg/runit/openshield/check /pkg/s6/openshield/run /pkg/s6/openshield/finish /pkg/dinit/dinit-preflight; do /bin/sh -n "$script"; done; /bin/sh /pkg/ensure-group.sh; /bin/sh /pkg/ensure-group.sh; getent group openshield >/dev/null; install -d -m 0755 /tmp/bin /tmp/stage; install -m 0755 /bin/true /tmp/bin/openshield-daemon; install -m 0755 /bin/true /tmp/bin/openshield-tui; /bin/sh /pkg/stage-install.sh /tmp/stage openrc /tmp/bin >/dev/null; test -x /tmp/stage/etc/init.d/openshield'
+    printf '%s\n' \
+        'PASS runtime: Alpine/BusyBox parsed scripts, staged safely, and kept addgroup idempotent'
+
+    docker run --rm --network none --cap-drop ALL \
+        --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --mount "type=bind,src=$package_directory/ensure-group.sh,dst=/test/ensure-group,readonly" \
+        devuan/devuan:daedalus /bin/sh -ec \
+        '/bin/sh /test/ensure-group; /bin/sh /test/ensure-group; getent group openshield >/dev/null'
+    printf '%s\n' 'PASS runtime: Devuan/shadow groupadd is idempotent in an isolated overlay'
+
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --tmpfs /etc/init.d:rw,exec,nosuid,nodev,mode=0755 \
+        --mount "type=bind,src=$temporary_directory/stage-openrc/etc/init.d/openshield,dst=/staged/openshield,readonly" \
+        artixlinux/artixlinux:base-openrc /bin/sh -ec \
+        'cp /staged/openshield /etc/init.d/openshield; chmod 0755 /etc/init.d/openshield; /etc/init.d/openshield describe >/dev/null'
+    printf '%s\n' 'PASS parser: Artix OpenRC loaded the service without running the firewall'
+
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --tmpfs /run:rw,nosuid,nodev,mode=0755 \
+        --mount "type=bind,src=$temporary_directory/stage-sysvinit/etc/init.d/openshield,dst=/staged/openshield,readonly" \
+        devuan/devuan:daedalus /bin/sh -ec \
+        '/bin/sh -n /staged/openshield; start-stop-daemon --start --test --quiet --background --make-pidfile --pidfile /run/openshield-test.pid --exec /bin/true --startas /bin/true; sleep 30 & service_pid=$!; printf "%s\n" "$service_pid" > /run/openshield-test.pid; start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/sleep >/dev/null; if start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/false >/dev/null 2>&1; then exit 1; fi; kill "$service_pid"; wait "$service_pid" 2>/dev/null || true'
+    printf '%s\n' 'PASS runtime: Devuan accepted SysV options and rejected a mismatched PID executable'
+
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --tmpfs /service:rw,exec,nosuid,nodev,mode=0755 \
+        --tmpfs /run:rw,exec,nosuid,nodev,mode=0755 \
+        --tmpfs /var/lib/openshield:rw,nosuid,nodev,mode=0700 \
+        --mount "type=bind,src=$temporary_directory/stage-runit/etc/sv/openshield,dst=/pkgservice,readonly" \
+        --mount "type=bind,src=$fixture_directory/init-stub-daemon.sh,dst=/usr/bin/openshield-daemon,readonly" \
+        --mount "type=bind,src=$fixture_directory/init-stub-group.sh,dst=/usr/libexec/openshield/ensure-group,readonly" \
+        voidlinux/voidlinux:latest /bin/sh -ec '
+            cp -R /pkgservice/. /service/
+            chmod 0755 /service/run /service/finish /service/check
+            runsv /service & supervisor=$!
+            count=0
+            while [ ! -s /service/supervise/pid ] && [ "$count" -lt 50 ]; do sleep 0.1; count=$((count + 1)); done
+            [ -s /service/supervise/pid ]
+            grep -q "^run$" /run/openshield-init-stub.log
+            sv -w 5 down /service
+            preflights=$(grep -c "^preflight$" /run/openshield-init-stub.log)
+            [ "$preflights" -ge 2 ]
+            sv exit /service
+            wait "$supervisor"
+        '
+    printf '%s\n' 'PASS runtime: Void runit executed preflight, daemon lifecycle, and finish quarantine'
+
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --tmpfs /work:rw,exec,nosuid,nodev,mode=0755 \
+        --mount "type=bind,src=$temporary_directory/stage-s6/etc/s6/sv/openshield,dst=/staged-openshield,readonly" \
+        artixlinux/artixlinux:base-s6 /bin/sh -ec \
+        'mkdir -p /work/source/mount-filesystems; printf "oneshot\n" > /work/source/mount-filesystems/type; printf "#!/bin/sh\nexit 0\n" > /work/source/mount-filesystems/up; chmod 0755 /work/source/mount-filesystems/up; cp -R /staged-openshield /work/source/openshield; s6-rc-compile /work/compiled /work/source; s6-rc-db -c /work/compiled dependencies openshield | grep -qx mount-filesystems'
+    printf '%s\n' 'PASS parser: Artix s6-rc compiled OpenShield as a longrun service'
+
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --tmpfs /service:rw,exec,nosuid,nodev,mode=0755 \
+        --tmpfs /run:rw,exec,nosuid,nodev,mode=0755 \
+        --tmpfs /var/lib/openshield:rw,nosuid,nodev,mode=0700 \
+        --mount "type=bind,src=$temporary_directory/stage-s6/etc/s6/sv/openshield,dst=/pkgservice,readonly" \
+        --mount "type=bind,src=$fixture_directory/init-stub-daemon.sh,dst=/usr/bin/openshield-daemon,readonly" \
+        --mount "type=bind,src=$fixture_directory/init-stub-group.sh,dst=/usr/libexec/openshield/ensure-group,readonly" \
+        artixlinux/artixlinux:base-s6 /bin/sh -ec '
+            cp -R /pkgservice/. /service/
+            chmod 0755 /service/run /service/finish
+            s6-supervise /service & supervisor=$!
+            s6-svwait -u -t 5000 /service
+            count=0
+            while ! grep -q "^run$" /run/openshield-init-stub.log 2>/dev/null && [ "$count" -lt 50 ]; do sleep 0.1; count=$((count + 1)); done
+            grep -q "^run$" /run/openshield-init-stub.log
+            s6-svc -d /service
+            s6-svwait -d -t 5000 /service
+            count=0
+            preflights=$(grep -c "^preflight$" /run/openshield-init-stub.log)
+            while [ "$preflights" -lt 2 ] && [ "$count" -lt 50 ]; do sleep 0.1; count=$((count + 1)); preflights=$(grep -c "^preflight$" /run/openshield-init-stub.log); done
+            [ "$preflights" -ge 2 ]
+            s6-svc -x /service
+            wait "$supervisor"
+        '
+    printf '%s\n' 'PASS runtime: Artix s6 executed preflight, daemon lifecycle, and finish quarantine'
+
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --security-opt label=disable \
+        --mount "type=bind,src=$temporary_directory/stage-dinit/etc/dinit.d,dst=/staged-dinit,readonly" \
+        --mount type=bind,src=/bin/true,dst=/usr/bin/openshield-daemon,readonly \
+        --mount "type=bind,src=$temporary_directory/stage-dinit/usr/libexec/openshield/dinit-preflight,dst=/usr/libexec/openshield/dinit-preflight,readonly" \
+        artixlinux/artixlinux:base-dinit /usr/sbin/dinit-check \
+        --services-dir /staged-dinit openshield
+    printf '%s\n' 'PASS parser: Artix dinit-check found no service-description problems'
+
+    printf '%s\n' 'NOTE real firewall/backend startup is intentionally outside this init parser/supervisor test'
+}
+
+case "$mode" in
+    validate)
+        validate_sources
+        ;;
+    manifests)
+        check_manifests
+        ;;
+    containers|containers-clean)
+        validate_sources
+        run_container_checks
+        ;;
+esac

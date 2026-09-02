@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+install -d -o root -g root -m 0755 /run/openshield
+/usr/bin/openshield-daemon --install-fail-closed
+install -d -o root -g root -m 0700 /var/lib/openshield
+/usr/libexec/openshield/ensure-group
+exec /usr/bin/openshield-daemon

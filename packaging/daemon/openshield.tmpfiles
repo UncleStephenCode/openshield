@@ -1,0 +1,3 @@
+# The systemd unit exposes only this file, not writable access to all of /run.
+# Type f creates an absent file without truncating an existing xtables lock.
+f /run/xtables.lock 0600 root root -

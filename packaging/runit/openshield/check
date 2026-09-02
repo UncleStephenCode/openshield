@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+# runit's `sv` command uses this probe as its readiness boundary.  Both
+# endpoints are created only after the kernel policy and NFQUEUE consumer are
+# active; merely observing a live process is not sufficient.
+[ -S /run/openshield/control.sock ]
+[ -S /run/openshield/observe.sock ]

@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+
+PATH=/usr/lib/openrc/bin:/lib/rc/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+name="OpenShield firewall daemon"
+description="Application-aware OpenShield firewall"
+command="/usr/bin/openshield-daemon"
+command_background="yes"
+pidfile="/run/openshield/daemon.pid"
+retry="TERM/10/KILL/5"
+
+depend() {
+    need localmount
+    before net
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0755 /run/openshield
+    # Close the packet path before evaluating any other mutable host
+    # prerequisite.  Unsafe state storage or a missing group helper must leave
+    # the machine closed.
+    /usr/bin/openshield-daemon --install-fail-closed
+    checkpath --directory --owner root:root --mode 0700 /var/lib/openshield
+    /usr/libexec/openshield/ensure-group
+}
+
+stop_post() {
+    /usr/bin/openshield-daemon --install-fail-closed
+}

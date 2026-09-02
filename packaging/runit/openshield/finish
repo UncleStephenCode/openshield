@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+# runsv invokes finish only after the supervised daemon has released its
+# singleton lock. Keep the host closed while runsv applies its restart delay.
+/usr/bin/openshield-daemon --install-fail-closed
