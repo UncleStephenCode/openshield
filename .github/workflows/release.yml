@@ -1,0 +1,336 @@
+name: Release packages
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: v2.43.4
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - id: version
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="$REQUESTED_TAG"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::Tag must look like vX.Y.Z"
+            exit 1
+          }
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION="$(awk '
+            /^\[workspace.package\]/ { in_section=1; next }
+            /^\[/ { in_section=0 }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/\"/, "", $3); print $3; exit
+            }
+          ' Cargo.toml)"
+          [[ -n "$CARGO_VERSION" ]] || { echo "::error::Cannot read workspace package version"; exit 1; }
+          [[ "$TAG_VERSION" == "$CARGO_VERSION" ]] || {
+            echo "::error::Tag $TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          }
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Release quality gate
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+      - run: scripts/test-init-matrix.sh validate
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [version, quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p openshield-daemon -p openshield-tui
+
+      - name: Stage binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 "target/${{ matrix.target }}/release/openshield-daemon" dist/openshield-daemon
+          install -m 0755 "target/${{ matrix.target }}/release/openshield-tui" dist/openshield-tui
+          file dist/*
+          ./dist/openshield-daemon --version
+          ./dist/openshield-tui --version
+          tar -C dist -cJf "openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz" \
+            openshield-daemon openshield-tui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: |
+            dist/openshield-daemon
+            dist/openshield-tui
+            openshield-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package ${{ matrix.family }} / ${{ matrix.arch }}
+    needs: [version, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: deb
+            arch: amd64
+          - family: deb
+            arch: arm64
+          - family: fedora
+            arch: amd64
+          - family: fedora
+            arch: arm64
+          - family: el9
+            arch: amd64
+          - family: el9
+            arch: arm64
+          - family: el10
+            arch: amd64
+          - family: el10
+            arch: arm64
+          - family: opensuse
+            arch: amd64
+          - family: opensuse
+            arch: arm64
+          - family: alpine
+            arch: amd64
+          - family: alpine
+            arch: arm64
+          - family: arch
+            arch: amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: release-artifact
+
+      - name: Prepare binaries
+        run: |
+          mkdir -p release-bin
+          install -m 0755 release-artifact/openshield-daemon release-bin/openshield-daemon
+          install -m 0755 release-artifact/openshield-tui release-bin/openshield-tui
+
+      - name: Install nFPM
+        env:
+          VERSION: ${{ env.NFPM_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          FAMILY: ${{ matrix.family }}
+        run: packaging/ci/scripts/build-release-package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.family }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  package-test:
+    name: Test ${{ matrix.name }} package
+    needs: [version, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 12
+            family: deb
+            arch: amd64
+            image: debian:12
+          - name: Debian 13
+            family: deb
+            arch: amd64
+            image: debian:13
+          - name: Ubuntu 22.04
+            family: deb
+            arch: amd64
+            image: ubuntu:22.04
+          - name: Ubuntu 24.04
+            family: deb
+            arch: amd64
+            image: ubuntu:24.04
+          - name: Ubuntu 26.04
+            family: deb
+            arch: amd64
+            image: ubuntu:26.04
+          - name: Fedora 43
+            family: fedora
+            arch: amd64
+            image: fedora:43
+          - name: Fedora 44
+            family: fedora
+            arch: amd64
+            image: fedora:44
+          - name: Rocky 9
+            family: el9
+            arch: amd64
+            image: rockylinux:9
+          - name: AlmaLinux 9
+            family: el9
+            arch: amd64
+            image: almalinux:9
+          - name: Rocky 10
+            family: el10
+            arch: amd64
+            image: rockylinux:10
+          - name: AlmaLinux 10
+            family: el10
+            arch: amd64
+            image: almalinux:10
+          - name: openSUSE Leap 16.0
+            family: opensuse
+            arch: amd64
+            image: opensuse/leap:16.0
+          - name: Alpine 3.23
+            family: alpine
+            arch: amd64
+            image: alpine:3.23
+          - name: Alpine 3.24
+            family: alpine
+            arch: amd64
+            image: alpine:3.24
+          - name: Arch Linux
+            family: arch
+            arch: amd64
+            image: archlinux:base
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-${{ matrix.family }}-${{ matrix.arch }}
+          path: dist
+      - name: Install and smoke-test package
+        env:
+          FAMILY: ${{ matrix.family }}
+          IMAGE: ${{ matrix.image }}
+        run: packaging/ci/scripts/test-release-package.sh
+
+  e2e:
+    name: Firewall E2E
+    needs: [version, quality]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - name: Run isolated firewall E2E
+        run: tests/e2e/server-learning-enforcing.sh
+
+  release:
+    name: Publish GitHub Release
+    needs: [version, build, package, package-test, e2e]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: release
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+          merge-multiple: true
+      - name: Collect archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find binaries -maxdepth 1 -type f -name '*.tar.xz' -exec cp {} release/ \;
+          cd release
+          sha256sum * | sort -k2 > SHA256SUMS
+          ls -lah
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.version.outputs.tag }}" release/* \
+            --verify-tag \
+            --generate-notes \
+            --title "OpenShield ${{ needs.version.outputs.tag }}"

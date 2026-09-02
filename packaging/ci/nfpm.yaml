@@ -1,0 +1,34 @@
+name: openshield
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: ${PACKAGE_RELEASE}
+section: net
+priority: optional
+maintainer: OpenShield developers
+vendor: OpenShield
+homepage: https://github.com/UncleStephenCode/openshield
+license: GPL-3.0-only
+description: Application-aware Linux host firewall written in Rust.
+
+contents:
+  - src: ${PACKAGE_ROOT}/
+    dst: /
+
+scripts:
+  postinstall: ${POSTINSTALL}
+
+overrides:
+  deb:
+    depends:
+      - nftables | iptables
+  rpm:
+    depends:
+      - nftables
+  apk:
+    depends:
+      - nftables
+  archlinux:
+    depends:
+      - nftables
