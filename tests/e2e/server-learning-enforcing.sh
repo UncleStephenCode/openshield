@@ -94,7 +94,7 @@ start_daemon() {
         temporary_status="${status_file}.tmp"
         if [ "$exact_caps" = true ]; then
             setpriv \
-                --regid openshield --clear-groups \
+                --regid root --groups openshield \
                 --bounding-set=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
                 --inh-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
                 --ambient-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
@@ -121,7 +121,7 @@ install_fail_closed_preflight() {
     docker exec "$client" /bin/sh -c '
         log_file=$1
         if ! setpriv \
-            --regid openshield --clear-groups \
+            --regid root --groups openshield \
             --bounding-set=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
             --inh-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
             --ambient-caps=-all,+net_admin,+net_raw,+sys_ptrace,+dac_read_search \
@@ -139,18 +139,18 @@ assert_exact_unit_process_state() {
         pid=$(cat "$pid_file")
         case "$pid" in ""|*[!0-9]*) exit 1 ;; esac
         status=/proc/$pid/status
-        expected_gid=$(getent group openshield | cut -d: -f3)
+        observer_gid=$(getent group openshield | cut -d: -f3)
         expected_caps=0000000000083004
-        [ -n "$expected_gid" ] && [ -r "$status" ]
+        [ -n "$observer_gid" ] && [ -r "$status" ]
 
         set -- $(sed -n "s/^Uid:[[:space:]]*//p" "$status")
         [ "$#" -eq 4 ] && [ "$1" = 0 ] && [ "$2" = 0 ] \
             && [ "$3" = 0 ] && [ "$4" = 0 ]
         set -- $(sed -n "s/^Gid:[[:space:]]*//p" "$status")
-        [ "$#" -eq 4 ] && [ "$1" = "$expected_gid" ] \
-            && [ "$2" = "$expected_gid" ] && [ "$3" = "$expected_gid" ] \
-            && [ "$4" = "$expected_gid" ]
-        [ -z "$(sed -n "s/^Groups:[[:space:]]*//p" "$status")" ]
+        [ "$#" -eq 4 ] && [ "$1" = 0 ] && [ "$2" = 0 ] \
+            && [ "$3" = 0 ] && [ "$4" = 0 ]
+        set -- $(sed -n "s/^Groups:[[:space:]]*//p" "$status")
+        [ "$#" -eq 1 ] && [ "$1" = "$observer_gid" ]
         [ "$(sed -n "s/^NoNewPrivs:[[:space:]]*//p" "$status")" = 1 ]
         for field in CapInh CapPrm CapEff CapBnd CapAmb; do
             value=$(sed -n "s/^$field:[[:space:]]*//p" "$status")

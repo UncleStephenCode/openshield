@@ -1,3 +1,12 @@
+# The service's primary group remains root. Adjust and relabel only these
+# directories, never their state/lock/socket contents recursively.
+d /run/openshield 0755 root root -
+z /run/openshield 0755 root root -
+d /var/lib/openshield 0700 root root -
+z /var/lib/openshield 0700 root root -
+
 # The systemd unit exposes only this file, not writable access to all of /run.
-# Type f creates an absent file without truncating an existing xtables lock.
+# Type f creates an absent file without truncating an existing xtables lock;
+# type z restores the distribution's SELinux context without disabling policy.
 f /run/xtables.lock 0600 root root -
+z /run/xtables.lock 0600 root root -

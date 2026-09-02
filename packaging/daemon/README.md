@@ -28,6 +28,11 @@ while an iptables-only installation remains valid when nftables is unavailable
 or recommendations are disabled. At runtime OpenShield still selects nftables
 first and uses `iptables`/`ip6tables` only as its fallback.
 
+Every RPM also requires `/usr/bin/systemd-tmpfiles`. The path dependency lets
+the distribution select its native provider, including `systemd-mini` where
+available, and guarantees that the post-install script can create and relabel
+the exact runtime paths before the first manual start.
+
 The Tumbleweed-specific GNU RPMs for `x86_64`, `i586`, `aarch64`, `ppc64le`,
 and `s390x` are dynamically linked. They additionally require the official
 Tumbleweed `glibc` and `libgcc_s1` runtime packages. These dependencies are not
@@ -37,6 +42,8 @@ added to the separate static-musl RPM builds.
 
 The service creates or verifies:
 
+- `/run/openshield`, pre-created by tmpfiles as `root:root` and `0755`;
+- `/var/lib/openshield`, pre-created by tmpfiles as `root:root` and `0700`;
 - `/run/openshield/control.sock`, owned by UID 0 and mode `0600`, for UID-0
   mutation (its group is intentionally irrelevant at that mode);
 - `/run/openshield/observe.sock`, `root:openshield` and `0660`, for read-only
@@ -58,9 +65,11 @@ because both old and new xtables implementations default to that shared lock;
 using a private lock would stop OpenShield from serializing with other xtables
 processes. The daemon clears the environment of firewall subprocesses, so a
 service-level `XTABLES_LOCKFILE` override is intentionally not part of this
-contract. The tmpfiles rule does not truncate an existing lock and never grants
-group write access. Packages must create it before the first manual service
-start; at boot the unit is ordered after and requires
+contract. The tmpfiles rules adjust and relabel only the two exact directories
+and the exact lock path, never their contents recursively. They do not truncate
+an existing lock or grant group write access. Packages must apply the
+declaration before the first manual service start; at boot the unit is ordered
+after and requires
 `systemd-tmpfiles-setup.service`.
 
 ## Startup and shutdown boundary
@@ -91,8 +100,12 @@ metadata, and locks the same persistent inode before state or firewall changes.
 
 ## Privileges and hardening
 
-The service runs with UID 0 and effective group `openshield`; this gives a new
-observation socket the required GID without retaining `CAP_CHOWN`. It retains
+The service runs with UID 0 and primary group `root`, and explicitly adds the
+supplementary group `openshield`. As the socket owner it may assign that group
+to the observation socket without retaining `CAP_CHOWN`. Keeping `Group=root`
+and managing the directories with non-recursive tmpfiles rules prevents systemd
+from changing preserved runtime locks or persistent state before exec. The
+service retains
 `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Legacy xtables requires
 `CAP_NET_RAW` to open the raw IPv4/IPv6 sockets used for alternate-backend
 inspection and fallback operation. The last two capabilities are needed to
@@ -104,6 +117,32 @@ This is attack-surface reduction, not complete isolation. After daemon
 compromise, retained capabilities can still permit access to process memory and
 files through other system calls or procfs magic links. Review the
 [threat model](../../docs/THREAT_MODEL.md) before deployment.
+
+## SELinux and AppArmor
+
+The package does not select an `SELinuxContext=` or `AppArmorProfile=` and never
+disables either LSM. tmpfiles creates the runtime directory, state directory,
+and shared xtables lock as `root:root`, then restores those three exact paths to
+the contexts defined by the installed SELinux file-context database. The
+non-recursive `z` rules do not relabel their contents.
+
+This is compatibility with the distribution's standard policy, not a bundled
+confinement policy for OpenShield. A locally supplied SELinux domain or AppArmor
+profile must explicitly cover the daemon's documented files, procfs attribution,
+socket families, capabilities, and fixed nftables/xtables executables. Diagnose
+policy failures while enforcement remains enabled:
+
+```console
+systemctl show openshield-daemon.service -p Group -p SupplementaryGroups
+ls -ldZ /run/openshield /var/lib/openshield /run/xtables.lock
+sudo ausearch -m AVC,USER_AVC -ts boot
+sudo journalctl -k -b --grep='apparmor="DENIED"'
+```
+
+On SELinux systems, `matchpathcon -V` can compare an existing path with policy;
+`restorecon -v` on the three exact paths above safely reapplies policy-defined
+contexts. Do not work around a denial with `setenforce 0`, `aa-complain`, a
+blanket allow rule, or unreviewed `audit2allow` output.
 
 ## Operational warning
 

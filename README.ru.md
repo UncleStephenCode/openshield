@@ -199,15 +199,16 @@ cargo deny check
 | `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` |
 | `s390x` | `tumbleweed-s390x` | `s390x` |
 
-Установите соответствующий Tumbleweed RPM через `zypper`. Пакет зависит от
-`(nftables or iptables)` и рекомендует nftables, поэтому при обычной установке
+Установите соответствующий Tumbleweed RPM через `zypper`. Для бэкенда
+фаервола пакет объявляет зависимость `(nftables or iptables)` и рекомендует
+nftables, поэтому при обычной установке
 будет выбран nftables. Узел только с iptables остаётся поддержанным, если
 nftables недоступен или рекомендации намеренно отключены; во время запуска
 демон всё равно сначала проверяет полностью работоспособный бэкенд nftables.
 
 Для ручной установки в systemd установите оба двоичных файла, unit-файл и
-декларации sysusers и tmpfiles. До старта сервиса создайте группу и общую
-блокировку xtables:
+декларации sysusers и tmpfiles. До старта сервиса создайте группу, принадлежащие
+root служебные каталоги и общую блокировку xtables:
 
 ```console
 sudo install -o root -g root -m 0755 target/release/openshield-daemon /usr/bin/openshield-daemon
@@ -219,6 +220,11 @@ sudo systemd-sysusers /usr/lib/sysusers.d/openshield.conf
 sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/openshield.conf
 sudo systemctl daemon-reload
 ```
+
+Если SELinux или AppArmor включён, оставьте его в enforcing-режиме. Упакованный
+unit-файл не выбирает и не отключает ни один LSM. Проверки меток точных путей
+и диагностика отказов описаны в
+[руководстве по упаковке systemd](packaging/daemon/README.ru.md#selinux-и-apparmor).
 
 ### Безопасное первое включение на удалённом сервере
 
@@ -360,9 +366,10 @@ openshield-tui --locale ru
 - Обучение — ограниченное управляемое оператором окно доверия, а не вердикт о
   безопасности локального исполняемого файла или удалённой конечной точки.
 - Упакованный systemd-сервис сохраняет `CAP_NET_ADMIN`, `CAP_NET_RAW`,
-  `CAP_SYS_PTRACE` и `CAP_DAC_READ_SEARCH`. Его эффективная группа —
-  `openshield`, поэтому сокету
-  наблюдения не требуется `CAP_CHOWN`; `CAP_NET_RAW` необходимо для проверки и работы резервного
+  `CAP_SYS_PTRACE` и `CAP_DAC_READ_SEARCH`. Его основной группой остаётся `root`,
+  а `openshield` явно добавляется как дополнительная группа. Как владелец
+  сокета демон может назначить ему эту дополнительную группу без
+  `CAP_CHOWN`; `CAP_NET_RAW` необходимо для проверки и работы резервного
   бэкенда legacy xtables, а два последних полномочия — для атрибуции
   через procfs между UID. Фильтр системных вызовов systemd сокращает поверхность
   атаки, но не изолирует память процесса или файловую систему после компрометации демона.

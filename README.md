@@ -191,15 +191,15 @@ installation architecture:
 | `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` |
 | `s390x` | `tumbleweed-s390x` | `s390x` |
 
-Install the matching Tumbleweed RPM with `zypper`. Its dependency is
+Install the matching Tumbleweed RPM with `zypper`. Its firewall dependency is
 `(nftables or iptables)` and it recommends nftables, so a normal installation
 selects nftables. An existing iptables-only host remains supported when nftables
 is unavailable or recommendations are deliberately disabled; runtime discovery
 still tries a fully usable nftables backend first.
 
 For a manual systemd installation, install both binaries, the unit, and the
-sysusers and tmpfiles declarations. Create the group and the shared xtables lock
-before starting the service:
+sysusers and tmpfiles declarations. Create the group, root-owned service
+directories, and shared xtables lock before starting the service:
 
 ```console
 sudo install -o root -g root -m 0755 target/release/openshield-daemon /usr/bin/openshield-daemon
@@ -211,6 +211,11 @@ sudo systemd-sysusers /usr/lib/sysusers.d/openshield.conf
 sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/openshield.conf
 sudo systemctl daemon-reload
 ```
+
+When SELinux or AppArmor is enabled, keep it enforcing. The packaged unit does
+not select or disable either LSM; see the
+[systemd packaging guide](packaging/daemon/README.md#selinux-and-apparmor) for
+exact-path label checks and denial diagnostics.
 
 ### Safe first activation on a remote server
 
@@ -352,9 +357,10 @@ native technical review.
 - Learning is a bounded operator-controlled trust window, not a verdict that a
   local executable or remote endpoint is benign.
 - The packaged systemd service retains `CAP_NET_ADMIN`, `CAP_NET_RAW`,
-  `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its effective group is
-  `openshield`, so the
-  observation socket needs no `CAP_CHOWN`; `CAP_NET_RAW` is required to inspect
+  `CAP_SYS_PTRACE`, and `CAP_DAC_READ_SEARCH`. Its primary group remains `root`,
+  and `openshield` is explicitly added as a supplementary group. As the socket
+  owner it can assign that supplementary group to the observation socket
+  without `CAP_CHOWN`; `CAP_NET_RAW` is required to inspect
   and operate the legacy xtables fallback, and the last two capabilities
   permit cross-UID procfs attribution. The systemd syscall filter reduces attack
   surface but is not process-memory or filesystem isolation after compromise.

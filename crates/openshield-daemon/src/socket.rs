@@ -488,10 +488,10 @@ fn set_socket_group(path: &Path, expected_uid: u32, observer_gid: u32) -> Result
         before.file_type().is_socket() && before.uid() == expected_uid,
         "socket identity changed before its observation group was assigned"
     );
-    // The systemd unit uses Group=openshield, so a newly bound socket already
-    // has the required GID. Avoiding a redundant chown keeps CAP_CHOWN out of
-    // the service capability set. Other init systems run the daemon as normal
-    // root and retain the existing chown path when the initial GID differs.
+    // The systemd unit keeps root as the primary group and adds openshield as
+    // a supplementary group. Linux permits an inode owner to select one of its
+    // supplementary groups, so this narrow change does not require CAP_CHOWN.
+    // Other init systems run the daemon as normal root and retain this path.
     if before.gid() != observer_gid {
         chown(path, None, Some(Gid::from_raw(observer_gid))).with_context(|| {
             format!(

@@ -31,6 +31,10 @@ overrides:
   rpm:
     depends:
       - ${RPM_FIREWALL_DEPENDENCY}
+      # The unit consumes tmpfiles after package installation and at boot.
+      # Depend on the executable path so each RPM distribution can select its
+      # native provider (including systemd-mini where it is supported).
+      - /usr/bin/systemd-tmpfiles
       # The pinned nFPM version omits empty dependency values. These two
       # entries are populated only for the dynamically linked Tumbleweed RPMs.
       - ${RPM_C_RUNTIME_DEPENDENCY}
