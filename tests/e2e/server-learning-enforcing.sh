@@ -148,6 +148,35 @@ begin_stage() {
     printf '==> OpenShield E2E (%s): %s\n' "$backend" "$stage_name"
 }
 
+refresh_zypper_repository() {
+    container=$1
+    repository=$2
+    attempt=1
+    maximum_attempts=3
+    while :; do
+        if docker exec "$container" zypper --non-interactive refresh "$repository"; then
+            return 0
+        else
+            refresh_status=$?
+        fi
+        if [ "$refresh_status" -ne 4 ]; then
+            printf 'zypper refresh for %s failed with non-retryable status %s\n' \
+                "$repository" "$refresh_status" >&2
+            return "$refresh_status"
+        fi
+        if [ "$attempt" -ge "$maximum_attempts" ]; then
+            printf 'zypper refresh for %s failed after %s attempts (status %s)\n' \
+                "$repository" "$attempt" "$refresh_status" >&2
+            return "$refresh_status"
+        fi
+        retry_delay=$((attempt * 5))
+        printf 'zypper refresh for %s failed (status %s); retrying in %s seconds\n' \
+            "$repository" "$refresh_status" "$retry_delay" >&2
+        sleep "$retry_delay"
+        attempt=$((attempt + 1))
+    done
+}
+
 wait_for_marker() {
     container=$1
     marker=$2
@@ -428,6 +457,10 @@ case "$client_family" in
         fi
         ;;
     opensuse|tumbleweed)
+        case "$client_family" in
+            opensuse) zypper_repository='openSUSE:repo-oss' ;;
+            tumbleweed) zypper_repository=repo-oss ;;
+        esac
         if [ "$backend" = nftables ]; then
             # Keep legacy xtables installed so nftables activation exercises
             # alternate-backend inspection with the exact systemd capability set.
@@ -435,12 +468,14 @@ case "$client_family" in
         else
             packages='iptables curl netcat-openbsd python3 shadow util-linux'
         fi
-        docker exec "$client" zypper --non-interactive refresh >/dev/null
+        refresh_zypper_repository "$client" "$zypper_repository" >/dev/null
         # shellcheck disable=SC2086
-        docker exec "$client" zypper --non-interactive install $packages >/dev/null
+        docker exec "$client" zypper --non-interactive --no-refresh install \
+            --repo "$zypper_repository" $packages >/dev/null
         if [ "$artifact_mode" = package ]; then
             docker exec "$client" /bin/sh -c \
-                'zypper --non-interactive install --no-recommends --allow-unsigned-rpm /packages/*.rpm' \
+                'zypper --non-interactive --no-refresh install \
+                    --no-recommends --allow-unsigned-rpm /packages/*.rpm' \
                 >/dev/null
         fi
         ;;

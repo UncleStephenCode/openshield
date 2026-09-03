@@ -356,6 +356,39 @@ ARCH_INSTALL_ASSERTIONS='
       test -f /usr/lib/systemd/system/openshield-daemon.service
       getent group openshield >/dev/null'
 
+# openSUSE package tests run concurrently across architectures and can hit a
+# transient CDN timeout while libzypp refreshes repository metadata. Refresh
+# only the required OSS repository, retry only libzypp status 4, and never
+# retry an install transaction or a permanent solver/script failure.
+ZYPPER_REFRESH_RETRY='
+      refresh_zypper_repository() {
+        openshield_zypper_repository=$1
+        openshield_zypper_attempt=1
+        openshield_zypper_max_attempts=3
+        while :; do
+          if zypper --non-interactive refresh "$openshield_zypper_repository"; then
+            return 0
+          else
+            openshield_zypper_status=$?
+          fi
+          if [ "$openshield_zypper_status" -ne 4 ]; then
+            printf "%s\n" \
+              "zypper refresh for $openshield_zypper_repository failed with non-retryable status $openshield_zypper_status" >&2
+            return "$openshield_zypper_status"
+          fi
+          if [ "$openshield_zypper_attempt" -ge "$openshield_zypper_max_attempts" ]; then
+            printf "%s\n" \
+              "zypper refresh for $openshield_zypper_repository failed after $openshield_zypper_attempt attempts (status $openshield_zypper_status)" >&2
+            return "$openshield_zypper_status"
+          fi
+          openshield_zypper_delay=$((openshield_zypper_attempt * 5))
+          printf "%s\n" \
+            "zypper refresh for $openshield_zypper_repository failed (status $openshield_zypper_status); retrying in $openshield_zypper_delay seconds" >&2
+          sleep "$openshield_zypper_delay"
+          openshield_zypper_attempt=$((openshield_zypper_attempt + 1))
+        done
+      }'
+
 case "$FAMILY" in
   deb)
     CMD=$DEB_METADATA_ASSERTIONS'
@@ -370,23 +403,30 @@ case "$FAMILY" in
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
   opensuse)
-    CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --allow-unsigned-rpm binutils "$package"
+    CMD=$RPM_METADATA_ASSERTIONS$ZYPPER_REFRESH_RETRY'
+      refresh_zypper_repository "openSUSE:repo-oss"
+      zypper --non-interactive --no-refresh install \
+        --repo "openSUSE:repo-oss" --allow-unsigned-rpm binutils "$package"
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
   tumbleweed)
-    CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --allow-unsigned-rpm binutils gawk "$package"
+    CMD=$RPM_METADATA_ASSERTIONS$ZYPPER_REFRESH_RETRY'
+      refresh_zypper_repository "repo-oss"
+      zypper --non-interactive --no-refresh install \
+        --repo "repo-oss" --allow-unsigned-rpm binutils gawk "$package"
       rpm -q nftables >/dev/null
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
-    FALLBACK_CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --no-recommends binutils gawk iptables
+    FALLBACK_CMD=$RPM_METADATA_ASSERTIONS$ZYPPER_REFRESH_RETRY'
+      refresh_zypper_repository "repo-oss"
+      zypper --non-interactive --no-refresh install \
+        --repo "repo-oss" --no-recommends binutils gawk iptables
       rpm -q iptables >/dev/null
       if rpm -q nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
         printf "%s\n" "nftables unexpectedly present before fallback installation" >&2
         exit 1
       fi
-      zypper --non-interactive install --no-recommends --allow-unsigned-rpm "$package"
+      zypper --non-interactive --no-refresh install \
+        --repo "repo-oss" --no-recommends --allow-unsigned-rpm "$package"
       rpm -q iptables >/dev/null
       if rpm -q nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
         printf "%s\n" "nftables recommendation was unexpectedly installed" >&2

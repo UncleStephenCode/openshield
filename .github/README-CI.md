@@ -172,6 +172,12 @@ digest, requested platform, execution mode, installed OpenShield asset name and
 SHA-256, backend, and test outcome. The init gate records its pinned images and
 script SHA-256. A successful manifest lookup alone is never release evidence.
 
+For openSUSE rows, CI refreshes only the required GPG-checked OSS repository
+before provisioning. A libzypp status `4` during refresh is retried at most
+three times with bounded backoff; every other status and every installation
+transaction fails immediately. Installation disables implicit refresh, so a
+partial repository update cannot be misreported as missing dependencies.
+
 The evidence stage fails closed for missing, duplicate, unexpected, or
 contradictory rows and assets. `SHA256SUMS` covers all published packages and
 binary archives. Publication depends on that verified inventory and cannot run
