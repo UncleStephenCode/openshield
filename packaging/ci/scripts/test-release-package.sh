@@ -27,43 +27,36 @@ image_pattern='^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*
 case "$PLATFORM" in
   linux/amd64)
     EXPECTED_ELF_CLASS=ELF64
-    EXPECTED_ELF_BITS=64
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine='Advanced Micro Devices X86-64'
     ;;
   linux/arm64)
     EXPECTED_ELF_CLASS=ELF64
-    EXPECTED_ELF_BITS=64
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine=AArch64
     ;;
   linux/386)
     EXPECTED_ELF_CLASS=ELF32
-    EXPECTED_ELF_BITS=32
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine='Intel 80386'
     ;;
   linux/arm/v5|linux/arm/v6|linux/arm/v7)
     EXPECTED_ELF_CLASS=ELF32
-    EXPECTED_ELF_BITS=32
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine=ARM
     ;;
   linux/ppc64le)
     EXPECTED_ELF_CLASS=ELF64
-    EXPECTED_ELF_BITS=64
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine=PowerPC64
     ;;
   linux/s390x)
     EXPECTED_ELF_CLASS=ELF64
-    EXPECTED_ELF_BITS=64
     EXPECTED_ELF_DATA='big endian'
     platform_elf_machine='IBM S/390'
     ;;
   linux/riscv64)
     EXPECTED_ELF_CLASS=ELF64
-    EXPECTED_ELF_BITS=64
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine='RISC-V'
     ;;
@@ -177,42 +170,56 @@ case "$FAMILY" in
     ;;
 esac
 
+# readelf is the authoritative gate here. Leap 16's s390x file/libmagic can
+# misclassify a valid big-endian static ELF as generic "data".
 COMMON_BINARY_ASSERTIONS='
-      command -v file >/dev/null
       command -v readelf >/dev/null
       command -v awk >/dev/null
       for binary_name in openshield-daemon openshield-tui; do
         binary=/usr/bin/$binary_name
         test -f "$binary" && test -x "$binary" && test ! -L "$binary"
-        file_output=$(LC_ALL=C file -b "$binary")
-        case "$file_output" in
-          *"ELF $EXPECTED_ELF_BITS-bit"*) ;;
-          *)
-            printf "%s\n" "unexpected file(1) identity for $binary: $file_output" >&2
-            exit 1
-            ;;
-        esac
-        case "$file_output" in
-          *"statically linked"*|*"static-pie linked"*) ;;
-          *)
-            printf "%s\n" "binary is not statically linked: $binary: $file_output" >&2
-            exit 1
-            ;;
-        esac
-        if LC_ALL=C readelf -l "$binary" \
+        elf_header=$(LC_ALL=C readelf -h -- "$binary") || {
+          printf "%s\n" "invalid ELF binary: $binary" >&2
+          exit 1
+        }
+        elf_program_headers=$(LC_ALL=C readelf -l -- "$binary") || {
+          printf "%s\n" "cannot inspect ELF program headers: $binary" >&2
+          exit 1
+        }
+        elf_dynamic=$(LC_ALL=C readelf -d -- "$binary") || {
+          printf "%s\n" "cannot inspect ELF dynamic section: $binary" >&2
+          exit 1
+        }
+        if printf "%s\n" "$elf_program_headers" \
           | grep -Eq '\''(^|[[:space:]])INTERP([[:space:]]|$)'\''; then
           printf "%s\n" "binary contains a dynamic ELF interpreter: $binary" >&2
           exit 1
         fi
-        elf_class=$(LC_ALL=C readelf -h "$binary" \
+        if printf "%s\n" "$elf_dynamic" | grep -Fq "(NEEDED)"; then
+          printf "%s\n" "binary contains a dynamic ELF dependency: $binary" >&2
+          exit 1
+        fi
+        elf_class=$(printf "%s\n" "$elf_header" \
           | awk -F: '\''/^[[:space:]]*Class:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }'\'')
-        elf_data=$(LC_ALL=C readelf -h "$binary" \
+        elf_data=$(printf "%s\n" "$elf_header" \
           | awk -F: '\''/^[[:space:]]*Data:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }'\'')
-        elf_machine=$(LC_ALL=C readelf -h "$binary" \
+        elf_machine=$(printf "%s\n" "$elf_header" \
           | awk -F: '\''/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }'\'')
-        [ "$elf_class" = "$EXPECTED_ELF_CLASS" ]
-        case "$elf_data" in *"$EXPECTED_ELF_DATA"*) ;; *) exit 1 ;; esac
-        [ "$elf_machine" = "$EXPECTED_ELF_MACHINE" ]
+        [ "$elf_class" = "$EXPECTED_ELF_CLASS" ] || {
+          printf "%s\n" "unexpected ELF class for $binary: $elf_class" >&2
+          exit 1
+        }
+        case "$elf_data" in
+          *"$EXPECTED_ELF_DATA"*) ;;
+          *)
+            printf "%s\n" "unexpected ELF byte order for $binary: $elf_data" >&2
+            exit 1
+            ;;
+        esac
+        [ "$elf_machine" = "$EXPECTED_ELF_MACHINE" ] || {
+          printf "%s\n" "unexpected ELF machine for $binary: $elf_machine" >&2
+          exit 1
+        }
       done
       [ "$(openshield-daemon --version)" = "openshield-daemon $EXPECTED_VERSION" ]
       [ "$(openshield-tui --version)" = "openshield-tui $EXPECTED_VERSION" ]'
@@ -354,26 +361,26 @@ case "$FAMILY" in
     CMD=$DEB_METADATA_ASSERTIONS'
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
-      apt-get install -y --no-install-recommends binutils file "$package"
+      apt-get install -y --no-install-recommends binutils "$package"
     '$DEB_INSTALL_ASSERTIONS$SYSTEMD_BASIC_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
   fedora|el9|el10)
     CMD=$RPM_METADATA_ASSERTIONS'
-      dnf -y install binutils file "$package"
+      dnf -y install binutils "$package"
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
   opensuse)
     CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --allow-unsigned-rpm binutils file "$package"
+      zypper --non-interactive install --allow-unsigned-rpm binutils "$package"
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
   tumbleweed)
     CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --allow-unsigned-rpm binutils file gawk "$package"
+      zypper --non-interactive install --allow-unsigned-rpm binutils gawk "$package"
       rpm -q nftables >/dev/null
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     FALLBACK_CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --no-recommends binutils file gawk iptables
+      zypper --non-interactive install --no-recommends binutils gawk iptables
       rpm -q iptables >/dev/null
       if rpm -q nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
         printf "%s\n" "nftables unexpectedly present before fallback installation" >&2
@@ -389,11 +396,11 @@ case "$FAMILY" in
     ;;
   alpine)
     CMD=$APK_METADATA_ASSERTIONS'
-      apk add --no-cache binutils file nftables
+      apk add --no-cache binutils nftables
       apk add --no-cache --allow-untrusted "$package"
     '$APK_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     FALLBACK_CMD=$APK_METADATA_ASSERTIONS'
-      apk add --no-cache binutils file iptables
+      apk add --no-cache binutils iptables
       if command -v nft >/dev/null 2>&1; then
         printf "%s\n" "nftables unexpectedly present before fallback installation" >&2
         exit 1
@@ -411,11 +418,11 @@ case "$FAMILY" in
     ;;
   arch)
     CMD=$ARCH_METADATA_ASSERTIONS'
-      pacman -Syu --noconfirm --needed binutils file nftables
+      pacman -Syu --noconfirm --needed binutils nftables
       pacman -U --noconfirm "$package"
     '$ARCH_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     FALLBACK_CMD=$ARCH_METADATA_ASSERTIONS'
-      pacman -Syu --noconfirm --needed binutils file
+      pacman -Syu --noconfirm --needed binutils
       pacman -S --noconfirm --ask=4 iptables-legacy
       if pacman -Q nftables >/dev/null 2>&1; then
         pacman -Rns --noconfirm nftables
@@ -449,7 +456,6 @@ run_package_test() {
     --env "EXPECTED_PACKAGE_ARCH=$EXPECTED_PACKAGE_ARCH" \
     --env "EXPECTED_PACKAGE_VERSION=$EXPECTED_PACKAGE_VERSION" \
     --env "EXPECTED_VERSION=$EXPECTED_VERSION" \
-    --env "EXPECTED_ELF_BITS=$EXPECTED_ELF_BITS" \
     --env "EXPECTED_ELF_CLASS=$EXPECTED_ELF_CLASS" \
     --env "EXPECTED_ELF_DATA=$EXPECTED_ELF_DATA" \
     --env "EXPECTED_ELF_MACHINE=$EXPECTED_ELF_MACHINE" \
