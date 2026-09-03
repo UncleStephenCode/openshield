@@ -39,6 +39,13 @@ evidence instead. Before making any publication API request, the write-capable
 job independently verifies the tag, source revision, matrix hash, complete
 asset inventory, file sizes, digests, and `SHA256SUMS`.
 
+GitHub's ZIP artifact transport normalizes regular files to mode `0644`.
+Release Evidence therefore treats the downloaded raw ELF files as byte-level
+transport copies and requires that mode explicitly. The publishable `tar.xz`
+remains the authority for executable metadata: it must contain exactly the
+daemon and TUI as regular `0755` members whose sizes and SHA-256 contents match
+the transport copies. Package assembly restores `0755` explicitly.
+
 To create a release, set `[workspace.package].version` in `Cargo.toml`, commit
 the complete change, and create the matching `vX.Y.Z` tag on that commit. A
 numeric `X.Y.Z` tag without the mandatory `v` prefix reaches Validation only,

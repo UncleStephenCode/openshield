@@ -31,6 +31,7 @@ INIT_IMAGES = {
     "artix-s6": "artixlinux/artixlinux:base-s6@sha256:e563ae1357cf6cd7c6df858b795db8ddf23ffa6ab1888739b91a33da189cf82b",
     "artix-dinit": "artixlinux/artixlinux:base-dinit@sha256:234cf62105d8a5a10caebb9b62dadc271d33eccc9fd41399453e20004a8e319a",
 }
+ARTIFACT_TRANSPORT_MODE = 0o644
 
 
 class CandidateError(RuntimeError):
@@ -140,6 +141,30 @@ def verify_archive(path: Path, binaries: dict[str, Path]) -> None:
             raise CandidateError(
                 f"archive member differs from verified binary: {path.name}/{member.name}"
             )
+
+
+def verify_binary_artifact(directory: Path, archive_name: str, matrix_id: str) -> Path:
+    expected_names = {"openshield-daemon", "openshield-tui", archive_name}
+    entries = directory_entries(directory)
+    if {entry.name for entry in entries} != expected_names:
+        raise CandidateError(f"binary artifact inventory mismatch: {matrix_id}")
+    for entry in entries:
+        regular_file(entry)
+
+    binaries = {name: directory / name for name in ("openshield-daemon", "openshield-tui")}
+    for binary in binaries.values():
+        transport_mode = stat.S_IMODE(binary.stat().st_mode)
+        if transport_mode != ARTIFACT_TRANSPORT_MODE:
+            raise CandidateError(
+                f"release transport binary has unexpected mode {transport_mode:04o}: {binary}"
+            )
+    archive = directory / archive_name
+    # GitHub's ZIP artifact transport intentionally normalizes regular files to
+    # 0644. The raw ELF siblings authenticate bytes only. Canonical executable
+    # metadata is carried by the tar archive and checked strictly by
+    # verify_archive().
+    verify_archive(archive, binaries)
+    return archive
 
 
 def execution_mode(arch: str) -> str:
@@ -371,18 +396,7 @@ def assemble(arguments: argparse.Namespace) -> None:
     for row in sorted(matrix["binaries"], key=lambda item: item["id"]):
         directory = binary_root / row["artifact_name"]
         archive_name = row["archive_template"].replace("{version}", version)
-        expected_names = {"openshield-daemon", "openshield-tui", archive_name}
-        entries = directory_entries(directory)
-        if {entry.name for entry in entries} != expected_names:
-            raise CandidateError(f"binary artifact inventory mismatch: {row['id']}")
-        for entry in entries:
-            regular_file(entry)
-        binaries = {name: directory / name for name in ("openshield-daemon", "openshield-tui")}
-        for binary in binaries.values():
-            if stat.S_IMODE(binary.stat().st_mode) != 0o755:
-                raise CandidateError(f"release binary is not mode 0755: {binary}")
-        archive = directory / archive_name
-        verify_archive(archive, binaries)
+        archive = verify_binary_artifact(directory, archive_name, row["id"])
         record = copy_asset(archive, output, seen)
         record.update({"kind": "binary", "matrix_id": row["id"]})
         asset_records.append(record)

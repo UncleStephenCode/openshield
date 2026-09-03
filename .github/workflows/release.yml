@@ -265,6 +265,7 @@ jobs:
               cargo test --workspace --all-targets --locked --offline
               cc -std=c11 -fsyntax-only -Wall -Wextra -Werror -Wpedantic \
                 tests/e2e/native-client.c
+              python3 tests/ci/test_release_candidate_artifacts.py
               scripts/check-target-matrix.sh validate
               scripts/test-init-matrix.sh validate
             '

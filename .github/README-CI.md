@@ -50,7 +50,10 @@ The stages have the following responsibilities:
    platform identities, artifact hashes, the 37 package-install results, the 74
    backend-test results, and the expected inventory of all 43 binary archives
    and 43 packages. Evidence completeness is checked against the authoritative
-   matrix rather than inferred from whichever jobs happened to finish.
+   matrix rather than inferred from whichever jobs happened to finish. GitHub's
+   ZIP transport normalizes raw files to `0644`; those ELF copies are verified
+   as transport bytes, while exact `0755` executable modes and matching content
+   are required inside each publishable `tar.xz` archive.
 9. **Publish** is reachable only when every required evidence record and release
    asset is present and consistent. Publication remains resumable, but an
    existing asset is never silently replaced with different bytes.
