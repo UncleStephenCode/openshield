@@ -58,6 +58,11 @@ Validation and the Quality Gate therefore precede every release compilation;
 package installation and firewall testing consume packages produced during the
 same run, not binaries rebuilt inside test jobs.
 
+Release tags use the canonical `vX.Y.Z` form and must point to the commit that
+contains the same workspace version. Semver-like `X.Y.Z` tags without `v` are
+included in the workflow trigger only so Validation can report the naming
+error; all build, packaging, testing, and publication jobs remain unreachable.
+
 Compilation runs on a native hosted runner or inside a digest-pinned Cross
 toolchain container. It is intentionally not bootstrapped from each target
 distribution's mutable package repository. The resulting static binary is then
@@ -142,7 +147,8 @@ Every row runs the complete Learning-to-Enforcing E2E separately with nftables
 and with an iptables-only fallback installation. DEB and RPM use an explicit
 package-manager alternative dependency. APK and Arch do not force-install one
 backend, because those formats cannot express the same portable alternative;
-the installation tests prove that either backend can satisfy the runtime
+the installation tests verify the package and dependency layout, while the
+separate firewall E2E jobs prove that either backend can satisfy the runtime
 contract.
 
 In an nftables scenario both frontends are installed and the daemon must still

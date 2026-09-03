@@ -34,7 +34,9 @@ write-capable job independently verifies the tag, source revision, matrix hash,
 complete asset inventory, file sizes, digests, and `SHA256SUMS`.
 
 To create a release, set `[workspace.package].version` in `Cargo.toml`, commit
-the complete change, and create the matching `vX.Y.Z` tag. Recovery of an
-already published release is allowed only through the explicit
-`workflow_dispatch` repair option; existing assets with different bytes are
-never overwritten.
+the complete change, and create the matching `vX.Y.Z` tag on that commit. A
+numeric `X.Y.Z` tag without the mandatory `v` prefix reaches Validation only,
+where it fails with an explicit diagnostic; it can never reach compilation or
+publication. Recovery of an already published release is allowed only through
+the explicit `workflow_dispatch` repair option; existing assets with different
+bytes are never overwritten.

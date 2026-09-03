@@ -3,7 +3,9 @@ name: Release packages
 on:
   push:
     tags:
-      - 'v*.*.*'
+      # Keep malformed semver-like tags observable: Validation rejects every
+      # release tag that does not use the canonical vX.Y.Z form.
+      - '*.*.*'
   workflow_dispatch:
     inputs:
       tag:
@@ -60,8 +62,12 @@ jobs:
         run: |
           set -euo pipefail
           TAG="$REQUESTED_TAG"
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error title=Invalid release tag::Tag $TAG is missing the required 'v' prefix; create v$TAG on the version commit"
+            exit 1
+          fi
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || {
-            echo "::error::Tag must look like vX.Y.Z"
+            echo "::error title=Invalid release tag::Tag $TAG must look like vX.Y.Z"
             exit 1
           }
           TAG_VERSION="${TAG#v}"
