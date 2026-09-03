@@ -14,6 +14,49 @@ one layer must not be interpreted as a pass in another.
 
 The real Learning-to-Enforcing firewall workflow is a separate end-to-end test.
 
+## Release validation versus compatibility research
+
+The release pipeline has its own authoritative matrix:
+[`packaging/ci/release-matrix.json`](../../packaging/ci/release-matrix.json).
+It defines 43 binary rows and 43 matching package rows. Its runtime submatrix
+installs 19 package variants in exactly 37 distribution/userspace and
+OCI-platform rows: 16 `amd64`, 15 `arm64`, and 6 `386`. Every runtime row is
+expanded into both firewall backends, producing 74 firewall E2E jobs. The other
+24 package variants account for 49 of the 86 declared distribution/platform
+mappings; they are build-only and have no package-install or firewall evidence.
+The release dependency graph is:
+
+```text
+Validation
+    -> Quality Gate
+    -> Binaries
+    -> Packages
+    -> Install Matrix
+    -> Container Tests
+    -> Firewall E2E
+    -> Release Evidence
+    -> Publish
+```
+
+The complete policy, architecture evidence levels, and publication boundary are
+documented in [the release CI guide](../../.github/README-CI.md). Compilation is
+allowed only after Validation and the Quality Gate. Publication is allowed only
+after the evidence stage has reconciled every required matrix row and release
+asset.
+
+The 37 runtime rows cover Debian 12/13, Ubuntu 22.04/24.04/26.04, Fedora 43/44,
+Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0, Tumbleweed, Alpine
+3.23/3.24, and Arch Linux on `amd64`, `arm64`, and, where published by the
+image, `386`. A family/architecture binary and package may be built once, but
+installation, container testing, and both backend results remain separate for
+every selected distribution/platform row. ARMv5/6/7, `ppc64le`, `riscv64`,
+and `s390x` remain build targets only.
+
+This release matrix and the 60-row research matrix below serve different
+purposes. Passing the broad compatibility smoke does not add a release row, and
+removing an archived research image does not change the package-support
+contract. Do not derive release claims from `distros.tsv`.
+
 ## Distribution image matrix
 
 `distros.tsv` contains exactly 60 rows across Debian/Ubuntu, Alpine, Fedora,
@@ -91,13 +134,21 @@ not provide their standard libraries, so the stable matrix skips them. Building
 them requires a separately reviewed nightly `build-std` workflow; they are not
 claimed as stable release targets.
 
-Separate Tumbleweed GNU release binaries were linked and ELF-validated for
-x86_64, i586, AArch64, ppc64le, and s390x. The i586, AArch64, ppc64le, and
-s390x daemon and TUI binaries completed capability-free `--version` smoke tests
-under digest-pinned Cross QEMU images; i586 additionally ran in the pinned
-official Tumbleweed `linux/386` image. These are execution smokes, not firewall
-tests or hardware certification. No blanket runtime claim is made for x86, ARM,
-arm64, PowerPC, IBM Z, or RISC-V hardware.
+The workflow defines 43 release binary rows and requires each one to be linked,
+checked for the expected ELF identity and static runtime boundary, and
+smoke-run in a pinned image for its target family and architecture. `amd64` and
+`arm64` jobs use native x86-64 and AArch64 runners. `386` uses the x86 runner's
+compatibility path. ARMv5, ARMv6, ARMv7, `ppc64le`, `riscv64`, and `s390x` use
+digest-pinned Cross build images and a selected QEMU user-mode handler only for
+their target-image `--version` binary smoke. The privileged handler registration
+step is rejected on self-hosted runners.
+
+A publishable run must install all 37 selected package rows and complete both
+backend scenarios for each of them. QEMU user-mode rows do not enter the
+package-install or firewall matrices. Their successful binary smoke is not
+package-runtime evidence, distribution-kernel coverage, physical-hardware
+certification, or a blanket runtime guarantee for ARM, PowerPC, IBM Z, or
+RISC-V hardware.
 Architecture aliases do not create additional targets: AMD64 means x86_64, and
 ARM64 means AArch64. `aarch` alone is not a Rust Linux target name.
 
@@ -134,6 +185,24 @@ mean a backend was selected or that real packets were filtered.
 
 ## Real firewall end-to-end workflow
 
+The workflow expands every one of the 37 runtime platform rows into two
+complete Learning-to-Enforcing tests: one with nftables preferred while both
+frontends are installed, and one with `nft` absent so the complete
+iptables/ip6tables fallback must be selected. A publishable run therefore
+requires 37 nftables and 37 iptables jobs across DEB, RPM, APK, and Arch
+packages on native `amd64`/`arm64` runners and the x86-64 kernel's `386`
+compatibility path. QEMU-user rows are excluded. The harness explicitly
+provisions the requested backend before installing the release package; that
+test setup does not by itself change or broaden a package format's dependency
+metadata.
+
+Every release image is pinned by SHA-256 digest and paired with an explicit OCI
+platform. The evidence stage records the image/platform identity, package and
+binary hashes, installation result, assigned backend results, and expected
+release-asset inventory. Docker still uses the runner kernel, so these results
+validate container userspace and isolated network-namespace behavior rather
+than the distribution's own kernel or a complete init boot.
+
 `../e2e/server-learning-enforcing.sh` creates a disposable Docker network with a
 client and HTTP server. It is designed to verify, separately for each backend:
 
@@ -141,8 +210,9 @@ client and HTTP server. It is designed to verify, separately for each backend:
 - initial persisted `Learning` mode after startup quarantine;
 - observation access for `openshield` and denial for an outsider;
 - denial of control to a non-root group member;
-- learning an application-bound `/usr/bin/curl` rule;
-- continued curl access and denial of another executable in `Enforcing`;
+- learning an application-bound TCP rule and a UDP rule;
+- continued access for the learned executable and denial of another executable
+  in `Enforcing`;
 - coexistence with a downstream firewall DROP;
 - inbound denial followed by an explicit inbound allow;
 - graceful-shutdown kernel `BlockAll` without replacing persisted `Enforcing`;
@@ -171,19 +241,20 @@ inside that container; the script does not apply rules on the host. Before
 creating resources, it reads the active endpoint with `docker context inspect`
 and refuses every endpoint whose URI is not `unix:///*`.
 
-The final Rust 1.98.0 Debian Bookworm and Tumbleweed release binaries passed
-both backend runs in their respective userspaces:
+Each successful runtime release row reports both backend runs in its selected
+userspace:
 
 ```text
 PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
 PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
 ```
 
-In each nftables run both frontends were installed and nftables was selected.
-In each iptables run `nft` was absent and the compatibility backend was selected,
-so the result proves preference and fallback rather than merely forcing a name.
+In an nftables run both frontends are installed and nftables must be selected.
+In an iptables run `nft` is absent and the compatibility backend must be
+selected, so the pair tests preference and fallback rather than merely forcing
+a name.
 
-These results cover the scripted behavior inside disposable network and
-container namespaces on a local Unix-socket Docker engine. They did not test or
-modify the host firewall and do not certify production kernels, deployments,
+A successful pair covers the scripted behavior inside disposable network and
+container namespaces on a local Unix-socket Docker engine. It does not test or
+modify the host firewall and does not certify production kernels, deployments,
 upgrades, or competing firewall configurations.

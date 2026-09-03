@@ -17,9 +17,6 @@ contents:
   # `expand` option. Fixed paths keep this staging boundary easy to audit.
   - src: .package-root/usr/
     dst: /usr
-  - src: .package-root/etc/
-    dst: /etc
-    packager: apk
 
 scripts:
   postinstall: packaging/ci/hooks/postinstall-systemd.sh
@@ -35,17 +32,5 @@ overrides:
       # Depend on the executable path so each RPM distribution can select its
       # native provider (including systemd-mini where it is supported).
       - /usr/bin/systemd-tmpfiles
-      # The pinned nFPM version omits empty dependency values. These two
-      # entries are populated only for the dynamically linked Tumbleweed RPMs.
-      - ${RPM_C_RUNTIME_DEPENDENCY}
-      - ${RPM_UNWIND_RUNTIME_DEPENDENCY}
     recommends:
-      - nftables
-  apk:
-    depends:
-      - nftables
-    scripts:
-      postinstall: packaging/ci/hooks/postinstall-openrc.sh
-  archlinux:
-    depends:
       - nftables

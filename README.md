@@ -179,17 +179,22 @@ of these init systems; by design it refuses to install directly into `/`.
 Package maintainers should use it with a fresh `DESTDIR`, install the staged
 files through their package manager, and run the platform-specific enablement
 step described in [packaging/README.md](packaging/README.md).
+The authoritative distribution/architecture release matrix and its gated
+build-to-publication flow are documented in [.github/README-CI.md](.github/README-CI.md).
 
-Releases provide separate GNU builds and RPMs for every main Tumbleweed
-installation architecture:
+The release workflow produces separate architecture-specific builds and RPMs
+for every Tumbleweed platform selected by the authoritative release matrix:
 
-| `uname -m` family | Release suffix | RPM architecture |
-| --- | --- | --- |
-| `x86_64` | `tumbleweed-amd64` | `x86_64` |
-| `i586` / `i686` | `tumbleweed-i586` | `i586` |
-| `aarch64` | `tumbleweed-arm64` | `aarch64` |
-| `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` |
-| `s390x` | `tumbleweed-s390x` | `s390x` |
+| Target architecture | Release suffix | RPM architecture | Release-CI evidence |
+| --- | --- | --- | --- |
+| `x86_64` | `tumbleweed-amd64` | `x86_64` | native package install and nftables/iptables E2E |
+| `i586` / `i686` | `tumbleweed-386` | `i586` | x86-64 compatibility package install and nftables/iptables E2E |
+| `aarch64` | `tumbleweed-arm64` | `aarch64` | native package install and nftables/iptables E2E |
+| ARMv6 hard-float | `tumbleweed-armv6` | `armv6hl` | build and QEMU `--version` smoke only |
+| ARMv7 hard-float | `tumbleweed-armv7` | `armv7hl` | build and QEMU `--version` smoke only |
+| `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` | build and QEMU `--version` smoke only |
+| `riscv64` | `tumbleweed-riscv64` | `riscv64` | build and QEMU `--version` smoke only |
+| `s390x` | `tumbleweed-s390x` | `s390x` | build and QEMU `--version` smoke only |
 
 Install the matching Tumbleweed RPM with `zypper`. Its firewall dependency is
 `(nftables or iptables)` and it recommends nftables, so a normal installation
@@ -280,8 +285,8 @@ arbitrary privileged ruleset editors.
 Compatibility claims are intentionally scoped:
 
 - final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 262 tests: 55 core,
-  144 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
+  all-target checks, clippy with warnings denied, and all 263 tests: 55 core,
+  145 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
   live-firewall end-to-end result;
 - both final static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
@@ -296,14 +301,20 @@ Compatibility claims are intentionally scoped:
 - the two RISC-V 32 targets are Rust Tier 3 and were skipped because stable
   rustup does not ship their standard libraries; they require an explicitly
   separate nightly `build-std` workflow;
-- separate Tumbleweed GNU release binaries were linked and ELF-validated for
-  x86_64, i586, AArch64, ppc64le, and s390x. The four non-host builds completed
-  capability-free `--version` smoke tests under pinned Cross QEMU images, and
-  i586 additionally ran in the pinned official Tumbleweed `linux/386` image;
-- non-native `cargo check` proves source-level compilation, not operation on
-  physical hardware. The explicit QEMU smokes above do not replace native
-  hardware validation; no transparent binfmt handler was installed on the test
-  host.
+- the release workflow builds 43 architecture/family binary targets and 43
+  corresponding package targets. The runtime submatrix installs 19 package
+  variants in 37 pinned distribution/platform rows: 16 `amd64`, 15 `arm64`,
+  and 6 `386`;
+- each of those 37 rows runs the nftables and iptables
+  Learning-to-Enforcing scenarios, for 74 firewall jobs. Both results are
+  publication requirements, not claims that an unpublished workflow run has
+  already completed;
+- `amd64` and `arm64` execute on native runners, while `386` uses the x86-64
+  kernel's 32-bit compatibility path. The other 24 ARMv5/6/7, `ppc64le`,
+  `riscv64`, and `s390x` package variants are build-only; their pinned
+  Cross/QEMU checks stop at ELF validation and a target-image `--version`
+  smoke. They account for 49 of the 86 declared distribution/platform
+  mappings and have no package-install or firewall-runtime evidence.
 
 The 60-image smoke matrix does not boot each image's init system and does not
 exercise its kernel, firewall backend, NFQUEUE, package manager, or upgrade
@@ -311,15 +322,16 @@ path. Archive and rolling images are compatibility probes, not supported-life
 guarantees. See [tests/compat/README.md](tests/compat/README.md) for exact rows,
 commands, and interpretation.
 
-The final Rust 1.98.0 release binaries passed the isolated
-`tests/e2e/server-learning-enforcing.sh` workflow separately with nftables and
-iptables on Debian Bookworm and a pinned openSUSE Tumbleweed snapshot. The
-nftables scenarios installed both frontends and still selected nftables; the
-iptables scenarios omitted `nft` and selected the compatibility backend. Every
-run covered Learning, UDP/TCP Enforcing, an explicit inbound allow, and restart.
-They ran in disposable namespaces on a local Unix-socket Docker engine; they
-neither tested nor modified the host firewall and are not production
-certification.
+The release workflow now requires the isolated
+`tests/e2e/server-learning-enforcing.sh` scenario with nftables and iptables for
+the 37 runtime-tested distribution/platform rows. The nftables scenario
+installs both frontends and requires nftables to win; the iptables scenario
+omits `nft` and requires the compatibility backend. Each run covers Learning,
+UDP/TCP Enforcing, application identity, an explicit inbound allow, and
+restart. These 74 configured publication gates must not be read as results
+until the corresponding workflow has completed. They run in disposable
+namespaces on a Unix-socket Docker engine, do not modify the host firewall,
+and are not production or native-hardware certification.
 
 ## TUI localization
 

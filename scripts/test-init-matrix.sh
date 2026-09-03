@@ -7,6 +7,7 @@ umask 077
 usage() {
     printf '%s\n' \
         'usage: scripts/test-init-matrix.sh validate' \
+        '       scripts/test-init-matrix.sh images' \
         '       scripts/test-init-matrix.sh manifests' \
         '       scripts/test-init-matrix.sh containers' \
         '       scripts/test-init-matrix.sh containers-clean'
@@ -14,7 +15,7 @@ usage() {
 
 mode=${1:-}
 case "$mode" in
-    validate|manifests|containers|containers-clean)
+    validate|images|manifests|containers|containers-clean)
         [ "$#" -eq 1 ] || { usage >&2; exit 2; }
         ;;
     *)
@@ -27,6 +28,17 @@ script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 repository_directory=$(CDPATH= cd -- "$script_directory/.." && pwd -P)
 package_directory=$repository_directory/packaging
 fixture_directory=$repository_directory/tests/compat
+
+# Release-critical init fixtures are immutable and deliberately constrained to
+# the amd64 userspace they were reviewed with.  They test parsers/supervisors,
+# not distribution kernels or non-amd64 release packages.
+init_platform=linux/amd64
+alpine_image='alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce'
+devuan_image='devuan/devuan:daedalus@sha256:878e7d497ed8bb3333e85186cc9b8b89ed19270e13f770ea784b1cfbef695a00'
+void_image='voidlinux/voidlinux:latest@sha256:26ba972f0c06beadcec4796ec3037e0bec32af4d255edb68a528bd98304c74f4'
+artix_openrc_image='artixlinux/artixlinux:base-openrc@sha256:09d7ca64ca40db4ffa8f8e97f7bdac8969f9f4a8f791e42d82a6b2377d40ce71'
+artix_s6_image='artixlinux/artixlinux:base-s6@sha256:e563ae1357cf6cd7c6df858b795db8ddf23ffa6ab1888739b91a33da189cf82b'
+artix_dinit_image='artixlinux/artixlinux:base-dinit@sha256:234cf62105d8a5a10caebb9b62dadc271d33eccc9fd41399453e20004a8e319a'
 
 temporary_directory=$(mktemp -d /tmp/openshield-init-matrix.XXXXXX)
 new_images=$temporary_directory/new-images
@@ -59,6 +71,16 @@ trap 'exit 143' TERM
 fail() {
     printf 'FAIL %s\n' "$*" >&2
     exit 1
+}
+
+print_init_images() {
+    printf '%s\t%s\t%s\n' \
+        alpine-openrc "$alpine_image" "$init_platform" \
+        devuan-sysvinit "$devuan_image" "$init_platform" \
+        void-runit "$void_image" "$init_platform" \
+        artix-openrc "$artix_openrc_image" "$init_platform" \
+        artix-s6 "$artix_s6_image" "$init_platform" \
+        artix-dinit "$artix_dinit_image" "$init_platform"
 }
 
 expect_file() {
@@ -237,12 +259,12 @@ require_local_docker() {
 
 record_new_images() {
     for container_image in \
-        alpine:3.22 \
-        devuan/devuan:daedalus \
-        voidlinux/voidlinux:latest \
-        artixlinux/artixlinux:base-openrc \
-        artixlinux/artixlinux:base-s6 \
-        artixlinux/artixlinux:base-dinit
+        "$alpine_image" \
+        "$devuan_image" \
+        "$void_image" \
+        "$artix_openrc_image" \
+        "$artix_s6_image" \
+        "$artix_dinit_image"
     do
         docker image inspect "$container_image" >/dev/null 2>&1 \
             || printf '%s\n' "$container_image" >> "$new_images"
@@ -253,12 +275,12 @@ check_manifests() {
     require_local_docker
     manifest_failures=0
     for container_image in \
-        alpine:3.22 \
-        devuan/devuan:daedalus \
-        voidlinux/voidlinux:latest \
-        artixlinux/artixlinux:base-openrc \
-        artixlinux/artixlinux:base-s6 \
-        artixlinux/artixlinux:base-dinit
+        "$alpine_image" \
+        "$devuan_image" \
+        "$void_image" \
+        "$artix_openrc_image" \
+        "$artix_s6_image" \
+        "$artix_dinit_image"
     do
         if docker buildx imagetools inspect "$container_image" >/dev/null 2>&1; then
             printf 'PASS manifest: %s\n' "$container_image"
@@ -277,40 +299,40 @@ run_container_checks() {
     # These two overlays are intentionally writable: groupadd/addgroup must
     # update their own ephemeral /etc.  They have no network or host mounts
     # other than the read-only helper under test.
-    docker run --rm --network none --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --mount "type=bind,src=$package_directory,dst=/pkg,readonly" \
         --mount "type=bind,src=$repository_directory/LICENSE,dst=/LICENSE,readonly" \
-        alpine:3.22 /bin/sh -ec \
+        "$alpine_image" /bin/sh -ec \
         'for script in /pkg/ensure-group.sh /pkg/stage-install.sh /pkg/openrc/openshield /pkg/sysvinit/openshield /pkg/runit/openshield/run /pkg/runit/openshield/finish /pkg/runit/openshield/check /pkg/s6/openshield/run /pkg/s6/openshield/finish /pkg/dinit/dinit-preflight; do /bin/sh -n "$script"; done; /bin/sh /pkg/ensure-group.sh; /bin/sh /pkg/ensure-group.sh; getent group openshield >/dev/null; install -d -m 0755 /tmp/bin /tmp/stage; install -m 0755 /bin/true /tmp/bin/openshield-daemon; install -m 0755 /bin/true /tmp/bin/openshield-tui; /bin/sh /pkg/stage-install.sh /tmp/stage openrc /tmp/bin >/dev/null; test -x /tmp/stage/etc/init.d/openshield'
     printf '%s\n' \
         'PASS runtime: Alpine/BusyBox parsed scripts, staged safely, and kept addgroup idempotent'
 
-    docker run --rm --network none --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --cap-drop ALL \
         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
         --security-opt no-new-privileges --security-opt label=disable \
         --mount "type=bind,src=$package_directory/ensure-group.sh,dst=/test/ensure-group,readonly" \
-        devuan/devuan:daedalus /bin/sh -ec \
+        "$devuan_image" /bin/sh -ec \
         '/bin/sh /test/ensure-group; /bin/sh /test/ensure-group; getent group openshield >/dev/null'
     printf '%s\n' 'PASS runtime: Devuan/shadow groupadd is idempotent in an isolated overlay'
 
-    docker run --rm --network none --read-only --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --tmpfs /etc/init.d:rw,exec,nosuid,nodev,mode=0755 \
         --mount "type=bind,src=$temporary_directory/stage-openrc/etc/init.d/openshield,dst=/staged/openshield,readonly" \
-        artixlinux/artixlinux:base-openrc /bin/sh -ec \
+        "$artix_openrc_image" /bin/sh -ec \
         'cp /staged/openshield /etc/init.d/openshield; chmod 0755 /etc/init.d/openshield; /etc/init.d/openshield describe >/dev/null'
     printf '%s\n' 'PASS parser: Artix OpenRC loaded the service without running the firewall'
 
-    docker run --rm --network none --read-only --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --tmpfs /run:rw,nosuid,nodev,mode=0755 \
         --mount "type=bind,src=$temporary_directory/stage-sysvinit/etc/init.d/openshield,dst=/staged/openshield,readonly" \
-        devuan/devuan:daedalus /bin/sh -ec \
+        "$devuan_image" /bin/sh -ec \
         '/bin/sh -n /staged/openshield; start-stop-daemon --start --test --quiet --background --make-pidfile --pidfile /run/openshield-test.pid --exec /bin/true --startas /bin/true; sleep 30 & service_pid=$!; printf "%s\n" "$service_pid" > /run/openshield-test.pid; start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/sleep >/dev/null; if start-stop-daemon --stop --test --quiet --pidfile /run/openshield-test.pid --exec /bin/false >/dev/null 2>&1; then exit 1; fi; kill "$service_pid"; wait "$service_pid" 2>/dev/null || true'
     printf '%s\n' 'PASS runtime: Devuan accepted SysV options and rejected a mismatched PID executable'
 
-    docker run --rm --network none --read-only --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --tmpfs /service:rw,exec,nosuid,nodev,mode=0755 \
         --tmpfs /run:rw,exec,nosuid,nodev,mode=0755 \
@@ -318,7 +340,7 @@ run_container_checks() {
         --mount "type=bind,src=$temporary_directory/stage-runit/etc/sv/openshield,dst=/pkgservice,readonly" \
         --mount "type=bind,src=$fixture_directory/init-stub-daemon.sh,dst=/usr/bin/openshield-daemon,readonly" \
         --mount "type=bind,src=$fixture_directory/init-stub-group.sh,dst=/usr/libexec/openshield/ensure-group,readonly" \
-        voidlinux/voidlinux:latest /bin/sh -ec '
+        "$void_image" /bin/sh -ec '
             cp -R /pkgservice/. /service/
             chmod 0755 /service/run /service/finish /service/check
             runsv /service & supervisor=$!
@@ -334,15 +356,15 @@ run_container_checks() {
         '
     printf '%s\n' 'PASS runtime: Void runit executed preflight, daemon lifecycle, and finish quarantine'
 
-    docker run --rm --network none --read-only --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --tmpfs /work:rw,exec,nosuid,nodev,mode=0755 \
         --mount "type=bind,src=$temporary_directory/stage-s6/etc/s6/sv/openshield,dst=/staged-openshield,readonly" \
-        artixlinux/artixlinux:base-s6 /bin/sh -ec \
+        "$artix_s6_image" /bin/sh -ec \
         'mkdir -p /work/source/mount-filesystems; printf "oneshot\n" > /work/source/mount-filesystems/type; printf "#!/bin/sh\nexit 0\n" > /work/source/mount-filesystems/up; chmod 0755 /work/source/mount-filesystems/up; cp -R /staged-openshield /work/source/openshield; s6-rc-compile /work/compiled /work/source; s6-rc-db -c /work/compiled dependencies openshield | grep -qx mount-filesystems'
     printf '%s\n' 'PASS parser: Artix s6-rc compiled OpenShield as a longrun service'
 
-    docker run --rm --network none --read-only --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --tmpfs /service:rw,exec,nosuid,nodev,mode=0755 \
         --tmpfs /run:rw,exec,nosuid,nodev,mode=0755 \
@@ -350,7 +372,7 @@ run_container_checks() {
         --mount "type=bind,src=$temporary_directory/stage-s6/etc/s6/sv/openshield,dst=/pkgservice,readonly" \
         --mount "type=bind,src=$fixture_directory/init-stub-daemon.sh,dst=/usr/bin/openshield-daemon,readonly" \
         --mount "type=bind,src=$fixture_directory/init-stub-group.sh,dst=/usr/libexec/openshield/ensure-group,readonly" \
-        artixlinux/artixlinux:base-s6 /bin/sh -ec '
+        "$artix_s6_image" /bin/sh -ec '
             cp -R /pkgservice/. /service/
             chmod 0755 /service/run /service/finish
             s6-supervise /service & supervisor=$!
@@ -369,12 +391,12 @@ run_container_checks() {
         '
     printf '%s\n' 'PASS runtime: Artix s6 executed preflight, daemon lifecycle, and finish quarantine'
 
-    docker run --rm --network none --read-only --cap-drop ALL \
+    docker run --rm --platform "$init_platform" --network none --read-only --cap-drop ALL \
         --security-opt no-new-privileges --security-opt label=disable \
         --mount "type=bind,src=$temporary_directory/stage-dinit/etc/dinit.d,dst=/staged-dinit,readonly" \
         --mount type=bind,src=/bin/true,dst=/usr/bin/openshield-daemon,readonly \
         --mount "type=bind,src=$temporary_directory/stage-dinit/usr/libexec/openshield/dinit-preflight,dst=/usr/libexec/openshield/dinit-preflight,readonly" \
-        artixlinux/artixlinux:base-dinit /usr/sbin/dinit-check \
+        "$artix_dinit_image" /usr/sbin/dinit-check \
         --services-dir /staged-dinit openshield
     printf '%s\n' 'PASS parser: Artix dinit-check found no service-description problems'
 
@@ -384,6 +406,9 @@ run_container_checks() {
 case "$mode" in
     validate)
         validate_sources
+        ;;
+    images)
+        print_init_images
         ;;
     manifests)
         check_manifests

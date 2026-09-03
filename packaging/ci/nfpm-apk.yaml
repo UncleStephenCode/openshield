@@ -1,0 +1,57 @@
+name: openshield
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: ${PACKAGE_RELEASE}
+section: net
+priority: optional
+maintainer: OpenShield developers
+vendor: OpenShield
+homepage: https://github.com/UncleStephenCode/openshield
+license: GPL-3.0-only
+description: Application-aware Linux host firewall written in Rust.
+
+# APK packaging intentionally lists every payload file. This keeps the OpenRC
+# package independent from the systemd package layout and prevents a newly
+# staged file from becoming part of the release without an explicit review.
+contents:
+  - src: .package-root/usr/bin/openshield-daemon
+    dst: /usr/bin/openshield-daemon
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: .package-root/usr/bin/openshield-tui
+    dst: /usr/bin/openshield-tui
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: .package-root/usr/libexec/openshield/ensure-group
+    dst: /usr/libexec/openshield/ensure-group
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: .package-root/usr/share/openshield/LICENSE
+    dst: /usr/share/openshield/LICENSE
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: .package-root/usr/share/openshield/openshield.sysusers
+    dst: /usr/share/openshield/openshield.sysusers
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: .package-root/etc/init.d/openshield
+    dst: /etc/init.d/openshield
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+
+scripts:
+  postinstall: packaging/ci/hooks/postinstall-openrc.sh
