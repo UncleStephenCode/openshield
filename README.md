@@ -182,15 +182,18 @@ step described in [packaging/README.md](packaging/README.md).
 The authoritative distribution/architecture release matrix and its gated
 build-to-publication flow are documented in [.github/README-CI.md](.github/README-CI.md).
 
-Releases provide separate GNU builds and RPMs for every main Tumbleweed
-installation architecture:
+The release workflow produces separate architecture-specific builds and RPMs
+for every Tumbleweed platform selected by the authoritative release matrix:
 
-| `uname -m` family | Release suffix | RPM architecture |
+| Target architecture | Release suffix | RPM architecture |
 | --- | --- | --- |
 | `x86_64` | `tumbleweed-amd64` | `x86_64` |
-| `i586` / `i686` | `tumbleweed-i586` | `i586` |
+| `i586` / `i686` | `tumbleweed-386` | `i586` |
 | `aarch64` | `tumbleweed-arm64` | `aarch64` |
+| ARMv6 hard-float | `tumbleweed-armv6` | `armv6hl` |
+| ARMv7 hard-float | `tumbleweed-armv7` | `armv7hl` |
 | `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` |
+| `riscv64` | `tumbleweed-riscv64` | `riscv64` |
 | `s390x` | `tumbleweed-s390x` | `s390x` |
 
 Install the matching Tumbleweed RPM with `zypper`. Its firewall dependency is
@@ -298,16 +301,19 @@ Compatibility claims are intentionally scoped:
 - the two RISC-V 32 targets are Rust Tier 3 and were skipped because stable
   rustup does not ship their standard libraries; they require an explicitly
   separate nightly `build-std` workflow;
-- separate Tumbleweed GNU release binaries were linked and ELF-validated for
-  x86_64, i586, AArch64, ppc64le, and s390x. The four non-host builds completed
-  capability-free `--version` smoke tests under pinned Cross QEMU images, and
-  i586 additionally ran in the pinned official Tumbleweed `linux/386` image;
-- non-native `cargo check` proves source-level compilation, not operation on
-  physical hardware. The explicit QEMU smokes above do not replace native
-  hardware validation. Those standalone binary smokes did not install a
-  transparent binfmt handler. The separate release-package matrix registers
-  only the required pinned QEMU handler on an ephemeral GitHub-hosted runner for
-  the Tumbleweed `ppc64le` and `s390x` package-install smokes.
+- the release workflow is configured for 43 architecture/family binary rows,
+  43 corresponding package rows, and 86 pinned distribution/platform install
+  rows. It requires the expected ELF identity, a static runtime boundary, a
+  target-image binary smoke, package installation, and assigned container tests
+  before publication;
+- every one of the 86 platform rows is assigned both nftables and iptables
+  Learning-to-Enforcing scenarios, for 172 firewall jobs. This is a publication
+  requirement of the new matrix, not a claim that an unpublished workflow run
+  has already completed;
+- `amd64` and `arm64` execute on native runners, `386` uses x86 compatibility,
+  and ARMv5/6/7, `ppc64le`, `riscv64`, and `s390x` use selected pinned
+  Cross/QEMU environments. QEMU results are emulation evidence; they do not
+  replace native-hardware validation or exercise a distribution-owned kernel.
 
 The 60-image smoke matrix does not boot each image's init system and does not
 exercise its kernel, firewall backend, NFQUEUE, package manager, or upgrade
@@ -315,15 +321,16 @@ path. Archive and rolling images are compatibility probes, not supported-life
 guarantees. See [tests/compat/README.md](tests/compat/README.md) for exact rows,
 commands, and interpretation.
 
-The final Rust 1.98.0 release binaries passed the isolated
-`tests/e2e/server-learning-enforcing.sh` workflow separately with nftables and
-iptables on Debian Bookworm and a pinned openSUSE Tumbleweed snapshot. The
-nftables scenarios installed both frontends and still selected nftables; the
-iptables scenarios omitted `nft` and selected the compatibility backend. Every
-run covered Learning, UDP/TCP Enforcing, an explicit inbound allow, and restart.
-They ran in disposable namespaces on a local Unix-socket Docker engine; they
-neither tested nor modified the host firewall and are not production
-certification.
+The release workflow now requires the isolated
+`tests/e2e/server-learning-enforcing.sh` scenario with nftables and iptables for
+all 86 distribution/platform rows. The nftables scenario installs both
+frontends and requires nftables to win; the iptables scenario omits `nft` and
+requires the compatibility backend. Each run covers Learning, UDP/TCP
+Enforcing, application identity, an explicit inbound allow, and restart. These
+are configured publication gates and must not be read as results until the
+corresponding workflow has completed. They run in disposable namespaces on a
+Unix-socket Docker engine, do not modify the host firewall, and are not
+production or native-hardware certification.
 
 ## TUI localization
 

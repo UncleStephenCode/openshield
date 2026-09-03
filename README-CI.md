@@ -12,20 +12,21 @@ The release graph is fail-closed:
 ```text
 Validation
     -> Quality Gate
-    -> 7 binary builds
-    -> 18 package builds
-    -> 34 distribution/platform installations
+    -> 43 family/architecture binary builds
+    -> 43 family/architecture package builds
+    -> 86 distribution/platform installations
     -> pinned init-system container tests
-    -> 59 firewall E2E jobs
+    -> 172 firewall E2E jobs
     -> sealed release candidate and evidence
     -> publication
 ```
 
-The 59 firewall jobs comprise 32 nftables scenarios and 27 iptables fallback
-scenarios. Tumbleweed i586 executes both scenarios through the x86 runner's
-`linux/386` compatibility mode. Tumbleweed ppc64le and s390x are explicitly
-recorded as QEMU package smoke only and are not represented as full firewall or
-native-hardware certification.
+Every one of the 86 pinned distribution/platform rows executes both the
+nftables-preference and iptables-only fallback scenarios. `amd64` and `arm64`
+use native GitHub-hosted runners, `linux/386` uses the x86 compatibility path,
+and the remaining ARM, PowerPC, RISC-V, and IBM Z rows use a SHA-256-pinned
+Cross/QEMU path. Emulated evidence is labelled as such and is not represented
+as native-hardware certification.
 
 Every published package is linked to its installation and firewall evidence by
 asset name and SHA-256. Before making any publication API request, the

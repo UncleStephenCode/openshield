@@ -5,14 +5,22 @@ set -euo pipefail
 : "${ARCH:?ARCH is required}"
 : "${FAMILY:?FAMILY is required}"
 
+version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+[[ "$VERSION" =~ $version_pattern ]] || {
+  echo 'VERSION must be a semantic version without a v prefix' >&2
+  exit 2
+}
+[[ "$ARCH" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
+  echo 'ARCH is not a safe nFPM architecture value' >&2
+  exit 2
+}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
 BIN_DIR="$REPO_ROOT/release-bin"
 OUT_DIR="$REPO_ROOT/dist"
 ROOT_DIR="$REPO_ROOT/.package-root"
 CONFIG="$REPO_ROOT/packaging/ci/nfpm.yaml"
 RPM_FIREWALL_DEPENDENCY='(nftables or iptables)'
-RPM_C_RUNTIME_DEPENDENCY=
-RPM_UNWIND_RUNTIME_DEPENDENCY=
 
 [[ -x "$BIN_DIR/openshield-daemon" ]] || { echo "missing $BIN_DIR/openshield-daemon" >&2; exit 2; }
 [[ -x "$BIN_DIR/openshield-tui" ]] || { echo "missing $BIN_DIR/openshield-tui" >&2; exit 2; }
@@ -25,6 +33,7 @@ case "$FAMILY" in
     INIT=openrc
     PACKAGER=apk
     PACKAGE_RELEASE=0
+    CONFIG="$REPO_ROOT/packaging/ci/nfpm-apk.yaml"
     ;;
   deb)
     INIT=systemd
@@ -55,11 +64,6 @@ case "$FAMILY" in
     INIT=systemd
     PACKAGER=rpm
     PACKAGE_RELEASE=1.tumbleweed
-    # These GNU binaries are dynamically linked. Unlike rpmbuild, nFPM does
-    # not discover their ELF dependencies, so name the official Tumbleweed
-    # runtime packages explicitly.
-    RPM_C_RUNTIME_DEPENDENCY=glibc
-    RPM_UNWIND_RUNTIME_DEPENDENCY=libgcc_s1
     ;;
   arch)
     INIT=systemd
@@ -74,8 +78,7 @@ esac
 
 "$REPO_ROOT/packaging/stage-install.sh" "$ROOT_DIR" "$INIT" "$BIN_DIR"
 
-export PACKAGE_RELEASE RPM_C_RUNTIME_DEPENDENCY RPM_FIREWALL_DEPENDENCY
-export RPM_UNWIND_RUNTIME_DEPENDENCY VERSION ARCH
+export PACKAGE_RELEASE RPM_FIREWALL_DEPENDENCY VERSION ARCH
 
 (cd "$REPO_ROOT" && nfpm package --config "$CONFIG" --packager "$PACKAGER" --target "$OUT_DIR/")
 

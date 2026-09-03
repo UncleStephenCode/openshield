@@ -43,6 +43,12 @@ case "$PLATFORM" in
     EXPECTED_ELF_DATA='little endian'
     platform_elf_machine='Intel 80386'
     ;;
+  linux/arm/v5|linux/arm/v6|linux/arm/v7)
+    EXPECTED_ELF_CLASS=ELF32
+    EXPECTED_ELF_BITS=32
+    EXPECTED_ELF_DATA='little endian'
+    platform_elf_machine=ARM
+    ;;
   linux/ppc64le)
     EXPECTED_ELF_CLASS=ELF64
     EXPECTED_ELF_BITS=64
@@ -54,6 +60,12 @@ case "$PLATFORM" in
     EXPECTED_ELF_BITS=64
     EXPECTED_ELF_DATA='big endian'
     platform_elf_machine='IBM S/390'
+    ;;
+  linux/riscv64)
+    EXPECTED_ELF_CLASS=ELF64
+    EXPECTED_ELF_BITS=64
+    EXPECTED_ELF_DATA='little endian'
+    platform_elf_machine='RISC-V'
     ;;
   *) fail "unsupported PLATFORM=$PLATFORM" ;;
 esac
@@ -114,7 +126,6 @@ package_name_pattern='^[A-Za-z0-9][A-Za-z0-9._+~-]*$'
 [[ "$PACKAGE_BASENAME" =~ $package_name_pattern ]] || fail 'unsafe package filename'
 
 EXPECTED_RPM_RELEASE=
-EXPECT_TUMBLEWEED_RUNTIME=false
 case "$FAMILY" in
   deb)
     # nFPM's semver schema maps prereleases to Debian's sorting-safe '~'.
@@ -143,7 +154,6 @@ case "$FAMILY" in
   tumbleweed)
     EXPECTED_PACKAGE_VERSION=$version_core
     EXPECTED_RPM_RELEASE=1.tumbleweed
-    EXPECT_TUMBLEWEED_RUNTIME=true
     ;;
   alpine)
     EXPECTED_PACKAGE_VERSION=$version_core
@@ -170,6 +180,7 @@ esac
 COMMON_BINARY_ASSERTIONS='
       command -v file >/dev/null
       command -v readelf >/dev/null
+      command -v awk >/dev/null
       for binary_name in openshield-daemon openshield-tui; do
         binary=/usr/bin/$binary_name
         test -f "$binary" && test -x "$binary" && test ! -L "$binary"
@@ -181,6 +192,18 @@ COMMON_BINARY_ASSERTIONS='
             exit 1
             ;;
         esac
+        case "$file_output" in
+          *"statically linked"*|*"static-pie linked"*) ;;
+          *)
+            printf "%s\n" "binary is not statically linked: $binary: $file_output" >&2
+            exit 1
+            ;;
+        esac
+        if LC_ALL=C readelf -l "$binary" \
+          | grep -Eq '\''(^|[[:space:]])INTERP([[:space:]]|$)'\''; then
+          printf "%s\n" "binary contains a dynamic ELF interpreter: $binary" >&2
+          exit 1
+        fi
         elf_class=$(LC_ALL=C readelf -h "$binary" \
           | awk -F: '\''/^[[:space:]]*Class:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }'\'')
         elf_data=$(LC_ALL=C readelf -h "$binary" \
@@ -227,10 +250,6 @@ RPM_METADATA_ASSERTIONS='set -eu
       rpm -qp --requires "$package" | grep -Fqx "(nftables or iptables)"
       rpm -qp --requires "$package" | grep -Fqx /usr/bin/systemd-tmpfiles
       rpm -qp --recommends "$package" | grep -Fqx nftables
-      if [ "$EXPECT_TUMBLEWEED_RUNTIME" = true ]; then
-        rpm -qp --requires "$package" | grep -Fqx glibc
-        rpm -qp --requires "$package" | grep -Fqx libgcc_s1
-      fi
       for required_path in \
         /usr/bin/openshield-daemon \
         /usr/bin/openshield-tui \
@@ -297,8 +316,7 @@ APK_METADATA_ASSERTIONS='set -eu
       [ "$package_arch" = "$EXPECTED_PACKAGE_ARCH" ]'
 
 APK_INSTALL_ASSERTIONS='
-      apk info -e openshield
-      [ "$(apk info -v openshield)" = "openshield-$EXPECTED_PACKAGE_VERSION" ]
+      apk info -e "openshield=$EXPECTED_PACKAGE_VERSION"
       test -f /etc/init.d/openshield
       getent group openshield >/dev/null'
 
@@ -351,18 +369,18 @@ case "$FAMILY" in
     ;;
   tumbleweed)
     CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --allow-unsigned-rpm binutils file "$package"
-      rpm -q glibc libgcc_s1 nftables >/dev/null
+      zypper --non-interactive install --allow-unsigned-rpm binutils file gawk "$package"
+      rpm -q nftables >/dev/null
     '$RPM_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     FALLBACK_CMD=$RPM_METADATA_ASSERTIONS'
-      zypper --non-interactive install --no-recommends binutils file iptables
+      zypper --non-interactive install --no-recommends binutils file gawk iptables
       rpm -q iptables >/dev/null
       if rpm -q nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
         printf "%s\n" "nftables unexpectedly present before fallback installation" >&2
         exit 1
       fi
       zypper --non-interactive install --no-recommends --allow-unsigned-rpm "$package"
-      rpm -q glibc libgcc_s1 iptables >/dev/null
+      rpm -q iptables >/dev/null
       if rpm -q nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
         printf "%s\n" "nftables recommendation was unexpectedly installed" >&2
         exit 1
@@ -371,14 +389,50 @@ case "$FAMILY" in
     ;;
   alpine)
     CMD=$APK_METADATA_ASSERTIONS'
-      apk add --no-cache binutils file
+      apk add --no-cache binutils file nftables
       apk add --no-cache --allow-untrusted "$package"
+    '$APK_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
+    FALLBACK_CMD=$APK_METADATA_ASSERTIONS'
+      apk add --no-cache binutils file iptables
+      if command -v nft >/dev/null 2>&1; then
+        printf "%s\n" "nftables unexpectedly present before fallback installation" >&2
+        exit 1
+      fi
+      apk add --no-cache --allow-untrusted "$package"
+      apk info -e iptables >/dev/null
+      if apk info -e nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
+        printf "%s\n" "nftables was unexpectedly installed with the fallback package" >&2
+        exit 1
+      fi
+      for tool in iptables ip6tables iptables-restore ip6tables-restore iptables-save ip6tables-save; do
+        command -v "$tool" >/dev/null
+      done
     '$APK_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
   arch)
     CMD=$ARCH_METADATA_ASSERTIONS'
-      pacman -Syu --noconfirm --needed binutils file
+      pacman -Syu --noconfirm --needed binutils file nftables
       pacman -U --noconfirm "$package"
+    '$ARCH_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
+    FALLBACK_CMD=$ARCH_METADATA_ASSERTIONS'
+      pacman -Syu --noconfirm --needed binutils file
+      pacman -S --noconfirm --ask=4 iptables-legacy
+      if pacman -Q nftables >/dev/null 2>&1; then
+        pacman -Rns --noconfirm nftables
+      fi
+      if command -v nft >/dev/null 2>&1; then
+        printf "%s\n" "nftables unexpectedly present before fallback installation" >&2
+        exit 1
+      fi
+      pacman -U --noconfirm "$package"
+      pacman -Q iptables-legacy >/dev/null
+      if pacman -Q nftables >/dev/null 2>&1 || command -v nft >/dev/null 2>&1; then
+        printf "%s\n" "nftables was unexpectedly installed with the fallback package" >&2
+        exit 1
+      fi
+      for tool in iptables ip6tables iptables-restore ip6tables-restore iptables-save ip6tables-save; do
+        command -v "$tool" >/dev/null
+      done
     '$ARCH_INSTALL_ASSERTIONS$COMMON_BINARY_ASSERTIONS
     ;;
 esac
@@ -400,13 +454,12 @@ run_package_test() {
     --env "EXPECTED_ELF_DATA=$EXPECTED_ELF_DATA" \
     --env "EXPECTED_ELF_MACHINE=$EXPECTED_ELF_MACHINE" \
     --env "EXPECTED_RPM_RELEASE=$EXPECTED_RPM_RELEASE" \
-    --env "EXPECT_TUMBLEWEED_RUNTIME=$EXPECT_TUMBLEWEED_RUNTIME" \
     --mount "type=bind,src=$DIST,dst=/packages,readonly" \
     "$IMAGE" \
     /bin/sh -c "$1"
 }
 
 run_package_test "$CMD"
-if [[ "$FAMILY" == tumbleweed ]]; then
+if [[ "$FAMILY" == tumbleweed || "$FAMILY" == alpine || "$FAMILY" == arch ]]; then
   run_package_test "$FALLBACK_CMD"
 fi

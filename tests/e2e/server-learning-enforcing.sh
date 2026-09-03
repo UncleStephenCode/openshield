@@ -11,11 +11,13 @@ artifact_directory=$2
 case "$backend" in nftables|iptables) ;; *) usage; exit 2 ;; esac
 case "$artifact_directory" in /*) ;; *) printf '%s\n' 'artifact directory must be absolute' >&2; exit 2 ;; esac
 artifact_mode=${E2E_ARTIFACT_MODE:-binary}
+native_client_source=${E2E_NATIVE_CLIENT:-}
 case "$artifact_mode" in
     binary)
         [ -x "$artifact_directory/openshield-daemon" ] \
             || { printf '%s\n' 'missing daemon binary' >&2; exit 2; }
         daemon_path=/opt/openshield/openshield-daemon
+        artifact_mount_destination=/opt/openshield
         ;;
     package)
         [ -d "$artifact_directory" ] \
@@ -32,12 +34,58 @@ case "$artifact_mode" in
             ''|*[!0-9A-Za-z.+~-]*) printf '%s\n' 'unsafe EXPECTED_VERSION' >&2; exit 2 ;;
         esac
         daemon_path=/usr/bin/openshield-daemon
+        artifact_mount_destination=/packages
         ;;
     *)
         printf '%s\n' 'E2E_ARTIFACT_MODE must be binary or package' >&2
         exit 2
         ;;
 esac
+if [ -n "$native_client_source" ]; then
+    for required_command in file readelf awk grep; do
+        command -v "$required_command" >/dev/null 2>&1 || {
+            printf 'required native-client verifier is unavailable: %s\n' \
+                "$required_command" >&2
+            exit 2
+        }
+    done
+    case "$native_client_source" in
+        /*) ;;
+        *) printf '%s\n' 'E2E_NATIVE_CLIENT must be absolute' >&2; exit 2 ;;
+    esac
+    case "$native_client_source" in
+        *[!A-Za-z0-9._/-]*)
+            printf '%s\n' 'E2E_NATIVE_CLIENT contains unsafe path characters' >&2
+            exit 2
+            ;;
+    esac
+    if [ ! -f "$native_client_source" ] || [ ! -x "$native_client_source" ] \
+        || [ -L "$native_client_source" ]; then
+        printf '%s\n' 'E2E_NATIVE_CLIENT must be an executable regular non-symlink file' >&2
+        exit 2
+    fi
+    native_client_identity=$(LC_ALL=C file -b "$native_client_source")
+    case "$native_client_identity" in
+        *"statically linked"*|*"static-pie linked"*) ;;
+        *) printf '%s\n' 'E2E_NATIVE_CLIENT must be statically linked' >&2; exit 2 ;;
+    esac
+    if LC_ALL=C readelf -l "$native_client_source" \
+        | grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)'; then
+        printf '%s\n' 'E2E_NATIVE_CLIENT must not contain an ELF interpreter' >&2
+        exit 2
+    fi
+    native_client_machine=$(LC_ALL=C readelf -h "$native_client_source" \
+        | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')
+    case "$(uname -m)" in
+        x86_64) expected_native_client_machine='Advanced Micro Devices X86-64' ;;
+        aarch64) expected_native_client_machine=AArch64 ;;
+        *) printf '%s\n' 'unsupported E2E runner architecture for native helper' >&2; exit 2 ;;
+    esac
+    [ "$native_client_machine" = "$expected_native_client_machine" ] || {
+        printf '%s\n' 'E2E_NATIVE_CLIENT does not match the Docker host architecture' >&2
+        exit 2
+    }
+fi
 client_family=${CLIENT_FAMILY:-debian}
 client_platform=${CLIENT_PLATFORM:-linux/amd64}
 client_image=${CLIENT_IMAGE:-rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922}
@@ -47,8 +95,8 @@ case "$client_family" in
     *) printf '%s\n' 'unsupported E2E client family' >&2; exit 2 ;;
 esac
 case "$client_platform" in
-    linux/amd64|linux/arm64|linux/386) ;;
-    *) printf '%s\n' 'unsupported native E2E client platform' >&2; exit 2 ;;
+    linux/amd64|linux/arm64|linux/386|linux/arm/v5|linux/arm/v6|linux/arm/v7|linux/ppc64le|linux/s390x|linux/riscv64) ;;
+    *) printf '%s\n' 'unsupported E2E client platform' >&2; exit 2 ;;
 esac
 for image in "$client_image" "$server_image"; do
     case "$image" in
@@ -80,7 +128,7 @@ case "$docker_host" in
         ;;
 esac
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 temporary_directory=$(mktemp -d /tmp/openshield-e2e.XXXXXX)
 run_token=${temporary_directory##*/}
 network_name="openshield-$run_token"
@@ -320,14 +368,15 @@ server_id=$(docker create --name "$server_name" --label "$resource_label" --netw
     "$server_image" python3 -m http.server 18081 --bind 0.0.0.0)
 docker start "$server_id" >/dev/null
 
-if [ "$artifact_mode" = package ]; then
+if [ -n "$native_client_source" ]; then
     client_id=$(docker create --platform "$client_platform" \
         --name "$client_name" --label "$resource_label" --network "$network_id" \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH \
         --security-opt no-new-privileges --security-opt label=disable \
         --env PYTHONDONTWRITEBYTECODE=1 \
-        --mount "type=bind,src=$artifact_directory,dst=/packages,readonly" \
+        --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$native_client_source,dst=/opt/openshield-e2e-client,readonly" \
         "$client_image" sleep infinity)
 else
     client_id=$(docker create --platform "$client_platform" \
@@ -335,7 +384,7 @@ else
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH \
         --security-opt no-new-privileges --security-opt label=disable \
         --env PYTHONDONTWRITEBYTECODE=1 \
-        --mount "type=bind,src=$artifact_directory,dst=/opt/openshield,readonly" \
+        --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
         "$client_image" sleep infinity)
 fi
@@ -396,24 +445,35 @@ case "$client_family" in
         fi
         ;;
     alpine)
-        [ "$backend" = nftables ] || {
-            printf '%s\n' 'the released Alpine package requires nftables' >&2
-            exit 2
-        }
-        docker exec "$client" apk add --no-cache \
-            nftables iptables curl netcat-openbsd python3 shadow util-linux libc-utils >/dev/null
+        if [ "$backend" = nftables ]; then
+            # Keep xtables installed to prove that a usable nft command wins.
+            packages='nftables iptables curl netcat-openbsd python3 shadow util-linux libc-utils'
+        else
+            packages='iptables curl netcat-openbsd python3 shadow util-linux libc-utils'
+        fi
+        # shellcheck disable=SC2086
+        docker exec "$client" apk add --no-cache $packages >/dev/null
         if [ "$artifact_mode" = package ]; then
             docker exec "$client" /bin/sh -c \
                 'apk add --allow-untrusted /packages/*.apk' >/dev/null
         fi
         ;;
     arch)
-        [ "$backend" = nftables ] || {
-            printf '%s\n' 'the released Arch package requires nftables' >&2
-            exit 2
-        }
         docker exec "$client" pacman -Syu --noconfirm --needed \
-            nftables iptables-nft curl openbsd-netcat python shadow util-linux >/dev/null
+            curl openbsd-netcat python shadow util-linux >/dev/null
+        if [ "$backend" = nftables ]; then
+            docker exec "$client" pacman -S --noconfirm --needed \
+                nftables iptables >/dev/null
+        else
+            # The base image currently contains the nft-based iptables package.
+            # Replace it transactionally with the official legacy provider,
+            # then remove the now-unused nft command before installing OpenShield.
+            docker exec "$client" pacman -S --noconfirm --ask=4 \
+                iptables-legacy >/dev/null
+            if docker exec "$client" pacman -Q nftables >/dev/null 2>&1; then
+                docker exec "$client" pacman -Rns --noconfirm nftables >/dev/null
+            fi
+        fi
         if [ "$artifact_mode" = package ]; then
             docker exec "$client" /bin/sh -c \
                 'pacman -U --noconfirm /packages/*.pkg.tar.zst' >/dev/null
@@ -472,10 +532,10 @@ docker exec "$client" grep -Fq "firewall_backend=\"$expected_backend\"" \
     }
 observer_gid=$(docker exec "$client" getent group openshield | cut -d: -f3)
 socket_gid=$(docker exec "$client" stat -c '%g' /run/openshield/observe.sock)
-[ -n "$observer_gid" ] && [ "$socket_gid" = "$observer_gid" ] || {
+if [ -z "$observer_gid" ] || [ "$socket_gid" != "$observer_gid" ]; then
     printf '%s\n' 'observation socket does not have the openshield group' >&2
     exit 1
-}
+fi
 
 begin_stage 'verify IPC access control'
 status=$(docker exec "$client" python3 /opt/ipc_client.py status)
@@ -511,35 +571,60 @@ while True:
     s.sendto(data, address)
 '
 wait_for_marker "$server" /tmp/openshield-udp-ready 'UDP echo server'
-udp_command=$(docker exec "$client" /bin/sh -c 'command -v nc')
-udp_executable=$(docker exec "$client" readlink -f "$udp_command")
-case "$udp_executable" in
-    /*) ;;
-    *) printf '%s\n' 'cannot resolve the UDP client executable' >&2; exit 1 ;;
-esac
-case "$udp_executable" in
-    *[!A-Za-z0-9._/-]*)
-        printf '%s\n' 'unsafe UDP client executable path' >&2
-        exit 1
-        ;;
-esac
+if [ -n "$native_client_source" ]; then
+    tcp_executable=/opt/openshield-e2e-client
+    udp_executable=/opt/openshield-e2e-client
+else
+    tcp_command=$(docker exec "$client" /bin/sh -c 'command -v curl')
+    udp_command=$(docker exec "$client" /bin/sh -c 'command -v nc')
+    tcp_executable=$(docker exec "$client" readlink -f "$tcp_command")
+    udp_executable=$(docker exec "$client" readlink -f "$udp_command")
+fi
+for executable in "$tcp_executable" "$udp_executable"; do
+    case "$executable" in
+        /*) ;;
+        *) printf '%s\n' 'cannot resolve an E2E traffic client executable' >&2; exit 1 ;;
+    esac
+    case "$executable" in
+        *[!A-Za-z0-9._/-]*)
+            printf '%s\n' 'unsafe E2E traffic client executable path' >&2
+            exit 1
+            ;;
+    esac
+done
 udp_payload=openshield-udp-e2e
 
-run_udp_client() {
-    docker exec "$client" /bin/sh -c '
-        payload=$1
-        executable=$2
-        source_port=$3
-        server_address=$4
-        server_port=$5
-        printf "%s" "$payload" \
-            | "$executable" -u -w 2 -p "$source_port" "$server_address" "$server_port"
-    ' openshield-udp-client \
-        "$udp_payload" "$udp_executable" 19000 "$server_ip" 18082
+run_tcp_client() {
+    timeout_seconds=$1
+    if [ -n "$native_client_source" ]; then
+        docker exec "$client" "$tcp_executable" tcp \
+            "$server_ip" 18081 "$((timeout_seconds * 1000))"
+    else
+        docker exec "$client" "$tcp_executable" \
+            --fail --silent --show-error --max-time "$timeout_seconds" \
+            "http://$server_ip:18081/" >/dev/null
+    fi
 }
 
-docker exec "$client" curl --fail --silent --show-error --max-time 5 \
-    "http://$server_ip:18081/" >/dev/null
+run_udp_client() {
+    if [ -n "$native_client_source" ]; then
+        docker exec "$client" "$udp_executable" udp \
+            "$server_ip" 18082 19000 2000 "$udp_payload"
+    else
+        docker exec "$client" /bin/sh -c '
+            payload=$1
+            executable=$2
+            source_port=$3
+            server_address=$4
+            server_port=$5
+            printf "%s" "$payload" \
+                | "$executable" -u -w 2 -p "$source_port" "$server_address" "$server_port"
+        ' openshield-udp-client \
+            "$udp_payload" "$udp_executable" 19000 "$server_ip" 18082
+    fi
+}
+
+run_tcp_client 5
 if ! udp_reply=$(run_udp_client); then
     printf '%s\n' 'UDP echo command failed during Learning' >&2
     exit 1
@@ -552,7 +637,7 @@ fi
 attempt=0
 while [ "$attempt" -lt 50 ]; do
     if docker exec "$client" python3 /opt/ipc_client.py assert-learned \
-        /usr/bin/curl "$server_ip" 18081; then
+        "$tcp_executable" "$server_ip" 18081; then
         break
     fi
     attempt=$((attempt + 1))
@@ -572,8 +657,7 @@ done
 
 begin_stage 'enforce learned outbound rules'
 docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
-docker exec "$client" curl --fail --silent --show-error --max-time 5 \
-    "http://$server_ip:18081/" >/dev/null
+run_tcp_client 5
 if ! udp_reply=$(run_udp_client); then
     printf '%s\n' 'learned UDP command failed during Enforcing' >&2
     exit 1
@@ -623,8 +707,7 @@ else
     docker exec "$client" nft add rule inet openshield_e2e_downstream output \
         ip daddr "$server_ip" udp dport 18082 drop
 fi
-if docker exec "$client" curl --fail --silent --show-error --max-time 2 \
-    "http://$server_ip:18081/" >/dev/null 2>&1; then
+if run_tcp_client 2 >/dev/null 2>&1; then
     printf '%s\n' 'an OpenShield allow bypassed a downstream firewall DROP' >&2
     exit 1
 fi
@@ -641,8 +724,7 @@ if [ "$backend" = iptables ]; then
 else
     docker exec "$client" nft delete table inet openshield_e2e_downstream
 fi
-docker exec "$client" curl --fail --silent --show-error --max-time 5 \
-    "http://$server_ip:18081/" >/dev/null
+run_tcp_client 5
 if ! udp_reply=$(run_udp_client); then
     printf '%s\n' 'UDP echo command failed after downstream DROP removal' >&2
     exit 1
@@ -708,8 +790,7 @@ if docker exec "$client" test -S /run/openshield/control.sock; then
 fi
 docker exec "$client" python3 -c \
     'import json; assert json.load(open("/var/lib/openshield/state.json", encoding="utf-8"))["mode"] == "enforcing"'
-if docker exec "$client" curl --fail --silent --show-error --max-time 2 \
-    "http://$server_ip:18081/" >/dev/null 2>&1; then
+if run_tcp_client 2 >/dev/null 2>&1; then
     printf '%s\n' 'graceful shutdown did not leave kernel BlockAll active' >&2
     exit 1
 fi
@@ -720,11 +801,10 @@ wait_for_daemon_ready /tmp/openshield-restart.log 'restarted daemon'
 assert_exact_unit_process_state
 status=$(docker exec "$client" python3 /opt/ipc_client.py status)
 case "$status" in *'"mode": "enforcing"'*) ;; *) printf 'unexpected restart status: %s\n' "$status" >&2; exit 1 ;; esac
-docker exec "$client" curl --fail --silent --show-error --max-time 5 \
-    "http://$server_ip:18081/" >/dev/null || {
-        printf '%s\n' 'persisted outbound rule did not recover after daemon restart' >&2
-        exit 1
-    }
+run_tcp_client 5 || {
+    printf '%s\n' 'persisted outbound rule did not recover after daemon restart' >&2
+    exit 1
+}
 daemon_pid=$(docker exec "$client" cat "$daemon_pid_file")
 case "$daemon_pid" in ''|*[!0-9]*) printf '%s\n' 'invalid restarted daemon pid' >&2; exit 1 ;; esac
 docker exec "$client" kill -TERM "$daemon_pid"

@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -14,27 +15,31 @@ from typing import Any, NoReturn
 MATRIX_PATH = (
     Path(__file__).resolve().parent.parent / "packaging" / "ci" / "release-matrix.json"
 )
+CROSS_PATH = Path(__file__).resolve().parent.parent / "Cross.toml"
 MAX_MATRIX_BYTES = 1024 * 1024
-EXPECTED_COUNTS = {"binaries": 7, "packages": 18, "platforms": 34}
+MAX_CROSS_BYTES = 64 * 1024
+EXPECTED_COUNTS = {"binaries": 43, "packages": 43, "platforms": 86}
 
 ROOT_KEYS = frozenset({"schema_version", "binaries", "packages", "platforms"})
 BINARY_KEYS = frozenset(
     {
         "id",
-        "kind",
+        "family",
         "arch",
+        "platform",
         "runner",
         "target",
         "cross",
         "native",
+        "crt_static",
+        "execution_mode",
         "elf_class",
         "elf_endian",
         "elf_machine",
         "artifact_name",
         "archive_template",
         "smoke_image",
-        "smoke_runner",
-        "smoke_arch",
+        "smoke_platform",
     }
 )
 PACKAGE_KEYS = frozenset(
@@ -45,6 +50,7 @@ PACKAGE_KEYS = frozenset(
         "binary_id",
         "binary_artifact_name",
         "artifact_name",
+        "nfpm_arch",
         "expected_package_arch",
         "expected_elf_machine",
     }
@@ -69,8 +75,7 @@ NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .+()/_-]*\Z")
 ARTIFACT_RE = re.compile(r"(?:binary|package)-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 TARGET_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+)+\Z")
 ARCHIVE_RE = re.compile(
-    r"openshield-\{version\}-linux(?:-tumbleweed)?-"
-    r"(?:amd64|i586|arm64|ppc64le|s390x)\.tar\.xz\Z"
+    r"openshield-\{version\}-linux-[a-z0-9]+(?:-[a-z0-9]+)*\.tar\.xz\Z"
 )
 IMAGE_RE = re.compile(
     r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
@@ -78,16 +83,21 @@ IMAGE_RE = re.compile(
     r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
     r"@sha256:[0-9a-f]{64}\Z"
 )
-ABSOLUTE_COMMAND_RE = re.compile(r"/[A-Za-z0-9._/-]+\Z")
-
+CROSS_IMAGE_RE = re.compile(
+    r"ghcr\.io/cross-rs/"
+    r"(?P<target>[a-z0-9_]+(?:-[a-z0-9_]+)+)"
+    r"@sha256:[0-9a-f]{64}\Z"
+)
 BINARY_TARGETS = {
-    ("generic", "amd64"): "x86_64-unknown-linux-musl",
-    ("generic", "arm64"): "aarch64-unknown-linux-musl",
-    ("tumbleweed", "amd64"): "x86_64-unknown-linux-gnu",
-    ("tumbleweed", "i586"): "i586-unknown-linux-gnu",
-    ("tumbleweed", "arm64"): "aarch64-unknown-linux-gnu",
-    ("tumbleweed", "ppc64le"): "powerpc64le-unknown-linux-gnu",
-    ("tumbleweed", "s390x"): "s390x-unknown-linux-gnu",
+    "amd64": "x86_64-unknown-linux-musl",
+    "arm64": "aarch64-unknown-linux-musl",
+    "386": "i586-unknown-linux-musl",
+    "armv5": "armv5te-unknown-linux-musleabi",
+    "armv6": "arm-unknown-linux-musleabihf",
+    "armv7": "armv7-unknown-linux-musleabihf",
+    "ppc64le": "powerpc64le-unknown-linux-gnu",
+    "riscv64": "riscv64gc-unknown-linux-gnu",
+    "s390x": "s390x-unknown-linux-gnu",
 }
 ARCH_DETAILS = {
     "amd64": {
@@ -97,7 +107,7 @@ ARCH_DETAILS = {
         "elf_endian": "little endian",
         "elf_machine": "Advanced Micro Devices X86-64",
     },
-    "i586": {
+    "386": {
         "platform": "linux/386",
         "runner": "ubuntu-24.04",
         "elf_class": "ELF32",
@@ -110,6 +120,27 @@ ARCH_DETAILS = {
         "elf_class": "ELF64",
         "elf_endian": "little endian",
         "elf_machine": "AArch64",
+    },
+    "armv5": {
+        "platform": "linux/arm/v5",
+        "runner": "ubuntu-24.04",
+        "elf_class": "ELF32",
+        "elf_endian": "little endian",
+        "elf_machine": "ARM",
+    },
+    "armv6": {
+        "platform": "linux/arm/v6",
+        "runner": "ubuntu-24.04",
+        "elf_class": "ELF32",
+        "elf_endian": "little endian",
+        "elf_machine": "ARM",
+    },
+    "armv7": {
+        "platform": "linux/arm/v7",
+        "runner": "ubuntu-24.04",
+        "elf_class": "ELF32",
+        "elf_endian": "little endian",
+        "elf_machine": "ARM",
     },
     "ppc64le": {
         "platform": "linux/ppc64le",
@@ -125,75 +156,208 @@ ARCH_DETAILS = {
         "elf_endian": "big endian",
         "elf_machine": "IBM S/390",
     },
+    "riscv64": {
+        "platform": "linux/riscv64",
+        "runner": "ubuntu-24.04",
+        "elf_class": "ELF64",
+        "elf_endian": "little endian",
+        "elf_machine": "RISC-V",
+    },
 }
-CROSS_SMOKE = {
-    "i586": ("/qemu-runner", "i586"),
-    "ppc64le": ("/linux-runner", "powerpc64le"),
-    "s390x": ("/linux-runner", "s390x"),
+FAMILY_ARCHES = {
+    "deb": ("amd64", "armv5", "armv7", "arm64", "386", "ppc64le", "riscv64", "s390x"),
+    "fedora": ("amd64", "arm64", "ppc64le", "s390x"),
+    "el9": ("amd64", "arm64", "ppc64le", "s390x"),
+    "el10": ("amd64", "arm64", "ppc64le", "s390x", "riscv64", "386"),
+    "opensuse": ("amd64", "arm64", "ppc64le", "s390x"),
+    "tumbleweed": ("amd64", "arm64", "ppc64le", "s390x", "386", "armv6", "armv7", "riscv64"),
+    "alpine": ("amd64", "arm64", "ppc64le", "s390x", "386", "armv6", "armv7", "riscv64"),
+    "arch": ("amd64",),
 }
-# i586 binaries receive an additional QEMU smoke check during cross-build, but
-# installed linux/386 packages execute directly on the x86-64 runner.  Only
-# architectures that need user-mode emulation for their package are excluded
-# from privileged firewall E2E.
-EMULATED_FIREWALL_ARCHES = {"ppc64le", "s390x"}
-
-GENERIC_PACKAGE_FAMILIES = (
-    "deb",
-    "fedora",
-    "el9",
-    "el10",
-    "opensuse",
-    "alpine",
-)
+PACKAGE_FAMILIES = frozenset(FAMILY_ARCHES)
 PACKAGE_COMBINATIONS = {
-    *(
-        (family, arch)
-        for family in GENERIC_PACKAGE_FAMILIES
-        for arch in ("amd64", "arm64")
-    ),
-    ("arch", "amd64"),
-    *(
-        ("tumbleweed", arch)
-        for arch in ("amd64", "i586", "arm64", "ppc64le", "s390x")
-    ),
+    (family, arch) for family, arches in FAMILY_ARCHES.items() for arch in arches
 }
+CROSS_ARCHES = frozenset(set(ARCH_DETAILS) - {"amd64", "arm64"})
+CRT_STATIC_ARCHES = frozenset({"ppc64le", "riscv64", "s390x"})
+
+
+def execution_mode(arch: str) -> str:
+    if arch in {"amd64", "arm64"}:
+        return "native"
+    if arch == "386":
+        return "x86-compat"
+    return "qemu-user"
+
+
+def nfpm_architecture(family: str, arch: str) -> str:
+    if family == "el10" and arch == "386":
+        return "i686"
+    if family == "tumbleweed" and arch == "386":
+        return "i586"
+    return {
+        "amd64": "amd64",
+        "arm64": "arm64",
+        "386": "386",
+        "armv5": "arm5",
+        "armv6": "arm6",
+        "armv7": "arm7",
+        "ppc64le": "ppc64le",
+        "riscv64": "riscv64",
+        "s390x": "s390x",
+    }[arch]
 
 
 def package_architecture(family: str, arch: str) -> str:
     if family == "deb":
-        return arch
+        return {
+            "amd64": "amd64",
+            "arm64": "arm64",
+            "386": "i386",
+            "armv5": "armel",
+            "armv7": "armhf",
+            "ppc64le": "ppc64el",
+            "riscv64": "riscv64",
+            "s390x": "s390x",
+        }[arch]
+    if family == "alpine":
+        return {
+            "amd64": "x86_64",
+            "arm64": "aarch64",
+            "386": "x86",
+            "armv6": "armhf",
+            "armv7": "armv7",
+            "ppc64le": "ppc64le",
+            "riscv64": "riscv64",
+            "s390x": "s390x",
+        }[arch]
+    if family == "arch":
+        return "x86_64"
     if arch == "amd64":
         return "x86_64"
     if arch == "arm64":
         return "aarch64"
+    if arch == "386":
+        return "i686" if family == "el10" else "i586"
+    if arch == "armv6":
+        return "armv6hl"
+    if arch == "armv7":
+        return "armv7hl"
     return arch
 
 
-EXPECTED_IMAGE_PLATFORMS = {
-    **{
-        image: (family, ("amd64", "arm64"))
-        for image, family in (
-            ("debian:12", "deb"),
-            ("debian:13", "deb"),
-            ("ubuntu:22.04", "deb"),
-            ("ubuntu:24.04", "deb"),
-            ("ubuntu:26.04", "deb"),
-            ("fedora:43", "fedora"),
-            ("fedora:44", "fedora"),
-            ("rockylinux/rockylinux:9", "el9"),
-            ("rockylinux/rockylinux:10", "el10"),
-            ("almalinux:9", "el9"),
-            ("almalinux:10", "el10"),
-            ("opensuse/leap:16.0", "opensuse"),
-            ("alpine:3.23", "alpine"),
-            ("alpine:3.24", "alpine"),
-        )
-    },
-    "opensuse/tumbleweed": (
-        "tumbleweed",
-        ("amd64", "i586", "arm64", "ppc64le", "s390x"),
+# Ordered from the oldest/first supported image to the newest.  This order is
+# also the authoritative choice for each binary's target-distribution smoke run.
+IMAGE_SPECS = (
+    (
+        "debian:12",
+        "deb",
+        "debian-12",
+        "Debian 12",
+        ("amd64", "armv7", "arm64", "386", "ppc64le"),
     ),
-    "archlinux:base": ("arch", ("amd64",)),
+    (
+        "debian:13",
+        "deb",
+        "debian-13",
+        "Debian 13",
+        ("amd64", "armv5", "armv7", "arm64", "386", "ppc64le", "riscv64", "s390x"),
+    ),
+    (
+        "ubuntu:22.04",
+        "deb",
+        "ubuntu-22-04",
+        "Ubuntu 22.04",
+        ("amd64", "armv7", "arm64", "ppc64le", "riscv64", "s390x"),
+    ),
+    (
+        "ubuntu:24.04",
+        "deb",
+        "ubuntu-24-04",
+        "Ubuntu 24.04",
+        ("amd64", "armv7", "arm64", "ppc64le", "riscv64", "s390x"),
+    ),
+    (
+        "ubuntu:26.04",
+        "deb",
+        "ubuntu-26-04",
+        "Ubuntu 26.04",
+        ("amd64", "armv7", "arm64", "ppc64le", "riscv64", "s390x"),
+    ),
+    (
+        "fedora:43",
+        "fedora",
+        "fedora-43",
+        "Fedora 43",
+        ("amd64", "arm64", "ppc64le", "s390x"),
+    ),
+    (
+        "fedora:44",
+        "fedora",
+        "fedora-44",
+        "Fedora 44",
+        ("amd64", "arm64", "ppc64le", "s390x"),
+    ),
+    (
+        "rockylinux/rockylinux:9",
+        "el9",
+        "rocky-9",
+        "Rocky Linux 9",
+        ("amd64", "arm64", "ppc64le", "s390x"),
+    ),
+    (
+        "rockylinux/rockylinux:10",
+        "el10",
+        "rocky-10",
+        "Rocky Linux 10",
+        ("amd64", "arm64", "ppc64le", "s390x", "riscv64"),
+    ),
+    (
+        "almalinux:9",
+        "el9",
+        "alma-9",
+        "AlmaLinux 9",
+        ("amd64", "arm64", "ppc64le", "s390x"),
+    ),
+    (
+        "almalinux:10",
+        "el10",
+        "alma-10",
+        "AlmaLinux 10",
+        ("amd64", "arm64", "386", "ppc64le", "s390x"),
+    ),
+    (
+        "opensuse/leap:16.0",
+        "opensuse",
+        "opensuse-leap-16",
+        "openSUSE Leap 16.0",
+        ("amd64", "arm64", "ppc64le", "s390x"),
+    ),
+    (
+        "opensuse/tumbleweed",
+        "tumbleweed",
+        "opensuse-tumbleweed",
+        "openSUSE Tumbleweed 20260830",
+        ("amd64", "arm64", "386", "armv6", "armv7", "ppc64le", "riscv64", "s390x"),
+    ),
+    (
+        "alpine:3.23",
+        "alpine",
+        "alpine-3-23",
+        "Alpine 3.23",
+        ("amd64", "arm64", "386", "armv6", "armv7", "ppc64le", "riscv64", "s390x"),
+    ),
+    (
+        "alpine:3.24",
+        "alpine",
+        "alpine-3-24",
+        "Alpine 3.24",
+        ("amd64", "arm64", "386", "armv6", "armv7", "ppc64le", "riscv64", "s390x"),
+    ),
+    ("archlinux:base", "arch", "arch-linux", "Arch Linux", ("amd64",)),
+)
+EXPECTED_IMAGE_PLATFORMS = {
+    image: (family, arches) for image, family, _, _, arches in IMAGE_SPECS
 }
 
 
@@ -272,63 +436,55 @@ def validate_binaries(rows: Any) -> dict[str, dict[str, Any]]:
         where = f"binaries[{index}]"
         row = exact_keys(raw, BINARY_KEYS, where)
         identifier = string(row["id"], ID_RE, f"{where}.id")
-        kind = member(row["kind"], {"generic", "tumbleweed"}, f"{where}.kind")
+        family = member(row["family"], PACKAGE_FAMILIES, f"{where}.family")
         arch = member(row["arch"], set(ARCH_DETAILS), f"{where}.arch")
-        combination = (kind, arch)
-        if combination not in BINARY_TARGETS:
-            raise MatrixError(f"{where} has unsupported kind/arch: {kind}/{arch}")
+        combination = (family, arch)
+        if combination not in PACKAGE_COMBINATIONS:
+            raise MatrixError(f"{where} has unsupported family/arch: {family}/{arch}")
         combinations.add(combination)
 
-        expected_id = f"{kind}-{arch}"
+        expected_id = f"{family}-{arch}"
         if identifier != expected_id:
             raise MatrixError(f"{where}.id must be {expected_id}")
         target = string(row["target"], TARGET_RE, f"{where}.target")
-        if target != BINARY_TARGETS[combination]:
-            raise MatrixError(f"{where}.target does not match {kind}/{arch}")
+        if target != BINARY_TARGETS[arch]:
+            raise MatrixError(f"{where}.target does not match architecture {arch}")
 
         details = ARCH_DETAILS[arch]
-        for field in ("runner", "elf_class", "elf_endian", "elf_machine"):
+        for field in ("platform", "runner", "elf_class", "elf_endian", "elf_machine"):
             if row[field] != details[field]:
                 raise MatrixError(f"{where}.{field} does not match architecture {arch}")
 
         cross = boolean(row["cross"], f"{where}.cross")
         native = boolean(row["native"], f"{where}.native")
-        expected_cross = arch in CROSS_SMOKE
-        if cross != expected_cross or native == cross:
+        crt_static = boolean(row["crt_static"], f"{where}.crt_static")
+        expected_cross = arch in CROSS_ARCHES
+        if cross != expected_cross or native != (not expected_cross):
             raise MatrixError(f"{where} has inconsistent cross/native flags")
+        if crt_static != (arch in CRT_STATIC_ARCHES):
+            raise MatrixError(f"{where}.crt_static does not match architecture {arch}")
+        expected_mode = execution_mode(arch)
+        if row["execution_mode"] != expected_mode:
+            raise MatrixError(f"{where}.execution_mode must be {expected_mode}")
 
-        expected_artifact = "binary-" + ("" if kind == "generic" else "tumbleweed-") + arch
+        expected_artifact = f"binary-{family}-{arch}"
         artifact = string(row["artifact_name"], ARTIFACT_RE, f"{where}.artifact_name")
         if artifact != expected_artifact:
             raise MatrixError(f"{where}.artifact_name must be {expected_artifact}")
 
         archive = string(row["archive_template"], ARCHIVE_RE, f"{where}.archive_template")
-        expected_archive = "openshield-{version}-linux-"
-        if kind == "tumbleweed":
-            expected_archive += "tumbleweed-"
-        expected_archive += f"{arch}.tar.xz"
+        expected_archive = f"openshield-{{version}}-linux-{family}-{arch}.tar.xz"
         if archive != expected_archive:
             raise MatrixError(f"{where}.archive_template must be {expected_archive}")
 
-        if cross:
-            smoke_image = string(row["smoke_image"], IMAGE_RE, f"{where}.smoke_image")
-            smoke_runner = string(
-                row["smoke_runner"], ABSOLUTE_COMMAND_RE, f"{where}.smoke_runner"
-            )
-            smoke_arch = string(row["smoke_arch"], ID_RE, f"{where}.smoke_arch")
-            expected_runner, expected_smoke_arch = CROSS_SMOKE[arch]
-            if smoke_runner != expected_runner or smoke_arch != expected_smoke_arch:
-                raise MatrixError(f"{where} has incorrect cross smoke parameters")
-            smoke_repository, _ = image_parts(smoke_image)
-            if smoke_repository != f"ghcr.io/cross-rs/{target}":
-                raise MatrixError(f"{where}.smoke_image does not match its Rust target")
-        elif any(row[field] is not None for field in ("smoke_image", "smoke_runner", "smoke_arch")):
-            raise MatrixError(f"{where} must not define smoke parameters for a native build")
+        string(row["smoke_image"], IMAGE_RE, f"{where}.smoke_image")
+        if row["smoke_platform"] != details["platform"]:
+            raise MatrixError(f"{where}.smoke_platform must be {details['platform']}")
 
         result.append(row)
 
-    if combinations != set(BINARY_TARGETS):
-        raise MatrixError("binaries do not cover the required kind/architecture combinations")
+    if combinations != PACKAGE_COMBINATIONS:
+        raise MatrixError("binaries do not cover the required family/architecture combinations")
     unique_rows(result, "id", "binary")
     unique_rows(result, "artifact_name", "binary")
     unique_rows(result, "archive_template", "binary")
@@ -347,11 +503,7 @@ def validate_packages(
         where = f"packages[{index}]"
         row = exact_keys(raw, PACKAGE_KEYS, where)
         identifier = string(row["id"], ID_RE, f"{where}.id")
-        family = member(
-            row["family"],
-            set(GENERIC_PACKAGE_FAMILIES) | {"arch", "tumbleweed"},
-            f"{where}.family",
-        )
+        family = member(row["family"], PACKAGE_FAMILIES, f"{where}.family")
         arch = member(row["arch"], set(ARCH_DETAILS), f"{where}.arch")
         combination = (family, arch)
         if combination not in PACKAGE_COMBINATIONS:
@@ -364,10 +516,12 @@ def validate_packages(
         if binary_id not in binaries:
             raise MatrixError(f"{where}.binary_id references an unknown binary")
         binary = binaries[binary_id]
-        expected_binary_id = (
-            f"tumbleweed-{arch}" if family == "tumbleweed" else f"generic-{arch}"
-        )
-        if binary_id != expected_binary_id or binary["arch"] != arch:
+        expected_binary_id = f"{family}-{arch}"
+        if (
+            binary_id != expected_binary_id
+            or binary["family"] != family
+            or binary["arch"] != arch
+        ):
             raise MatrixError(f"{where}.binary_id does not match its package architecture")
 
         binary_artifact = string(
@@ -379,6 +533,9 @@ def validate_packages(
         if artifact != f"package-{family}-{arch}":
             raise MatrixError(f"{where}.artifact_name does not match family/arch")
 
+        expected_nfpm_arch = nfpm_architecture(family, arch)
+        if row["nfpm_arch"] != expected_nfpm_arch:
+            raise MatrixError(f"{where}.nfpm_arch must be {expected_nfpm_arch}")
         expected_package_arch = package_architecture(family, arch)
         if row["expected_package_arch"] != expected_package_arch:
             raise MatrixError(
@@ -410,15 +567,8 @@ def validate_platforms(
         row = exact_keys(raw, PLATFORM_KEYS, where)
         identifier = string(row["id"], ID_RE, f"{where}.id")
         name = string(row["name"], NAME_RE, f"{where}.name")
-        family = member(
-            row["family"],
-            set(GENERIC_PACKAGE_FAMILIES) | {"arch", "tumbleweed"},
-            f"{where}.family",
-        )
+        family = member(row["family"], PACKAGE_FAMILIES, f"{where}.family")
         arch = member(row["arch"], set(ARCH_DETAILS), f"{where}.arch")
-        if not identifier.endswith(f"-{arch}") or not name.endswith(f" / {arch}"):
-            raise MatrixError(f"{where} id/name must identify architecture {arch}")
-
         package_id = string(row["package"], ID_RE, f"{where}.package")
         if package_id not in packages:
             raise MatrixError(f"{where}.package references an unknown package")
@@ -435,6 +585,23 @@ def validate_platforms(
         expected_family, expected_arches = expected_image
         if family != expected_family or arch not in expected_arches:
             raise MatrixError(f"{where}.image does not support the declared family/arch row")
+
+        matching_specs = [
+            (prefix, label)
+            for spec_image, spec_family, prefix, label, spec_arches in IMAGE_SPECS
+            if spec_image == image_name
+            and spec_family == family
+            and arch in spec_arches
+        ]
+        if len(matching_specs) != 1:
+            raise MatrixError(f"{where}.image has an ambiguous platform specification")
+        prefix, label = matching_specs[0]
+        expected_id = f"{prefix}-{arch}"
+        expected_name = f"{label} / {arch}"
+        if identifier != expected_id or name != expected_name:
+            raise MatrixError(
+                f"{where} id/name must be {expected_id!r}/{expected_name!r}"
+            )
         previous_digest = image_digests.setdefault(image_name, digest)
         if previous_digest != digest:
             raise MatrixError(f"platform image {image_name} uses more than one digest")
@@ -447,18 +614,8 @@ def validate_platforms(
         if row["expected_package_arch"] != package["expected_package_arch"]:
             raise MatrixError(f"{where}.expected_package_arch does not match its package")
 
-        firewall_test = member(
-            row["firewall_test"], {"full", "nft", "emulated"}, f"{where}.firewall_test"
-        )
-        expected_firewall_test = "full"
-        if family in {"alpine", "arch"}:
-            expected_firewall_test = "nft"
-        elif arch in EMULATED_FIREWALL_ARCHES:
-            expected_firewall_test = "emulated"
-        if firewall_test != expected_firewall_test:
-            raise MatrixError(
-                f"{where}.firewall_test must be {expected_firewall_test} for {family}/{arch}"
-            )
+        if row["firewall_test"] != "full":
+            raise MatrixError(f"{where}.firewall_test must be full")
 
         image_platform = (image_name, expected_platform)
         if image_platform in image_platforms:
@@ -481,6 +638,73 @@ def validate_platforms(
     return result
 
 
+def validate_smoke_links(
+    binaries: dict[str, dict[str, Any]], platforms: list[dict[str, Any]]
+) -> None:
+    platform_rows = {
+        (image_parts(row["image"])[0], row["arch"]): row for row in platforms
+    }
+    for identifier, binary in binaries.items():
+        family = binary["family"]
+        arch = binary["arch"]
+        oldest_image = next(
+            image
+            for image, spec_family, _, _, arches in IMAGE_SPECS
+            if spec_family == family and arch in arches
+        )
+        smoke_platform = platform_rows[(oldest_image, arch)]
+        if binary["smoke_image"] != smoke_platform["image"]:
+            raise MatrixError(
+                f"binary {identifier} must smoke-test in {smoke_platform['image']}"
+            )
+        if binary["smoke_platform"] != smoke_platform["platform"]:
+            raise MatrixError(
+                f"binary {identifier} smoke platform does not match its target image"
+            )
+
+
+def validate_cross_config() -> None:
+    """Require every cross compiler image to be explicit and digest-pinned."""
+
+    try:
+        stat = CROSS_PATH.stat()
+        if not CROSS_PATH.is_file() or stat.st_size <= 0 or stat.st_size > MAX_CROSS_BYTES:
+            raise MatrixError("Cross.toml must be a non-empty regular file below 64 KiB")
+        document = tomllib.loads(CROSS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise MatrixError(f"cannot read Cross.toml: {error}") from error
+
+    root = exact_keys(document, frozenset({"target"}), "Cross.toml root")
+    targets = root["target"]
+    if not isinstance(targets, dict) or not targets:
+        raise MatrixError("Cross.toml.target must be a non-empty table")
+
+    required_targets = {BINARY_TARGETS[arch] for arch in CROSS_ARCHES}
+    missing = sorted(required_targets - set(targets))
+    if missing:
+        raise MatrixError(
+            "Cross.toml is missing release cross targets: " + ", ".join(missing)
+        )
+
+    for target, raw in targets.items():
+        string(target, TARGET_RE, f"Cross.toml.target.{target}")
+        config = exact_keys(
+            raw,
+            frozenset({"image"}),
+            f"Cross.toml.target.{target}",
+        )
+        image = config["image"]
+        match = CROSS_IMAGE_RE.fullmatch(image) if isinstance(image, str) else None
+        if match is None:
+            raise MatrixError(
+                f"Cross.toml.target.{target}.image must be a digest-pinned cross-rs image"
+            )
+        if match.group("target") != target:
+            raise MatrixError(
+                f"Cross.toml.target.{target}.image does not match its target"
+            )
+
+
 def load_and_validate() -> dict[str, Any]:
     try:
         stat = MATRIX_PATH.stat()
@@ -501,6 +725,8 @@ def load_and_validate() -> dict[str, Any]:
     binaries = validate_binaries(root["binaries"])
     packages = validate_packages(root["packages"], binaries)
     platforms = validate_platforms(root["platforms"], packages)
+    validate_smoke_links(binaries, platforms)
+    validate_cross_config()
     return {
         "schema_version": 1,
         "binaries": list(binaries.values()),
@@ -516,12 +742,7 @@ def enrich_platform(
     enriched = dict(platform)
     enriched["package_artifact_name"] = package["artifact_name"]
     enriched["expected_elf_machine"] = package["expected_elf_machine"]
-    if platform["arch"] in EMULATED_FIREWALL_ARCHES:
-        enriched["execution_mode"] = "qemu-user"
-    elif platform["arch"] == "i586":
-        enriched["execution_mode"] = "x86-compat"
-    else:
-        enriched["execution_mode"] = "native"
+    enriched["execution_mode"] = execution_mode(platform["arch"])
     return enriched
 
 
@@ -538,11 +759,7 @@ def emitted_rows(document: dict[str, Any], matrix: str) -> list[dict[str, Any]]:
 
     firewall: list[dict[str, Any]] = []
     for platform in platforms:
-        policy = platform["firewall_test"]
-        if policy == "emulated":
-            continue
-        backends = ("nftables", "iptables") if policy == "full" else ("nftables",)
-        for backend in backends:
+        for backend in ("nftables", "iptables"):
             row = dict(platform)
             row["backend"] = backend
             row["evidence_id"] = f"{platform['id']}-{backend}"

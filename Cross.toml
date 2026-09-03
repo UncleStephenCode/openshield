@@ -1,11 +1,26 @@
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c"
 
+[target.arm-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/arm-unknown-linux-musleabihf@sha256:283b8271593b7f2504d8b84f6f01e0a3e005802b784d90f357e1ce283a7554f9"
+
+[target.armv5te-unknown-linux-musleabi]
+image = "ghcr.io/cross-rs/armv5te-unknown-linux-musleabi@sha256:c61eb7fe427de062589b8580995e5ae78eaab02e756e705badce0ad6a7a3bcde"
+
+[target.armv7-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf@sha256:b4f481f30ceca34730a5723f717396d762d94f6eddd7e1cf7c7862d1377ff98c"
+
 [target.i586-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/i586-unknown-linux-gnu@sha256:87cddacc45ea10d3953e1aeeaedb08c42607f18a24aa1bde58599d08499b9096"
 
+[target.i586-unknown-linux-musl]
+image = "ghcr.io/cross-rs/i586-unknown-linux-musl@sha256:52bdb60a8a6a41a9b707724419065cc1d7f4299d7764dfc3a0952b0448793cdf"
+
 [target.powerpc64le-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu@sha256:de5114adcd786f6a41eb07379459aaae94de73670303e202ea3603d250c19091"
+
+[target.riscv64gc-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu@sha256:67ee97dd4719390d299edfcf39f226360ccfb1539e08b078ec187d4848415794"
 
 [target.s390x-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/s390x-unknown-linux-gnu@sha256:0d8edc92c39158abe211fddfc9617bf5b7865c2ae0f58873f9cf0c58bb315271"

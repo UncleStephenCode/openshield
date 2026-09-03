@@ -18,8 +18,10 @@ The real Learning-to-Enforcing firewall workflow is a separate end-to-end test.
 
 The release pipeline has its own authoritative matrix:
 [`packaging/ci/release-matrix.json`](../../packaging/ci/release-matrix.json).
-It defines exactly 34 distribution/userspace and OCI-platform pairs for which a
-release package must be installed and its assigned container tests must pass.
+It defines 43 binary rows, 43 matching package rows, and exactly 86
+distribution/userspace and OCI-platform rows for which a release package must
+be installed and its assigned container tests must pass. Every platform row is
+expanded into both firewall backends, producing 172 firewall E2E jobs.
 The release dependency graph is:
 
 ```text
@@ -40,12 +42,13 @@ allowed only after Validation and the Quality Gate. Publication is allowed only
 after the evidence stage has reconciled every required matrix row and release
 asset.
 
-The 34 release rows cover Debian 12/13, Ubuntu 22.04/24.04/26.04, Fedora 43/44,
-Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0, Alpine 3.23/3.24, and
-Tumbleweed on `amd64` and `arm64`; Arch Linux on `amd64`; and Tumbleweed
-additionally on i586 (`linux/386`), `ppc64le`, and `s390x`. Family/architecture
-packages may be built once, but installation and evidence remain separate for
-every distribution/platform row.
+The 86 release rows cover Debian 12/13, Ubuntu 22.04/24.04/26.04, Fedora 43/44,
+Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0, Tumbleweed, Alpine
+3.23/3.24, and Arch Linux. They include every selected platform exposed by the
+corresponding official image: `amd64`, `386`, ARMv5, ARMv6, ARMv7, `arm64`,
+`ppc64le`, `riscv64`, and `s390x` where available. A family/architecture binary
+and package may be built once, but installation, container testing, and both
+backend results remain separate for every distribution/platform row.
 
 This release matrix and the 60-row research matrix below serve different
 purposes. Passing the broad compatibility smoke does not add a release row, and
@@ -129,21 +132,23 @@ not provide their standard libraries, so the stable matrix skips them. Building
 them requires a separately reviewed nightly `build-std` workflow; they are not
 claimed as stable release targets.
 
-Release binaries are linked and ELF-validated for x86_64, i586, AArch64,
-ppc64le, and s390x where the authoritative matrix requires them. `amd64` and
-`arm64` release jobs run on native x86-64 and AArch64 runners. The Tumbleweed
-i586 package runs directly through the x86 runner's `linux/386` compatibility
-path, while the cross-built binary also receives a `qemu-runner` smoke check;
-the installed package then runs both full backend E2E scenarios, though this is
-not physical-i586 hardware. Tumbleweed `ppc64le` and
-`s390x` use digest-pinned Cross/QEMU environments for capability-free execution
-and package smoke only. QEMU evidence is never presented as a full firewall
-test, native execution, distribution-kernel coverage, or hardware
-certification. The package smoke registers only the selected digest-pinned
-`binfmt_misc` handler on an ephemeral GitHub-hosted runner; the privileged
-registration step is rejected on self-hosted runners. No blanket runtime claim
-is made for x86, ARM, arm64, PowerPC,
-IBM Z, or RISC-V hardware.
+The workflow defines 43 release binary rows and requires each one to be linked,
+checked for the expected ELF identity and static runtime boundary, and
+smoke-run in a pinned image for its target family and architecture. `amd64` and
+`arm64` jobs use native x86-64 and AArch64 runners. `386` uses the x86 runner's
+compatibility path. ARMv5, ARMv6, ARMv7, `ppc64le`, `riscv64`, and `s390x` use
+digest-pinned Cross build images and a selected QEMU user-mode handler on
+ephemeral GitHub-hosted runners. The privileged handler registration step is
+rejected on self-hosted runners.
+
+A publishable run must complete both backend scenarios for all 86 installed
+package rows, including the emulated rows. For QEMU rows, a small separately
+built static host-native TCP/UDP client supplies a stable executable identity
+for the application-rule assertions; the daemon, package, firewall commands,
+and target userspace remain the selected foreign architecture. A successful
+QEMU job is valid emulation evidence, but it is not native execution,
+distribution-kernel coverage, physical-hardware certification, or a blanket
+runtime guarantee for x86, ARM, arm64, PowerPC, IBM Z, or RISC-V hardware.
 Architecture aliases do not create additional targets: AMD64 means x86_64, and
 ARM64 means AArch64. `aarch` alone is not a Rust Linux target name.
 
@@ -180,15 +185,14 @@ mean a backend was selected or that real packets were filtered.
 
 ## Real firewall end-to-end workflow
 
-Release backend coverage follows the package dependency contract. DEB and RPM
-rows marked `full` (`amd64`, `arm64`, and Tumbleweed i586) run the complete Learning-to-Enforcing test
-twice: once with nftables preferred while both frontends are installed, and
-once with `nft` absent so the complete iptables/ip6tables fallback must be
-selected. APK and Arch rows run the complete nftables scenario because those
-released packages require nftables and do not declare iptables as an
-alternative dependency. The emulated Tumbleweed `ppc64le` and `s390x` rows are
-limited to package-install and QEMU execution smoke and are not recorded as
-complete backend E2E results.
+The workflow expands every one of the 86 release platform rows into two
+complete Learning-to-Enforcing tests: one with nftables preferred while both
+frontends are installed, and one with `nft` absent so the complete
+iptables/ip6tables fallback must be selected. A publishable run therefore
+requires 86 nftables and 86 iptables jobs, including DEB, RPM, APK, Arch,
+native, x86-compatibility, and QEMU-user rows. The harness explicitly provisions
+the requested backend before installing the release package; that test setup
+does not by itself change or broaden a package format's dependency metadata.
 
 Every release image is pinned by SHA-256 digest and paired with an explicit OCI
 platform. The evidence stage records the image/platform identity, package and
@@ -204,8 +208,9 @@ client and HTTP server. It is designed to verify, separately for each backend:
 - initial persisted `Learning` mode after startup quarantine;
 - observation access for `openshield` and denial for an outsider;
 - denial of control to a non-root group member;
-- learning an application-bound `/usr/bin/curl` rule;
-- continued curl access and denial of another executable in `Enforcing`;
+- learning an application-bound TCP rule and a UDP rule;
+- continued access for the learned executable and denial of another executable
+  in `Enforcing`;
 - coexistence with a downstream firewall DROP;
 - inbound denial followed by an explicit inbound allow;
 - graceful-shutdown kernel `BlockAll` without replacing persisted `Enforcing`;
@@ -234,19 +239,20 @@ inside that container; the script does not apply rules on the host. Before
 creating resources, it reads the active endpoint with `docker context inspect`
 and refuses every endpoint whose URI is not `unix:///*`.
 
-The final Rust 1.98.0 Debian Bookworm and Tumbleweed release binaries passed
-both backend runs in their respective userspaces:
+Each successful release row reports both backend runs in its selected
+userspace:
 
 ```text
 PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
 PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
 ```
 
-In each nftables run both frontends were installed and nftables was selected.
-In each iptables run `nft` was absent and the compatibility backend was selected,
-so the result proves preference and fallback rather than merely forcing a name.
+In an nftables run both frontends are installed and nftables must be selected.
+In an iptables run `nft` is absent and the compatibility backend must be
+selected, so the pair tests preference and fallback rather than merely forcing
+a name.
 
-These results cover the scripted behavior inside disposable network and
-container namespaces on a local Unix-socket Docker engine. They did not test or
-modify the host firewall and do not certify production kernels, deployments,
+A successful pair covers the scripted behavior inside disposable network and
+container namespaces on a local Unix-socket Docker engine. It does not test or
+modify the host firewall and does not certify production kernels, deployments,
 upgrades, or competing firewall configurations.

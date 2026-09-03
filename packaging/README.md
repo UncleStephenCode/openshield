@@ -54,6 +54,24 @@ Do not start the service automatically during an unattended remote package
 upgrade unless an inbound management rule and an independently tested recovery
 path already exist. Inbound traffic is default-drop even in `Learning`.
 
+## Release-package matrix
+
+The authoritative release workflow builds 43 architecture/family binaries and
+43 matching packages, then installs them in 86 pinned
+distribution/OCI-platform rows. Family/architecture artifacts are reused only
+for compilation and packaging; installation evidence remains independent for
+each distribution version and platform. Every installed-package row is assigned
+both the nftables and iptables Learning-to-Enforcing scenarios, for 172
+firewall jobs that must succeed before publication. These are workflow gates,
+not a claim that a newly edited matrix has already passed.
+
+Native runners execute `amd64` and `arm64`, while `386` uses x86 compatibility
+and the remaining non-native architectures use selected digest-pinned
+Cross/QEMU environments. QEMU results demonstrate emulated execution only; they
+do not certify physical hardware or a distribution-owned kernel. See the
+[release CI guide](../.github/README-CI.md) for the exact matrix and evidence
+boundary.
+
 ## Init-system notes
 
 | Init system | Staged service | Ordering and supervision |

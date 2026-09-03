@@ -45,6 +45,9 @@ jobs:
       - name: Validate target matrix
         run: scripts/check-target-matrix.sh validate
 
+      - name: Validate release matrix
+        run: python3 scripts/release-matrix.py validate
+
       - name: Validate init layouts
         run: scripts/test-init-matrix.sh validate
 

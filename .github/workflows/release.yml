@@ -42,10 +42,8 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       tag_ref_sha: ${{ steps.version.outputs.tag_ref_sha }}
       source_sha: ${{ steps.version.outputs.source_sha }}
-      generic_binary_matrix: ${{ steps.release_matrix.outputs.generic_binary_matrix }}
-      tumbleweed_binary_matrix: ${{ steps.release_matrix.outputs.tumbleweed_binary_matrix }}
-      generic_package_matrix: ${{ steps.release_matrix.outputs.generic_package_matrix }}
-      tumbleweed_package_matrix: ${{ steps.release_matrix.outputs.tumbleweed_package_matrix }}
+      binary_matrix: ${{ steps.release_matrix.outputs.binary_matrix }}
+      package_matrix: ${{ steps.release_matrix.outputs.package_matrix }}
       platform_matrix: ${{ steps.release_matrix.outputs.platform_matrix }}
       firewall_matrix: ${{ steps.release_matrix.outputs.firewall_matrix }}
     steps:
@@ -100,12 +98,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/release-matrix.py validate
-          binary_matrix=$(python3 scripts/release-matrix.py matrix binaries)
-          package_matrix=$(python3 scripts/release-matrix.py matrix packages)
-          echo "generic_binary_matrix=$(jq -c '{include: [.include[] | select(.kind == "generic")]}' <<< "$binary_matrix")" >> "$GITHUB_OUTPUT"
-          echo "tumbleweed_binary_matrix=$(jq -c '{include: [.include[] | select(.kind == "tumbleweed")]}' <<< "$binary_matrix")" >> "$GITHUB_OUTPUT"
-          echo "generic_package_matrix=$(jq -c '{include: [.include[] | select(.family != "tumbleweed")]}' <<< "$package_matrix")" >> "$GITHUB_OUTPUT"
-          echo "tumbleweed_package_matrix=$(jq -c '{include: [.include[] | select(.family == "tumbleweed")]}' <<< "$package_matrix")" >> "$GITHUB_OUTPUT"
+          echo "binary_matrix=$(python3 scripts/release-matrix.py matrix binaries)" >> "$GITHUB_OUTPUT"
+          echo "package_matrix=$(python3 scripts/release-matrix.py matrix packages)" >> "$GITHUB_OUTPUT"
           echo "platform_matrix=$(python3 scripts/release-matrix.py matrix platforms)" >> "$GITHUB_OUTPUT"
           echo "firewall_matrix=$(python3 scripts/release-matrix.py matrix firewall)" >> "$GITHUB_OUTPUT"
 
@@ -129,14 +123,28 @@ jobs:
               docker buildx imagetools inspect --raw "$image" > "$manifest_file"
               manifest_files["$image"]=$manifest_file
             fi
-            architecture=${platform#linux/}
+            IFS=/ read -r platform_os architecture variant unexpected <<< "$platform"
+            [[ "$platform_os" == linux && -n "$architecture" && -z "$unexpected" ]] || {
+              echo "::error::Invalid release platform: $platform"
+              exit 1
+            }
+            if [[ -n "$variant" ]]; then
+              [[ "$architecture" == arm && "$variant" =~ ^v[5-7]$ ]] || {
+                echo "::error::Unsupported release platform variant: $platform"
+                exit 1
+              }
+            fi
             platform_found=false
             if jq -e '(.manifests | type) == "array"' \
                 "${manifest_files[$image]}" >/dev/null; then
-              if jq -e --arg architecture "$architecture" '
+              if jq -e \
+                  --arg os "$platform_os" \
+                  --arg architecture "$architecture" \
+                  --arg variant "$variant" '
                   any(.manifests[];
-                    .platform.os == "linux" and
-                    .platform.architecture == $architecture)
+                    .platform.os == $os and
+                    .platform.architecture == $architecture and
+                    ($variant == "" or (.platform.variant // "") == $variant))
                 ' "${manifest_files[$image]}" >/dev/null; then
                 platform_found=true
               fi
@@ -147,8 +155,13 @@ jobs:
                   --format '{{json .Image}}' > "$image_config_file"
                 image_config_files["$image"]=$image_config_file
               fi
-              if jq -e --arg architecture "$architecture" '
-                  .os == "linux" and .architecture == $architecture
+              if jq -e \
+                  --arg os "$platform_os" \
+                  --arg architecture "$architecture" \
+                  --arg variant "$variant" '
+                  .os == $os and
+                  .architecture == $architecture and
+                  ($variant == "" or (.variant // "") == $variant)
                 ' "${image_config_files[$image]}" >/dev/null; then
                 platform_found=true
               fi
@@ -161,7 +174,7 @@ jobs:
             {
               jq -r '.platforms[] | [.image, .platform] | @tsv' \
                 packaging/ci/release-matrix.json
-              jq -r '.binaries[] | select(.smoke_image != null) | [.smoke_image, "linux/amd64"] | @tsv' \
+              jq -r '.binaries[] | [.smoke_image, .smoke_platform] | @tsv' \
                 packaging/ci/release-matrix.json
               printf '%s\t%s\n' \
                 "$BINFMT_IMAGE" linux/amd64 \
@@ -244,15 +257,18 @@ jobs:
               cargo fmt --all --check
               cargo clippy --workspace --all-targets --locked --offline -- -D warnings
               cargo test --workspace --all-targets --locked --offline
+              cc -std=c11 -fsyntax-only -Wall -Wextra -Werror -Wpedantic \
+                tests/e2e/native-client.c
+              scripts/check-target-matrix.sh validate
               scripts/test-init-matrix.sh validate
             '
 
   build:
-    name: Binaries / generic / ${{ matrix.arch }}
+    name: Binaries / ${{ matrix.family }} / ${{ matrix.arch }}
     needs: [version, quality]
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.generic_binary_matrix) }}
+      matrix: ${{ fromJSON(needs.version.outputs.binary_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -260,67 +276,18 @@ jobs:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
 
-      - name: Install musl build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          rustup target add "${{ matrix.target }}"
-
-      - name: Build release binaries
-        run: |
-          cargo build --release --locked --target "${{ matrix.target }}" \
-            -p openshield-daemon -p openshield-tui
-
-      - name: Stage binary artifact
+      - name: Install Rust target and native build tools
         shell: bash
         env:
-          ARCHIVE_TEMPLATE: ${{ matrix.archive_template }}
-          EXPECTED_CLASS: ${{ matrix.elf_class }}
-          EXPECTED_ENDIAN: ${{ matrix.elf_endian }}
-          EXPECTED_MACHINE: ${{ matrix.elf_machine }}
-          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          install -m 0755 "target/${{ matrix.target }}/release/openshield-daemon" dist/openshield-daemon
-          install -m 0755 "target/${{ matrix.target }}/release/openshield-tui" dist/openshield-tui
-          for binary in dist/openshield-daemon dist/openshield-tui; do
-            elf_class=$(LC_ALL=C readelf -h "$binary" | awk -F: '/^[[:space:]]*Class:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')
-            elf_data=$(LC_ALL=C readelf -h "$binary" | awk -F: '/^[[:space:]]*Data:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')
-            elf_machine=$(LC_ALL=C readelf -h "$binary" | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')
-            [[ "$elf_class" == "$EXPECTED_CLASS" \
-              && "$elf_data" == *"$EXPECTED_ENDIAN"* \
-              && "$elf_machine" == "$EXPECTED_MACHINE" ]]
-          done
-          ./dist/openshield-daemon --version
-          ./dist/openshield-tui --version
-          archive=${ARCHIVE_TEMPLATE/\{version\}/$VERSION}
-          tar -C dist -cJf "$PWD/dist/$archive" openshield-daemon openshield-tui
-          test -s "dist/$archive"
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.artifact_name }}
-          # A single directory keeps every downloaded entry at artifact root.
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7
-
-  build-tumbleweed:
-    name: Binaries / Tumbleweed / ${{ matrix.arch }}
-    needs: [version, quality]
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.tumbleweed_binary_matrix) }}
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.version.outputs.source_sha }}
-          persist-credentials: false
-
-      - name: Install Rust target
-        run: rustup target add "${{ matrix.target }}"
+          if [[ "$USE_CROSS" != true ]]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+          fi
+          rustup target add "$TARGET"
 
       - name: Install pinned cross
         if: ${{ matrix.cross }}
@@ -343,25 +310,31 @@ jobs:
           sudo install -m 0755 "$extract_dir/cross" "$extract_dir/cross-util" /usr/local/bin/
           cross --version
 
-      - name: Build Tumbleweed binaries
+      - name: Build release binaries
         shell: bash
         env:
-          USE_CROSS: ${{ matrix.cross }}
+          CRT_STATIC: ${{ matrix.crt_static || false }}
           TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
         run: |
           set -euo pipefail
           if [[ "$USE_CROSS" == true ]]; then
-            cross build --release --locked --target "$TARGET" \
-              -p openshield-daemon -p openshield-tui
+            if [[ "$CRT_STATIC" == true ]]; then
+              RUSTFLAGS='-C target-feature=+crt-static' \
+                cross build --release --locked --target "$TARGET" \
+                  -p openshield-daemon -p openshield-tui
+            else
+              cross build --release --locked --target "$TARGET" \
+                -p openshield-daemon -p openshield-tui
+            fi
           else
             cargo build --release --locked --target "$TARGET" \
               -p openshield-daemon -p openshield-tui
           fi
 
-      - name: Verify and stage Tumbleweed binaries
+      - name: Verify and stage release binaries
         shell: bash
         env:
-          ARCH: ${{ matrix.arch }}
           ARCHIVE_TEMPLATE: ${{ matrix.archive_template }}
           EXPECTED_CLASS: ${{ matrix.elf_class }}
           EXPECTED_ENDIAN: ${{ matrix.elf_endian }}
@@ -375,7 +348,7 @@ jobs:
           for binary in openshield-daemon openshield-tui; do
             source="target/$TARGET/release/$binary"
             [[ -f "$source" && ! -L "$source" ]] || {
-              echo "::error::Missing or unsafe Tumbleweed binary: $binary"
+              echo "::error::Missing or unsafe release binary: $binary"
               exit 1
             }
             elf_class="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Class:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
@@ -398,37 +371,51 @@ jobs:
           tar -C dist -cJf "$PWD/dist/$archive" openshield-daemon openshield-tui
           [[ -s "dist/$archive" ]]
 
-      - name: Run cross-architecture smoke test
-        if: ${{ matrix.cross }}
+      - name: Enable pinned QEMU for emulated binary smoke tests
+        if: ${{ matrix.execution_mode == 'qemu-user' }}
         shell: bash
         env:
-          SMOKE_ARCH: ${{ matrix.smoke_arch }}
+          BINFMT_IMAGE: ${{ env.BINFMT_IMAGE }}
+          EMULATED_ARCH: ${{ matrix.arch }}
+          EMULATED_IMAGE: ${{ matrix.smoke_image }}
+          EMULATED_PLATFORM: ${{ matrix.smoke_platform }}
+        run: |
+          set -euo pipefail
+          packaging/ci/scripts/enable-qemu.sh \
+            "$EMULATED_ARCH" "$EMULATED_PLATFORM" "$EMULATED_IMAGE"
+
+      - name: Run binary smoke test in the target distribution
+        shell: bash
+        env:
           SMOKE_IMAGE: ${{ matrix.smoke_image }}
-          SMOKE_RUNNER: ${{ matrix.smoke_runner }}
+          SMOKE_PLATFORM: ${{ matrix.smoke_platform }}
         run: |
           set -euo pipefail
           [[ "$SMOKE_IMAGE" == *@sha256:* ]]
+          docker pull --platform "$SMOKE_PLATFORM" "$SMOKE_IMAGE" >/dev/null
           for binary in openshield-daemon openshield-tui; do
             docker run --rm --network none --read-only --cap-drop ALL \
-              --security-opt no-new-privileges \
+              --security-opt no-new-privileges --security-opt label=disable \
+              --platform "$SMOKE_PLATFORM" --pull never \
               --mount "type=bind,src=$PWD/dist,dst=/opt/openshield,readonly" \
-              --entrypoint "$SMOKE_RUNNER" \
-              "$SMOKE_IMAGE" "$SMOKE_ARCH" "/opt/openshield/$binary" --version
+              --entrypoint "/opt/openshield/$binary" \
+              "$SMOKE_IMAGE" --version
           done
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact_name }}
+          # A single directory keeps every downloaded entry at artifact root.
           path: dist/
           if-no-files-found: error
           retention-days: 7
 
   package:
     name: Packages / ${{ matrix.family }} / ${{ matrix.arch }}
-    needs: [version, build, build-tumbleweed]
+    needs: [version, build]
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.generic_package_matrix) }}
+      matrix: ${{ fromJSON(needs.version.outputs.package_matrix) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -439,12 +426,12 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ matrix.binary_artifact_name }}
-          path: ${{ runner.temp }}/binary-${{ matrix.arch }}
+          path: ${{ runner.temp }}/binary-${{ matrix.family }}-${{ matrix.arch }}
 
       - name: Prepare binaries
         shell: bash
         env:
-          ARTIFACT_DIR: ${{ runner.temp }}/binary-${{ matrix.arch }}
+          ARTIFACT_DIR: ${{ runner.temp }}/binary-${{ matrix.family }}-${{ matrix.arch }}
           EXPECTED_MACHINE: ${{ matrix.expected_elf_machine }}
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
@@ -491,86 +478,8 @@ jobs:
       - name: Build package
         env:
           VERSION: ${{ needs.version.outputs.version }}
-          ARCH: ${{ matrix.arch }}
+          ARCH: ${{ matrix.nfpm_arch }}
           FAMILY: ${{ matrix.family }}
-        run: bash packaging/ci/scripts/build-release-package.sh
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 7
-
-  package-tumbleweed:
-    name: Packages / Tumbleweed / ${{ matrix.arch }}
-    needs: [version, build, build-tumbleweed]
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.tumbleweed_package_matrix) }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.version.outputs.source_sha }}
-          persist-credentials: false
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ matrix.binary_artifact_name }}
-          path: ${{ runner.temp }}/binary-tumbleweed-${{ matrix.arch }}
-
-      - name: Prepare Tumbleweed binaries
-        shell: bash
-        env:
-          ARCH: ${{ matrix.arch }}
-          ARTIFACT_DIR: ${{ runner.temp }}/binary-tumbleweed-${{ matrix.arch }}
-          EXPECTED_MACHINE: ${{ matrix.expected_elf_machine }}
-        run: |
-          set -euo pipefail
-          install -d -m 0755 release-bin
-          for binary in openshield-daemon openshield-tui; do
-            source="$ARTIFACT_DIR/$binary"
-            [[ -f "$source" && ! -L "$source" ]] || {
-              echo "::error::Missing or unsafe Tumbleweed binary artifact: $binary"
-              exit 1
-            }
-            elf_machine="$(LC_ALL=C readelf -h "$source" | awk -F: '/^[[:space:]]*Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }')"
-            [[ "$elf_machine" == "$EXPECTED_MACHINE" ]] || {
-              echo "::error::Unexpected ELF machine for $binary: $elf_machine"
-              exit 1
-            }
-            install -m 0755 "$source" "release-bin/$binary"
-          done
-          if [[ "$ARCH" == amd64 ]]; then
-            ./release-bin/openshield-daemon --version
-            ./release-bin/openshield-tui --version
-          fi
-
-      - name: Install nFPM
-        shell: bash
-        env:
-          VERSION: ${{ env.NFPM_VERSION }}
-          EXPECTED_SHA256: ${{ env.NFPM_SHA256 }}
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/nfpm-${VERSION#v}-linux-x86_64.tar.gz"
-          extract_dir="$RUNNER_TEMP/nfpm-${VERSION#v}"
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            --output "$archive" \
-            "https://github.com/goreleaser/nfpm/releases/download/${VERSION}/nfpm_${VERSION#v}_Linux_x86_64.tar.gz"
-          printf '%s  %s\n' "$EXPECTED_SHA256" "$archive" | sha256sum --check --strict -
-          mkdir -m 0700 "$extract_dir"
-          tar -xzf "$archive" -C "$extract_dir" nfpm
-          [[ -f "$extract_dir/nfpm" && ! -L "$extract_dir/nfpm" ]]
-          sudo install -m 0755 "$extract_dir/nfpm" /usr/local/bin/nfpm
-          nfpm --version
-
-      - name: Build Tumbleweed RPM
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-          FAMILY: tumbleweed
         run: bash packaging/ci/scripts/build-release-package.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -582,7 +491,7 @@ jobs:
 
   package-test:
     name: Install / ${{ matrix.name }}
-    needs: [version, package, package-tumbleweed]
+    needs: [version, package]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.version.outputs.platform_matrix) }}
@@ -594,82 +503,17 @@ jobs:
           persist-credentials: false
 
       - name: Enable pinned QEMU for emulated package smoke tests
-        if: ${{ matrix.arch == 'ppc64le' || matrix.arch == 's390x' }}
+        if: ${{ matrix.execution_mode == 'qemu-user' }}
         shell: bash
         env:
+          BINFMT_IMAGE: ${{ env.BINFMT_IMAGE }}
           EMULATED_ARCH: ${{ matrix.arch }}
           EMULATED_IMAGE: ${{ matrix.image }}
           EMULATED_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted \
-            && "${RUNNER_OS:-}" == Linux \
-            && "${RUNNER_ARCH:-}" == X64 ]] || {
-            echo '::error::Privileged binfmt registration is restricted to an ephemeral GitHub-hosted Linux X64 runner'
-            exit 1
-          }
-          case "$EMULATED_ARCH" in
-            ppc64le|s390x) ;;
-            *)
-              echo "::error::Unsupported emulated package-test architecture: $EMULATED_ARCH"
-              exit 1
-              ;;
-          esac
-          [[ "$EMULATED_PLATFORM" == "linux/$EMULATED_ARCH" ]] || {
-            echo "::error::Emulated architecture/platform mismatch: $EMULATED_ARCH / $EMULATED_PLATFORM"
-            exit 1
-          }
-          image_pattern='^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$'
-          [[ "$BINFMT_IMAGE" =~ $image_pattern ]] || {
-            echo '::error::The binfmt installer image is not pinned by SHA-256'
-            exit 1
-          }
-          [[ "$EMULATED_IMAGE" =~ $image_pattern ]] || {
-            echo '::error::The emulated probe image is not pinned by SHA-256'
-            exit 1
-          }
-
-          docker pull --platform linux/amd64 "$BINFMT_IMAGE"
-          install_log="$RUNNER_TEMP/openshield-binfmt-$EMULATED_ARCH.log"
-          if ! docker run --rm --privileged --network none \
-            --platform linux/amd64 --pull never \
-            "$BINFMT_IMAGE" --install "$EMULATED_ARCH" 2>&1 | tee "$install_log"; then
-            echo "::error::The pinned binfmt installer failed for $EMULATED_ARCH"
-            exit 1
-          fi
-          grep -Fqx "installing: $EMULATED_ARCH OK" "$install_log" || {
-            echo "::error::The pinned binfmt image did not register $EMULATED_ARCH"
-            exit 1
-          }
-
-          handler="/proc/sys/fs/binfmt_misc/qemu-$EMULATED_ARCH"
-          [[ -r "$handler" ]] || {
-            echo "::error::QEMU/binfmt handler was not registered: $handler"
-            exit 1
-          }
-          grep -qx enabled "$handler" || {
-            echo "::error::QEMU/binfmt handler is not enabled: $handler"
-            exit 1
-          }
-          handler_flags=$(awk '$1 == "flags:" { print $2; exit }' "$handler")
-          [[ "$handler_flags" == *F* ]] || {
-            echo "::error::QEMU/binfmt handler lacks the fix-binary flag: $handler_flags"
-            exit 1
-          }
-          handler_interpreter=$(awk '$1 == "interpreter" { print $2; exit }' "$handler")
-          [[ "$handler_interpreter" == "/usr/bin/qemu-$EMULATED_ARCH" ]] || {
-            echo "::error::Unexpected QEMU/binfmt interpreter: $handler_interpreter"
-            exit 1
-          }
-
-          actual_arch=$(docker run --rm --network none --read-only --cap-drop ALL \
-            --security-opt no-new-privileges --security-opt label=disable \
-            --platform "$EMULATED_PLATFORM" \
-            --entrypoint /bin/sh "$EMULATED_IMAGE" -eu -c 'uname -m')
-          [[ "$actual_arch" == "$EMULATED_ARCH" ]] || {
-            echo "::error::QEMU/binfmt probe reported $actual_arch instead of $EMULATED_ARCH"
-            exit 1
-          }
+          packaging/ci/scripts/enable-qemu.sh \
+            "$EMULATED_ARCH" "$EMULATED_PLATFORM" "$EMULATED_IMAGE"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -736,6 +580,45 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
+
+      - name: Build the static native client for emulated firewall tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=tests/e2e/native-client.c
+          output_dir="$RUNNER_TEMP/openshield-e2e-native-client"
+          output="$output_dir/openshield-e2e-native-client"
+          [[ -f "$source" && ! -L "$source" ]] || {
+            echo '::error::Missing or unsafe native E2E client source'
+            exit 1
+          }
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils file musl-tools
+          command -v musl-gcc >/dev/null
+          command -v file >/dev/null
+          command -v readelf >/dev/null
+          install -d -m 0755 "$output_dir"
+          umask 022
+          musl-gcc -std=c11 -static -O2 -Wall -Wextra -Werror -Wpedantic \
+            "$source" -o "$output"
+          chmod 0755 "$output"
+          [[ -f "$output" && ! -L "$output" && -x "$output" ]]
+          file_identity=$(LC_ALL=C file -b "$output")
+          case "$file_identity" in
+            *"ELF 64-bit"*"x86-64"*"statically linked"*) ;;
+            *)
+              echo "::error::Unexpected native E2E client identity: $file_identity"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-native-client-amd64
+          path: ${{ runner.temp }}/openshield-e2e-native-client/openshield-e2e-native-client
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Test non-systemd init integrations in containers
         run: scripts/test-init-matrix.sh containers-clean
 
@@ -794,6 +677,44 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
+
+      - name: Enable pinned QEMU for emulated firewall tests
+        if: ${{ matrix.execution_mode == 'qemu-user' }}
+        shell: bash
+        env:
+          BINFMT_IMAGE: ${{ env.BINFMT_IMAGE }}
+          EMULATED_ARCH: ${{ matrix.arch }}
+          EMULATED_IMAGE: ${{ matrix.image }}
+          EMULATED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          packaging/ci/scripts/enable-qemu.sh \
+            "$EMULATED_ARCH" "$EMULATED_PLATFORM" "$EMULATED_IMAGE"
+
+      - name: Download native attribution client for emulated firewall tests
+        if: ${{ matrix.execution_mode == 'qemu-user' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-native-client-amd64
+          path: ${{ runner.temp }}/openshield-e2e-native-client
+
+      - name: Verify native attribution client for emulated firewall tests
+        if: ${{ matrix.execution_mode == 'qemu-user' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          client="$RUNNER_TEMP/openshield-e2e-native-client/openshield-e2e-native-client"
+          [[ -f "$client" && ! -L "$client" ]]
+          chmod 0755 "$client"
+          file_identity=$(LC_ALL=C file -b "$client")
+          case "$file_identity" in
+            *"ELF 64-bit"*"x86-64"*"statically linked"*) ;;
+            *)
+              echo "::error::Unexpected native E2E client artifact identity: $file_identity"
+              exit 1
+              ;;
+          esac
+          printf 'E2E_NATIVE_CLIENT=%s\n' "$client" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -888,9 +809,7 @@ jobs:
     needs:
       - version
       - build
-      - build-tumbleweed
       - package
-      - package-tumbleweed
       - package-test
       - container-tests
       - e2e

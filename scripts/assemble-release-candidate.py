@@ -143,11 +143,11 @@ def verify_archive(path: Path, binaries: dict[str, Path]) -> None:
 
 
 def execution_mode(arch: str) -> str:
-    if arch in {"ppc64le", "s390x"}:
-        return "qemu-user"
-    if arch == "i586":
+    if arch in {"386", "i586"}:
         return "x86-compat"
-    return "native"
+    if arch in {"amd64", "arm64"}:
+        return "native"
+    return "qemu-user"
 
 
 def expected_evidence(matrix: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:

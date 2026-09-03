@@ -133,9 +133,9 @@ done < <(jq -r '.assets[] | [.name, .sha256, (.size | tostring)] | @tsv' "$evide
 jq -S --arg source_sha "$source_sha" --arg version "$version" \
     --slurpfile evidence "$evidence" '
       def execution_mode($arch):
-        if ($arch == "ppc64le" or $arch == "s390x") then "qemu-user"
-        elif $arch == "i586" then "x86-compat"
-        else "native"
+        if ($arch == "386" or $arch == "i586") then "x86-compat"
+        elif ($arch == "amd64" or $arch == "arm64") then "native"
+        else "qemu-user"
         end;
       ($evidence[0].assets
         | map(select(.kind == "package"))
@@ -158,9 +158,9 @@ cmp -s "$temporary_directory/expected-install-evidence.json" \
 jq -S --arg source_sha "$source_sha" --arg version "$version" \
     --slurpfile evidence "$evidence" '
       def execution_mode($arch):
-        if ($arch == "ppc64le" or $arch == "s390x") then "qemu-user"
-        elif $arch == "i586" then "x86-compat"
-        else "native"
+        if ($arch == "386" or $arch == "i586") then "x86-compat"
+        elif ($arch == "amd64" or $arch == "arm64") then "native"
+        else "qemu-user"
         end;
       ($evidence[0].assets
         | map(select(.kind == "package"))

@@ -33,10 +33,11 @@ the distribution select its native provider, including `systemd-mini` where
 available, and guarantees that the post-install script can create and relabel
 the exact runtime paths before the first manual start.
 
-The Tumbleweed-specific GNU RPMs for `x86_64`, `i586`, `aarch64`, `ppc64le`,
-and `s390x` are dynamically linked. They additionally require the official
-Tumbleweed `glibc` and `libgcc_s1` runtime packages. These dependencies are not
-added to the separate static-musl RPM builds.
+Every release-matrix RPM payload is required to be statically linked and to
+have no ELF `PT_INTERP` segment. Package-install tests enforce that property for
+each architecture, so the package does not rely on a separately declared C or
+unwind runtime. Static linkage does not remove the Linux kernel-version and
+userspace compatibility constraints recorded by the release evidence.
 
 ## Runtime objects
 
