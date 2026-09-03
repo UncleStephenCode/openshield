@@ -441,8 +441,14 @@ case "$client_family" in
         fi
         ;;
     fedora|el9|el10)
+        # EL9 base images already provide curl-minimal.  Asking DNF for the
+        # full curl package would require replacing it and makes provisioning
+        # fail before the OpenShield package is exercised.
         docker exec "$client" dnf -y install \
-            curl nmap-ncat python3 shadow-utils util-linux >/dev/null
+            nmap-ncat python3 shadow-utils util-linux >/dev/null
+        if ! docker exec "$client" /bin/sh -c 'command -v curl >/dev/null'; then
+            docker exec "$client" dnf -y install curl-minimal >/dev/null
+        fi
         if [ "$backend" = nftables ]; then
             docker exec "$client" /bin/sh -c \
                 'dnf -y install nftables iptables-nft || dnf -y install nftables iptables' \
@@ -652,7 +658,10 @@ run_udp_client() {
             source_port=$3
             server_address=$4
             server_port=$5
-            printf "%s" "$payload" \
+            # Keep stdin open briefly after the datagram is written.  Nmap
+            # Ncat otherwise exits on EOF before the daemon can attribute the
+            # short-lived UDP socket and before the echo reply is received.
+            { printf "%s" "$payload"; sleep 1; } \
                 | "$executable" -u -w 2 -p "$source_port" "$server_address" "$server_port"
         ' openshield-udp-client \
             "$udp_payload" "$udp_executable" 19000 "$server_ip" 18082
@@ -817,7 +826,8 @@ docker exec "$server" python3 -c \
 begin_stage 'graceful shutdown and fail-closed policy'
 daemon_pid=$(docker exec "$client" cat "$daemon_pid_file")
 case "$daemon_pid" in ''|*[!0-9]*) printf '%s\n' 'invalid daemon pid' >&2; exit 1 ;; esac
-docker exec "$client" kill -TERM "$daemon_pid"
+docker exec "$client" /bin/sh -c 'kill -TERM "$1"' \
+    openshield-daemon-stop "$daemon_pid"
 wait_for_daemon_exit /tmp/openshield.log 'initial daemon'
 if docker exec "$client" test -S /run/openshield/control.sock; then
     printf '%s\n' 'daemon left the control socket after process exit' >&2
@@ -842,7 +852,8 @@ run_tcp_client 5 || {
 }
 daemon_pid=$(docker exec "$client" cat "$daemon_pid_file")
 case "$daemon_pid" in ''|*[!0-9]*) printf '%s\n' 'invalid restarted daemon pid' >&2; exit 1 ;; esac
-docker exec "$client" kill -TERM "$daemon_pid"
+docker exec "$client" /bin/sh -c 'kill -TERM "$1"' \
+    openshield-daemon-stop "$daemon_pid"
 wait_for_daemon_exit /tmp/openshield-restart.log 'restarted daemon'
 if docker exec "$client" test -S /run/openshield/control.sock; then
     printf '%s\n' 'restarted daemon left the control socket after process exit' >&2

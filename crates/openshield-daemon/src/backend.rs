@@ -50,8 +50,10 @@ const MAX_NFT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FIREWALL_STDERR_BYTES: usize = 64 * 1024;
 const XT_WAIT_SECONDS: &str = "5";
 const XTABLES_LIST_ARGS: [&str; 6] = ["--wait", XT_WAIT_SECONDS, "-t", "filter", "-n", "-L"];
-const LEGACY_BACKEND_UNAVAILABLE_SUFFIX: &str =
-    ": Cannot initialize: iptables who? (do you need to insmod?)";
+const LEGACY_BACKEND_UNAVAILABLE_SUFFIXES: [&str; 2] = [
+    ": Cannot initialize: iptables who? (do you need to insmod?)",
+    ": Cannot initialize: Protocol not supported",
+];
 // `--test --noflush` validates every xtables extension and control-flow
 // primitive used by the compatibility compiler without changing live rules.
 // A bundle which merely understands an empty filter table is not sufficient:
@@ -1258,7 +1260,10 @@ fn is_proven_absent_legacy_backend(
     if diagnostic.contains(['\n', '\r']) {
         return false;
     }
-    let Some(version_line) = diagnostic.strip_suffix(LEGACY_BACKEND_UNAVAILABLE_SUFFIX) else {
+    let Some(version_line) = LEGACY_BACKEND_UNAVAILABLE_SUFFIXES
+        .iter()
+        .find_map(|suffix| diagnostic.strip_suffix(suffix))
+    else {
         return false;
     };
     if !version_line.starts_with(program_prefix)
@@ -3203,6 +3208,16 @@ COMMIT
             diagnostic,
         ));
 
+        let unsupported_protocol =
+            b"ip6tables-save v1.8.7 (legacy): Cannot initialize: Protocol not supported\n";
+        assert!(is_proven_absent_legacy_backend(
+            legacy_save,
+            legacy_binary,
+            Some(1),
+            b"",
+            unsupported_protocol,
+        ));
+
         let ipv4_save = std::path::Path::new("/usr/sbin/iptables-save");
         let old_legacy_binary = std::path::Path::new("/usr/sbin/xtables-multi");
         let ipv4_diagnostic =
@@ -3359,6 +3374,8 @@ COMMIT
         let legacy_binary = std::path::Path::new("/usr/sbin/xtables-legacy-multi");
         let nft_binary = std::path::Path::new("/usr/sbin/xtables-nft-multi");
         let diagnostic = b"ip6tables-save v1.8.9 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n";
+        let unsupported_protocol =
+            b"ip6tables-save v1.8.9 (legacy): Cannot initialize: Protocol not supported\n";
         let ambiguous = [
             AmbiguousCase { status: Some(0), stdout: b"", stderr: diagnostic, resolved: legacy_binary },
             AmbiguousCase { status: Some(2), stdout: b"", stderr: diagnostic, resolved: legacy_binary },
@@ -3396,6 +3413,12 @@ COMMIT
                 resolved: legacy_binary,
             },
             AmbiguousCase { status: Some(1), stdout: b"", stderr: diagnostic, resolved: nft_binary },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: unsupported_protocol,
+                resolved: nft_binary,
+            },
         ];
         for case in ambiguous {
             assert!(!is_proven_absent_legacy_backend(
