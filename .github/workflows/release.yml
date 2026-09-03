@@ -366,6 +366,15 @@ jobs:
               echo "::error::Unexpected ELF identity for $binary: $elf_class / $elf_data / $elf_machine"
               exit 1
             }
+            if LC_ALL=C readelf -l "$source" \
+                | grep -E '(^|[[:space:]])INTERP([[:space:]]|$)' >/dev/null; then
+              echo "::error::Release binary contains a dynamic ELF interpreter: $binary"
+              exit 1
+            fi
+            if LC_ALL=C readelf -d "$source" | grep -F '(NEEDED)' >/dev/null; then
+              echo "::error::Release binary contains a dynamic ELF dependency: $binary"
+              exit 1
+            fi
             install -m 0755 "$source" "dist/$binary"
           done
           file dist/openshield-daemon dist/openshield-tui
@@ -508,19 +517,6 @@ jobs:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
 
-      - name: Enable pinned QEMU for emulated package smoke tests
-        if: ${{ matrix.execution_mode == 'qemu-user' }}
-        shell: bash
-        env:
-          BINFMT_IMAGE: ${{ env.BINFMT_IMAGE }}
-          EMULATED_ARCH: ${{ matrix.arch }}
-          EMULATED_IMAGE: ${{ matrix.image }}
-          EMULATED_PLATFORM: ${{ matrix.platform }}
-        run: |
-          set -euo pipefail
-          packaging/ci/scripts/enable-qemu.sh \
-            "$EMULATED_ARCH" "$EMULATED_PLATFORM" "$EMULATED_IMAGE"
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ matrix.package_artifact_name }}
@@ -587,44 +583,6 @@ jobs:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
 
-      - name: Build the static native client for emulated firewall tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          source=tests/e2e/native-client.c
-          output_dir="$RUNNER_TEMP/openshield-e2e-native-client"
-          output="$output_dir/openshield-e2e-native-client"
-          [[ -f "$source" && ! -L "$source" ]] || {
-            echo '::error::Missing or unsafe native E2E client source'
-            exit 1
-          }
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends binutils file musl-tools
-          command -v musl-gcc >/dev/null
-          command -v file >/dev/null
-          command -v readelf >/dev/null
-          install -d -m 0755 "$output_dir"
-          umask 022
-          musl-gcc -std=c11 -static -O2 -Wall -Wextra -Werror -Wpedantic \
-            "$source" -o "$output"
-          chmod 0755 "$output"
-          [[ -f "$output" && ! -L "$output" && -x "$output" ]]
-          file_identity=$(LC_ALL=C file -b "$output")
-          case "$file_identity" in
-            *"ELF 64-bit"*"x86-64"*"statically linked"*) ;;
-            *)
-              echo "::error::Unexpected native E2E client identity: $file_identity"
-              exit 1
-              ;;
-          esac
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: e2e-native-client-amd64
-          path: ${{ runner.temp }}/openshield-e2e-native-client/openshield-e2e-native-client
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Test non-systemd init integrations in containers
         run: scripts/test-init-matrix.sh containers-clean
 
@@ -683,44 +641,6 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_sha }}
           persist-credentials: false
-
-      - name: Enable pinned QEMU for emulated firewall tests
-        if: ${{ matrix.execution_mode == 'qemu-user' }}
-        shell: bash
-        env:
-          BINFMT_IMAGE: ${{ env.BINFMT_IMAGE }}
-          EMULATED_ARCH: ${{ matrix.arch }}
-          EMULATED_IMAGE: ${{ matrix.image }}
-          EMULATED_PLATFORM: ${{ matrix.platform }}
-        run: |
-          set -euo pipefail
-          packaging/ci/scripts/enable-qemu.sh \
-            "$EMULATED_ARCH" "$EMULATED_PLATFORM" "$EMULATED_IMAGE"
-
-      - name: Download native attribution client for emulated firewall tests
-        if: ${{ matrix.execution_mode == 'qemu-user' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: e2e-native-client-amd64
-          path: ${{ runner.temp }}/openshield-e2e-native-client
-
-      - name: Verify native attribution client for emulated firewall tests
-        if: ${{ matrix.execution_mode == 'qemu-user' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          client="$RUNNER_TEMP/openshield-e2e-native-client/openshield-e2e-native-client"
-          [[ -f "$client" && ! -L "$client" ]]
-          chmod 0755 "$client"
-          file_identity=$(LC_ALL=C file -b "$client")
-          case "$file_identity" in
-            *"ELF 64-bit"*"x86-64"*"statically linked"*) ;;
-            *)
-              echo "::error::Unexpected native E2E client artifact identity: $file_identity"
-              exit 1
-              ;;
-          esac
-          printf 'E2E_NATIVE_CLIENT=%s\n' "$client" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

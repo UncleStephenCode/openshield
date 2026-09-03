@@ -185,16 +185,16 @@ build-to-publication flow are documented in [.github/README-CI.md](.github/READM
 The release workflow produces separate architecture-specific builds and RPMs
 for every Tumbleweed platform selected by the authoritative release matrix:
 
-| Target architecture | Release suffix | RPM architecture |
-| --- | --- | --- |
-| `x86_64` | `tumbleweed-amd64` | `x86_64` |
-| `i586` / `i686` | `tumbleweed-386` | `i586` |
-| `aarch64` | `tumbleweed-arm64` | `aarch64` |
-| ARMv6 hard-float | `tumbleweed-armv6` | `armv6hl` |
-| ARMv7 hard-float | `tumbleweed-armv7` | `armv7hl` |
-| `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` |
-| `riscv64` | `tumbleweed-riscv64` | `riscv64` |
-| `s390x` | `tumbleweed-s390x` | `s390x` |
+| Target architecture | Release suffix | RPM architecture | Release-CI evidence |
+| --- | --- | --- | --- |
+| `x86_64` | `tumbleweed-amd64` | `x86_64` | native package install and nftables/iptables E2E |
+| `i586` / `i686` | `tumbleweed-386` | `i586` | x86-64 compatibility package install and nftables/iptables E2E |
+| `aarch64` | `tumbleweed-arm64` | `aarch64` | native package install and nftables/iptables E2E |
+| ARMv6 hard-float | `tumbleweed-armv6` | `armv6hl` | build and QEMU `--version` smoke only |
+| ARMv7 hard-float | `tumbleweed-armv7` | `armv7hl` | build and QEMU `--version` smoke only |
+| `ppc64le` | `tumbleweed-ppc64le` | `ppc64le` | build and QEMU `--version` smoke only |
+| `riscv64` | `tumbleweed-riscv64` | `riscv64` | build and QEMU `--version` smoke only |
+| `s390x` | `tumbleweed-s390x` | `s390x` | build and QEMU `--version` smoke only |
 
 Install the matching Tumbleweed RPM with `zypper`. Its firewall dependency is
 `(nftables or iptables)` and it recommends nftables, so a normal installation
@@ -285,8 +285,8 @@ arbitrary privileged ruleset editors.
 Compatibility claims are intentionally scoped:
 
 - final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 262 tests: 55 core,
-  144 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
+  all-target checks, clippy with warnings denied, and all 263 tests: 55 core,
+  145 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
   live-firewall end-to-end result;
 - both final static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
@@ -301,19 +301,20 @@ Compatibility claims are intentionally scoped:
 - the two RISC-V 32 targets are Rust Tier 3 and were skipped because stable
   rustup does not ship their standard libraries; they require an explicitly
   separate nightly `build-std` workflow;
-- the release workflow is configured for 43 architecture/family binary rows,
-  43 corresponding package rows, and 86 pinned distribution/platform install
-  rows. It requires the expected ELF identity, a static runtime boundary, a
-  target-image binary smoke, package installation, and assigned container tests
-  before publication;
-- every one of the 86 platform rows is assigned both nftables and iptables
-  Learning-to-Enforcing scenarios, for 172 firewall jobs. This is a publication
-  requirement of the new matrix, not a claim that an unpublished workflow run
-  has already completed;
-- `amd64` and `arm64` execute on native runners, `386` uses x86 compatibility,
-  and ARMv5/6/7, `ppc64le`, `riscv64`, and `s390x` use selected pinned
-  Cross/QEMU environments. QEMU results are emulation evidence; they do not
-  replace native-hardware validation or exercise a distribution-owned kernel.
+- the release workflow builds 43 architecture/family binary targets and 43
+  corresponding package targets. The runtime submatrix installs 19 package
+  variants in 37 pinned distribution/platform rows: 16 `amd64`, 15 `arm64`,
+  and 6 `386`;
+- each of those 37 rows runs the nftables and iptables
+  Learning-to-Enforcing scenarios, for 74 firewall jobs. Both results are
+  publication requirements, not claims that an unpublished workflow run has
+  already completed;
+- `amd64` and `arm64` execute on native runners, while `386` uses the x86-64
+  kernel's 32-bit compatibility path. The other 24 ARMv5/6/7, `ppc64le`,
+  `riscv64`, and `s390x` package variants are build-only; their pinned
+  Cross/QEMU checks stop at ELF validation and a target-image `--version`
+  smoke. They account for 49 of the 86 declared distribution/platform
+  mappings and have no package-install or firewall-runtime evidence.
 
 The 60-image smoke matrix does not boot each image's init system and does not
 exercise its kernel, firewall backend, NFQUEUE, package manager, or upgrade
@@ -323,14 +324,14 @@ commands, and interpretation.
 
 The release workflow now requires the isolated
 `tests/e2e/server-learning-enforcing.sh` scenario with nftables and iptables for
-all 86 distribution/platform rows. The nftables scenario installs both
-frontends and requires nftables to win; the iptables scenario omits `nft` and
-requires the compatibility backend. Each run covers Learning, UDP/TCP
-Enforcing, application identity, an explicit inbound allow, and restart. These
-are configured publication gates and must not be read as results until the
-corresponding workflow has completed. They run in disposable namespaces on a
-Unix-socket Docker engine, do not modify the host firewall, and are not
-production or native-hardware certification.
+the 37 runtime-tested distribution/platform rows. The nftables scenario
+installs both frontends and requires nftables to win; the iptables scenario
+omits `nft` and requires the compatibility backend. Each run covers Learning,
+UDP/TCP Enforcing, application identity, an explicit inbound allow, and
+restart. These 74 configured publication gates must not be read as results
+until the corresponding workflow has completed. They run in disposable
+namespaces on a Unix-socket Docker engine, do not modify the host firewall,
+and are not production or native-hardware certification.
 
 ## TUI localization
 

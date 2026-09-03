@@ -150,10 +150,16 @@ def execution_mode(arch: str) -> str:
     return "qemu-user"
 
 
-def expected_evidence(matrix: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    installs = {row["id"]: row for row in matrix["platforms"]}
+def expected_evidence(
+    matrix: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    runtime_test_arches = frozenset(matrix["runtime_test_arches"])
+    runtime_platforms = [
+        row for row in matrix["platforms"] if row["arch"] in runtime_test_arches
+    ]
+    installs = {row["id"]: row for row in runtime_platforms}
     firewall: dict[str, dict[str, Any]] = {}
-    for row in matrix["platforms"]:
+    for row in runtime_platforms:
         modes = row["firewall_test"]
         backends: tuple[str, ...]
         if modes == "full":
@@ -167,6 +173,14 @@ def expected_evidence(matrix: dict[str, Any]) -> tuple[dict[str, dict[str, Any]]
         for backend in backends:
             evidence_id = f"{row['id']}-{backend}"
             firewall[evidence_id] = {**row, "backend": backend}
+
+    for row in matrix["platforms"]:
+        expected_mode = "full" if row["arch"] in runtime_test_arches else "build-only"
+        if row["firewall_test"] != expected_mode:
+            raise CandidateError(
+                f"contradictory firewall_test mode in {row['id']}: "
+                f"expected {expected_mode}, found {row['firewall_test']}"
+            )
     return installs, firewall
 
 

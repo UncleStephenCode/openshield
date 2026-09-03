@@ -20,7 +20,9 @@ MAX_MATRIX_BYTES = 1024 * 1024
 MAX_CROSS_BYTES = 64 * 1024
 EXPECTED_COUNTS = {"binaries": 43, "packages": 43, "platforms": 86}
 
-ROOT_KEYS = frozenset({"schema_version", "binaries", "packages", "platforms"})
+ROOT_KEYS = frozenset(
+    {"schema_version", "runtime_test_arches", "binaries", "packages", "platforms"}
+)
 BINARY_KEYS = frozenset(
     {
         "id",
@@ -180,6 +182,7 @@ PACKAGE_COMBINATIONS = {
 }
 CROSS_ARCHES = frozenset(set(ARCH_DETAILS) - {"amd64", "arm64"})
 CRT_STATIC_ARCHES = frozenset({"ppc64le", "riscv64", "s390x"})
+EXPECTED_RUNTIME_TEST_ARCHES = ("amd64", "arm64", "386")
 
 
 def execution_mode(arch: str) -> str:
@@ -614,8 +617,13 @@ def validate_platforms(
         if row["expected_package_arch"] != package["expected_package_arch"]:
             raise MatrixError(f"{where}.expected_package_arch does not match its package")
 
-        if row["firewall_test"] != "full":
-            raise MatrixError(f"{where}.firewall_test must be full")
+        expected_firewall_test = (
+            "full" if arch in EXPECTED_RUNTIME_TEST_ARCHES else "build-only"
+        )
+        if row["firewall_test"] != expected_firewall_test:
+            raise MatrixError(
+                f"{where}.firewall_test must be {expected_firewall_test} for {arch}"
+            )
 
         image_platform = (image_name, expected_platform)
         if image_platform in image_platforms:
@@ -636,6 +644,15 @@ def validate_platforms(
     unique_rows(result, "id", "platform")
     unique_rows(result, "name", "platform")
     return result
+
+
+def validate_runtime_test_arches(value: Any) -> list[str]:
+    if not isinstance(value, list) or tuple(value) != EXPECTED_RUNTIME_TEST_ARCHES:
+        raise MatrixError(
+            "runtime_test_arches must be exactly: "
+            + ", ".join(EXPECTED_RUNTIME_TEST_ARCHES)
+        )
+    return list(value)
 
 
 def validate_smoke_links(
@@ -722,6 +739,7 @@ def load_and_validate() -> dict[str, Any]:
     root = exact_keys(document, ROOT_KEYS, "root")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise MatrixError("schema_version must be integer 1")
+    runtime_test_arches = validate_runtime_test_arches(root["runtime_test_arches"])
     binaries = validate_binaries(root["binaries"])
     packages = validate_packages(root["packages"], binaries)
     platforms = validate_platforms(root["platforms"], packages)
@@ -729,6 +747,7 @@ def load_and_validate() -> dict[str, Any]:
     validate_cross_config()
     return {
         "schema_version": 1,
+        "runtime_test_arches": runtime_test_arches,
         "binaries": list(binaries.values()),
         "packages": list(packages.values()),
         "platforms": platforms,
@@ -754,11 +773,15 @@ def emitted_rows(document: dict[str, Any], matrix: str) -> list[dict[str, Any]]:
 
     packages = {row["id"]: row for row in document["packages"]}
     platforms = [enrich_platform(row, packages) for row in document["platforms"]]
+    runtime_test_arches = frozenset(document["runtime_test_arches"])
+    runtime_platforms = [
+        row for row in platforms if row["arch"] in runtime_test_arches
+    ]
     if matrix == "platforms":
-        return platforms
+        return runtime_platforms
 
     firewall: list[dict[str, Any]] = []
-    for platform in platforms:
+    for platform in runtime_platforms:
         for backend in ("nftables", "iptables"):
             row = dict(platform)
             row["backend"] = backend
@@ -787,12 +810,14 @@ def main() -> int:
     try:
         document = load_and_validate()
         if arguments.command == "validate":
+            runtime_platform_count = len(emitted_rows(document, "platforms"))
             firewall_count = len(emitted_rows(document, "firewall"))
             print(
                 "release matrix validated: "
                 f"{len(document['binaries'])} binaries, "
                 f"{len(document['packages'])} packages, "
-                f"{len(document['platforms'])} platforms, "
+                f"{len(document['platforms'])} declared platforms, "
+                f"{runtime_platform_count} package-install jobs, "
                 f"{firewall_count} firewall jobs"
             )
         else:

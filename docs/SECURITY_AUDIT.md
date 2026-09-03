@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-02, OpenShield 0.1.18, Rust stable 1.98.0.
+Review snapshot: 2026-09-03, OpenShield 0.1.27, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -57,11 +57,14 @@ The normative boundary is defined by the
   installed rule bodies, and keeps its dispatch jumps first in the relevant
   built-in chains. It refuses ambiguous coexistence with old OpenShield
   artifacts in nftables or another xtables implementation.
-- An installed legacy userspace frontend whose kernel protocol is unavailable
-  is treated as an empty alternate xtables world only after both `filter` and
-  `mangle` inspections return the exact bounded `ENOPROTOOPT` diagnostic with
-  an empty stdout. Mixed results, permission failures, timeouts, malformed or
-  oversized output, and every other error remain fail-closed.
+- Alternate xtables worlds are inspected with one bounded `*-save -c` snapshot
+  and no `-t` selector, so legacy userspace enumerates only already loaded
+  tables and cannot request module autoload during inspection. The combined
+  output has strict table framing; only `filter` and `mangle` are examined for
+  owned artifacts. An unavailable legacy protocol is accepted as empty only
+  for its exact bounded diagnostic and empty stdout. Unexpected diagnostics,
+  permission failures, timeouts, malformed or oversized output, and every
+  other error remain fail-closed.
 - xtables has no transaction that spans IPv4 and IPv6. OpenShield therefore
   validates both programs and puts both families into `BlockAll` before applying
   either requested policy. Failure can cause temporary denial but must not
@@ -190,7 +193,7 @@ establish the properties of another.
 
 - Final Rust 1.98.0 verification passed `cargo fmt --all -- --check`, locked
   workspace all-target checks, workspace all-target clippy with warnings denied,
-  and all 262 workspace tests: 55 core, 144 daemon, 11 protocol, and 52 TUI.
+  and all 263 workspace tests: 55 core, 145 daemon, 11 protocol, and 52 TUI.
   This includes automatic-learning budgets, version pinning, fsuid-prefilter,
   and immutable policy-index cases. Daemon tests used mock backends and temporary
   Unix sockets and did not touch the host firewall. These are component results,

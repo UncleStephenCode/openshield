@@ -14,24 +14,30 @@ Validation
     -> Quality Gate
     -> 43 family/architecture binary builds
     -> 43 family/architecture package builds
-    -> 86 distribution/platform installations
+    -> 37 distribution/platform installations for 19 package variants
     -> pinned init-system container tests
-    -> 172 firewall E2E jobs
+    -> 74 firewall E2E jobs
     -> sealed release candidate and evidence
     -> publication
 ```
 
-Every one of the 86 pinned distribution/platform rows executes both the
-nftables-preference and iptables-only fallback scenarios. `amd64` and `arm64`
-use native GitHub-hosted runners, `linux/386` uses the x86 compatibility path,
-and the remaining ARM, PowerPC, RISC-V, and IBM Z rows use a SHA-256-pinned
-Cross/QEMU path. Emulated evidence is labelled as such and is not represented
-as native-hardware certification.
+The runtime matrix contains 37 pinned distribution/platform rows: 16 `amd64`,
+15 `arm64`, and 6 `386`. Every row executes both the nftables-preference and
+iptables-only fallback scenarios. `amd64` and `arm64` use native GitHub-hosted
+runners; `linux/386` uses the x86-64 kernel's direct 32-bit compatibility path.
 
-Every published package is linked to its installation and firewall evidence by
-asset name and SHA-256. Before making any publication API request, the
-write-capable job independently verifies the tag, source revision, matrix hash,
-complete asset inventory, file sizes, digests, and `SHA256SUMS`.
+All 43 binary and 43 package targets are still built. The other 24 package
+variants for ARMv5/6/7, PowerPC64LE, RISC-V 64, and IBM Z are build-only:
+they account for 49 of the 86 declared distribution/platform mappings. Their
+Cross/QEMU lanes provide ELF and capability-free `--version` smoke evidence,
+but no package-install or firewall-runtime evidence. Publication of one of
+these artifacts is not a runtime-support or native-hardware claim.
+
+Each runtime-tested package is linked to its installation and firewall evidence
+by asset name and SHA-256; build-only packages carry build and asset-integrity
+evidence instead. Before making any publication API request, the write-capable
+job independently verifies the tag, source revision, matrix hash, complete
+asset inventory, file sizes, digests, and `SHA256SUMS`.
 
 To create a release, set `[workspace.package].version` in `Cargo.toml`, commit
 the complete change, and create the matching `vX.Y.Z` tag on that commit. A

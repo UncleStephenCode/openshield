@@ -591,13 +591,9 @@ impl XtablesTools {
             matches!(table, "filter" | "mangle"),
             "unsupported xtables inspection table"
         );
-        capture_command(
-            &self.save,
-            &["-c", "-t", table],
-            NFT_QUERY_TIMEOUT,
-            MAX_NFT_OUTPUT_BYTES,
-        )
-        .with_context(|| format!("cannot inspect policy through {}", self.save.display()))
+        let args = selected_xtables_save_args(table);
+        capture_command(&self.save, &args, NFT_QUERY_TIMEOUT, MAX_NFT_OUTPUT_BYTES)
+            .with_context(|| format!("cannot inspect policy through {}", self.save.display()))
     }
 }
 
@@ -987,11 +983,18 @@ fn active_xtables_worlds(
 
         let duplicate_world =
             xtables_world_is_covered(identity_before.world, excluded, &inspected_worlds);
+        let legacy_world_is_covered =
+            xtables_world_is_covered(XtablesWorld::Legacy, excluded, &inspected_worlds);
         let inspection = if duplicate_world {
             None
         } else {
-            Some(inspect_xtables_world(|table| {
-                inspect_xtables_table(save, &identity_before.resolved, table)
+            Some(inspect_xtables_world(|| {
+                inspect_xtables_save_world(
+                    save,
+                    &identity_before.resolved,
+                    identity_before.world,
+                    legacy_world_is_covered,
+                )
             }))
         };
         let identity_after = identify_xtables_world(save);
@@ -1154,55 +1157,44 @@ fn parse_xtables_world_version(
 }
 
 #[derive(Debug)]
-enum XtablesTableInspection {
+enum XtablesWorldInspection {
     Captured(Vec<u8>),
     BackendAbsent,
 }
 
-fn inspect_xtables_world<Capture>(mut capture: Capture) -> Result<bool>
+fn inspect_xtables_world<Capture>(capture: Capture) -> Result<bool>
 where
-    Capture: FnMut(&str) -> Result<XtablesTableInspection>,
+    Capture: FnOnce() -> Result<XtablesWorldInspection>,
 {
-    let mut absent_tables = 0_u8;
-    let mut captured_tables = 0_u8;
-    for table in ["filter", "mangle"] {
-        match capture(table)? {
-            XtablesTableInspection::Captured(captured) => {
-                captured_tables = captured_tables
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("xtables captured-table count overflow"))?;
-                if parse_xtables_save(&captured)?.has_openshield_artifacts() {
-                    return Ok(true);
-                }
-            }
-            XtablesTableInspection::BackendAbsent => {
-                absent_tables = absent_tables
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("xtables absent-table count overflow"))?;
-            }
-        }
+    match capture()? {
+        XtablesWorldInspection::Captured(captured) => parse_xtables_world_save(&captured),
+        // A backend absence accepted by the exact bounded classifier cannot
+        // retain live rules and is therefore equivalent to a clean capture.
+        XtablesWorldInspection::BackendAbsent => Ok(false),
     }
-    ensure!(
-        (absent_tables == 0 && captured_tables == 2)
-            || (absent_tables == 2 && captured_tables == 0),
-        "xtables backend availability changed or differed between filter and mangle inspection"
-    );
-    Ok(false)
 }
 
-fn inspect_xtables_table(
+fn inspect_xtables_save_world(
     save: &Path,
     resolved: &Path,
-    table: &str,
-) -> Result<XtablesTableInspection> {
-    let captured = capture_command_output(
-        save,
-        &["-c", "-t", table],
-        NFT_QUERY_TIMEOUT,
-        MAX_NFT_OUTPUT_BYTES,
-    )?;
+    world: XtablesWorld,
+    legacy_world_is_covered: bool,
+) -> Result<XtablesWorldInspection> {
+    let args = xtables_save_inspection_args();
+    let captured = capture_command_output(save, &args, NFT_QUERY_TIMEOUT, MAX_NFT_OUTPUT_BYTES)?;
     if captured.status.success() {
-        return Ok(XtablesTableInspection::Captured(captured.stdout));
+        ensure!(
+            captured.stderr.is_empty()
+                || is_expected_covered_legacy_warning(
+                    save,
+                    world,
+                    legacy_world_is_covered,
+                    &captured.stderr,
+                ),
+            "{} wrote an unexpected diagnostic while inspecting its xtables world",
+            save.display()
+        );
+        return Ok(XtablesWorldInspection::Captured(captured.stdout));
     }
     if is_proven_absent_legacy_backend(
         save,
@@ -1211,13 +1203,57 @@ fn inspect_xtables_table(
         &captured.stdout,
         &captured.stderr,
     ) {
-        return Ok(XtablesTableInspection::BackendAbsent);
+        return Ok(XtablesWorldInspection::BackendAbsent);
     }
     bail!(
-        "{save} ({table}) exited with status {status}",
+        "{save} exited with status {status}",
         save = save.display(),
         status = captured.status
     )
+}
+
+fn selected_xtables_save_args(table: &str) -> [&str; 3] {
+    ["-c", "-t", table]
+}
+
+fn xtables_save_inspection_args() -> [&'static str; 1] {
+    // With no `-t`, legacy iptables-save enumerates only tables that are already
+    // registered in procfs. It therefore observes an alternate world without
+    // asking modprobe to load a missing table module. Selected-backend capture
+    // deliberately retains `-t` so a usable selected backend can initialize.
+    ["-c"]
+}
+
+fn is_expected_covered_legacy_warning(
+    save: &Path,
+    world: XtablesWorld,
+    legacy_world_is_covered: bool,
+    stderr: &[u8],
+) -> bool {
+    if world != XtablesWorld::Nft || !legacy_world_is_covered {
+        return false;
+    }
+    let Some(save_name) = save.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let program = if save_name.starts_with("ip6tables") {
+        "ip6tables"
+    } else if save_name.starts_with("iptables") {
+        "iptables"
+    } else {
+        return false;
+    };
+    let expected = format!(
+        "# Warning: {program}-legacy tables present, use {program}-legacy-save to see them"
+    );
+    let Ok(stderr) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    let stderr = stderr
+        .strip_suffix("\r\n")
+        .or_else(|| stderr.strip_suffix('\n'))
+        .unwrap_or(stderr);
+    stderr == expected
 }
 
 fn is_proven_absent_legacy_backend(
@@ -1255,8 +1291,14 @@ fn is_proven_absent_legacy_backend(
     let Ok(diagnostic) = std::str::from_utf8(stderr) else {
         return false;
     };
-    let diagnostic = diagnostic.strip_suffix('\n').unwrap_or(diagnostic);
-    let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
+    // libxtables releases in supported distributions terminate this fatal
+    // diagnostic with either one line ending or a line ending plus one empty
+    // line. Accept only those exact encodings; any third or interior line
+    // remains below and is rejected as ambiguous output.
+    let diagnostic = ["\r\n\r\n", "\n\n", "\r\n", "\n", "\r"]
+        .into_iter()
+        .find_map(|ending| diagnostic.strip_suffix(ending))
+        .unwrap_or(diagnostic);
     if diagnostic.contains(['\n', '\r']) {
         return false;
     }
@@ -1737,6 +1779,76 @@ fn parse_xtables_save(input: &[u8]) -> Result<XtablesSnapshot> {
         owned_rules,
         counters,
     })
+}
+
+fn parse_xtables_world_save(input: &[u8]) -> Result<bool> {
+    let text = std::str::from_utf8(input).context("xtables-save output is not UTF-8")?;
+    let mut tables = HashSet::new();
+    let mut current_table = None;
+    let mut supported_table = String::new();
+    let mut has_openshield_artifacts = false;
+
+    for line in text.lines() {
+        if let Some(table) = line.strip_prefix('*') {
+            ensure!(
+                current_table.is_none(),
+                "nested table in combined xtables-save output"
+            );
+            ensure!(
+                !table.is_empty()
+                    && table.len() <= 32
+                    && table.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "invalid table name in combined xtables-save output"
+            );
+            ensure!(
+                tables.insert(table),
+                "duplicate table in combined xtables-save output"
+            );
+            current_table = Some(table);
+            if matches!(table, "filter" | "mangle") {
+                supported_table.push_str(line);
+                supported_table.push('\n');
+            }
+            continue;
+        }
+
+        if line == "COMMIT" {
+            let table = current_table
+                .take()
+                .ok_or_else(|| anyhow!("xtables COMMIT has no table"))?;
+            if matches!(table, "filter" | "mangle") {
+                supported_table.push_str("COMMIT\n");
+                has_openshield_artifacts |=
+                    parse_xtables_save(supported_table.as_bytes())?.has_openshield_artifacts();
+                supported_table.clear();
+            }
+            continue;
+        }
+
+        match current_table {
+            Some("filter" | "mangle") => {
+                supported_table.push_str(line);
+                supported_table.push('\n');
+            }
+            Some(_) => {}
+            None => ensure!(
+                line.is_empty() || line.starts_with('#'),
+                "unexpected data outside a table in combined xtables-save output"
+            ),
+        }
+    }
+
+    ensure!(
+        current_table.is_none(),
+        "unterminated table in combined xtables-save output"
+    );
+    ensure!(
+        supported_table.is_empty(),
+        "incomplete supported table in combined xtables-save output"
+    );
+    Ok(has_openshield_artifacts)
 }
 
 fn compiled_owned_rules(policy: &str) -> Result<Vec<String>> {
@@ -2642,11 +2754,12 @@ mod tests {
 
     use super::{
         FirewallCounters, InterfaceName, LearnedEndpoint, PortRange, TransportProtocol,
-        XtablesBundle, XtablesIdentity, XtablesTableInspection, XtablesTools, XtablesWorld,
+        XtablesBundle, XtablesIdentity, XtablesTools, XtablesWorld, XtablesWorldInspection,
         add_firewall_counters, attempt_both_families, ensure_xtables_identity_unchanged,
-        inspect_xtables_world, is_proven_absent_legacy_backend, parse_counters,
-        parse_learned_endpoints, parse_xtables_save, parse_xtables_world_version,
-        verify_base_chains, verify_table, xtables_world_is_covered,
+        inspect_xtables_world, is_expected_covered_legacy_warning, is_proven_absent_legacy_backend,
+        parse_counters, parse_learned_endpoints, parse_xtables_save, parse_xtables_world_save,
+        parse_xtables_world_version, selected_xtables_save_args, verify_base_chains, verify_table,
+        xtables_save_inspection_args, xtables_world_is_covered,
     };
     use anyhow::Result;
     use serde_json::{Value, json};
@@ -3208,6 +3321,30 @@ COMMIT
             diagnostic,
         ));
 
+        // Ubuntu 22.04's libxtables 1.8.7 appends an additional empty line to
+        // this fatal diagnostic when the legacy IPv6 module is unavailable.
+        let ubuntu_double_lf = b"ip6tables-save v1.8.7 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n\n";
+        assert!(is_proven_absent_legacy_backend(
+            legacy_save,
+            legacy_binary,
+            Some(1),
+            b"",
+            ubuntu_double_lf,
+        ));
+
+        for crlf_diagnostic in [
+            &b"ip6tables-save v1.8.7 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\r\n"[..],
+            &b"ip6tables-save v1.8.7 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\r\n\r\n"[..],
+        ] {
+            assert!(is_proven_absent_legacy_backend(
+                legacy_save,
+                legacy_binary,
+                Some(1),
+                b"",
+                crlf_diagnostic,
+            ));
+        }
+
         let unsupported_protocol =
             b"ip6tables-save v1.8.7 (legacy): Cannot initialize: Protocol not supported\n";
         assert!(is_proven_absent_legacy_backend(
@@ -3391,6 +3528,18 @@ COMMIT
             AmbiguousCase {
                 status: Some(1),
                 stdout: b"",
+                stderr: b"modprobe: FATAL: Module ip6_tables not found in directory /lib/modules/6.17.0-1022-azure\nip6tables-save v1.8.13 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
+                stderr: b"ip6tables-save v1.8.13 (legacy): Cannot initialize: iptables who? (do you need to insmod?)\n\n\n",
+                resolved: legacy_binary,
+            },
+            AmbiguousCase {
+                status: Some(1),
+                stdout: b"",
                 stderr: b"ip6tables-save v1.8.9 (nf_tables): Cannot initialize: iptables who? (do you need to insmod?)\n",
                 resolved: legacy_binary,
             },
@@ -3432,64 +3581,98 @@ COMMIT
     }
 
     #[test]
-    fn alternate_xtables_world_accepts_only_consistent_backend_absence() -> Result<()> {
-        assert!(!inspect_xtables_world(|_table| {
-            Ok(XtablesTableInspection::BackendAbsent)
+    fn alternate_xtables_save_inspection_enumerates_only_loaded_tables() {
+        assert_eq!(selected_xtables_save_args("filter"), ["-c", "-t", "filter"]);
+        assert_eq!(selected_xtables_save_args("mangle"), ["-c", "-t", "mangle"]);
+        assert_eq!(xtables_save_inspection_args(), ["-c"]);
+
+        let ipv4_save = std::path::Path::new("/usr/sbin/iptables-nft-save");
+        let ipv6_save = std::path::Path::new("/usr/sbin/ip6tables-nft-save");
+        let ipv4_warning =
+            b"# Warning: iptables-legacy tables present, use iptables-legacy-save to see them\n";
+        let ipv6_warning = b"# Warning: ip6tables-legacy tables present, use ip6tables-legacy-save to see them\r\n";
+        assert!(is_expected_covered_legacy_warning(
+            ipv4_save,
+            XtablesWorld::Nft,
+            true,
+            ipv4_warning,
+        ));
+        assert!(is_expected_covered_legacy_warning(
+            ipv6_save,
+            XtablesWorld::Nft,
+            true,
+            ipv6_warning,
+        ));
+        assert!(!is_expected_covered_legacy_warning(
+            ipv4_save,
+            XtablesWorld::Nft,
+            false,
+            ipv4_warning,
+        ));
+        assert!(!is_expected_covered_legacy_warning(
+            ipv4_save,
+            XtablesWorld::Legacy,
+            true,
+            ipv4_warning,
+        ));
+        assert!(!is_expected_covered_legacy_warning(
+            ipv4_save,
+            XtablesWorld::Nft,
+            true,
+            b"warning\n",
+        ));
+    }
+
+    #[test]
+    fn alternate_xtables_world_accepts_absent_and_clean_loaded_tables() -> Result<()> {
+        assert!(!inspect_xtables_world(|| {
+            Ok(XtablesWorldInspection::BackendAbsent)
         })?);
-
-        assert!(!inspect_xtables_world(|table| {
-            Ok(XtablesTableInspection::Captured(
-                format!("*{table}\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n").into_bytes(),
-            ))
+        assert!(!inspect_xtables_world(|| {
+            Ok(XtablesWorldInspection::Captured(Vec::new()))
         })?);
-
-        let mixed = inspect_xtables_world(|table| {
-            if table == "filter" {
-                Ok(XtablesTableInspection::BackendAbsent)
-            } else {
-                Ok(XtablesTableInspection::Captured(
-                    b"*mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n".to_vec(),
-                ))
-            }
-        });
-        assert!(mixed.is_err());
-
-        let ambiguous = inspect_xtables_world(|table| {
-            if table == "filter" {
-                Ok(XtablesTableInspection::Captured(
-                    b"*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n".to_vec(),
-                ))
-            } else {
-                Err(anyhow::anyhow!("injected permission failure"))
-            }
-        });
-        assert!(ambiguous.is_err());
+        for captured in [
+            &b"*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n"[..],
+            &b"*mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n"[..],
+            &b"# Generated by iptables-save\n*raw\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n\
+               *filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n\
+               *mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n# Completed\n"[..],
+        ] {
+            assert!(!inspect_xtables_world(|| {
+                Ok(XtablesWorldInspection::Captured(captured.to_vec()))
+            })?);
+        }
+        assert!(
+            inspect_xtables_world(|| { Err(anyhow::anyhow!("injected permission failure")) })
+                .is_err()
+        );
+        for captured in [
+            &b"unexpected\n"[..],
+            &b"COMMIT\n"[..],
+            &b"*filter\n:INPUT ACCEPT [0:0]\n"[..],
+            &b"*filter\n*mangle\nCOMMIT\n"[..],
+            &b"*filter\nCOMMIT\n*filter\nCOMMIT\n"[..],
+            &b"*FILTER\nCOMMIT\n"[..],
+            &b"*filter name\nCOMMIT\n"[..],
+        ] {
+            assert!(parse_xtables_world_save(captured).is_err());
+        }
         Ok(())
     }
 
     #[test]
-    fn alternate_xtables_world_detects_artifacts_despite_partial_absence() -> Result<()> {
-        let detected = inspect_xtables_world(|table| {
-            if table == "filter" {
-                Ok(XtablesTableInspection::Captured(
-                    b"*filter\n:INPUT ACCEPT [0:0]\n:OPENSHIELD_IN - [0:0]\nCOMMIT\n".to_vec(),
-                ))
-            } else {
-                Ok(XtablesTableInspection::BackendAbsent)
-            }
-        })?;
-        assert!(detected);
-
-        let detected = inspect_xtables_world(|table| {
-            if table == "filter" {
-                Ok(XtablesTableInspection::BackendAbsent)
-            } else {
-                Ok(XtablesTableInspection::Captured(
-                    b"*mangle\n:OUTPUT ACCEPT [0:0]\n:OPENSHIELD_MARK - [0:0]\nCOMMIT\n".to_vec(),
-                ))
-            }
-        })?;
-        assert!(detected);
+    fn alternate_xtables_world_detects_artifacts_in_each_owned_table() -> Result<()> {
+        for captured in [
+            &b"*filter\n:INPUT ACCEPT [0:0]\n:OPENSHIELD_IN - [0:0]\nCOMMIT\n"[..],
+            &b"*mangle\n:OUTPUT ACCEPT [0:0]\n:OPENSHIELD_MARK - [0:0]\nCOMMIT\n"[..],
+            &b"*raw\n:OPENSHIELD_IN - [0:0]\nCOMMIT\n\
+               *filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n\
+               *mangle\n:OUTPUT ACCEPT [0:0]\n:OPENSHIELD_MARK - [0:0]\nCOMMIT\n"[..],
+        ] {
+            assert!(inspect_xtables_world(|| {
+                Ok(XtablesWorldInspection::Captured(captured.to_vec()))
+            })?);
+        }
         Ok(())
     }
 

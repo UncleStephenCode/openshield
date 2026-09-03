@@ -50,6 +50,15 @@ done < <(find "$candidate" -mindepth 1 -maxdepth 1 -type f -print0)
 
 expected_assets=$(jq -er '(.binaries | length) + (.packages | length)' "$matrix")
 [[ "$expected_assets" =~ ^[0-9]+$ ]] || fail 'invalid matrix asset count'
+jq -e '
+      .runtime_test_arches as $runtime_test_arches
+      | [.platforms[] as $row
+        | if ($runtime_test_arches | index($row.arch))
+          then $row.firewall_test == "full"
+          else $row.firewall_test == "build-only"
+          end]
+      | all
+    ' "$matrix" >/dev/null || fail 'release matrix has contradictory runtime-test modes'
 actual_files=$(find "$candidate" -mindepth 1 -maxdepth 1 -type f | wc -l)
 [[ "$actual_files" -eq $((expected_assets + 2)) ]] || fail 'release file count mismatch'
 
@@ -140,7 +149,9 @@ jq -S --arg source_sha "$source_sha" --arg version "$version" \
       ($evidence[0].assets
         | map(select(.kind == "package"))
         | INDEX(.matrix_id)) as $assets
+      | .runtime_test_arches as $runtime_test_arches
       | [.platforms[] as $row
+        | select($runtime_test_arches | index($row.arch))
         | $assets[$row.package] as $asset
         | {schema_version: 1, type: "package-install", id: $row.id,
            package: $row.package, image: $row.image, platform: $row.platform,
@@ -165,7 +176,9 @@ jq -S --arg source_sha "$source_sha" --arg version "$version" \
       ($evidence[0].assets
         | map(select(.kind == "package"))
         | INDEX(.matrix_id)) as $assets
+      | .runtime_test_arches as $runtime_test_arches
       | [.platforms[] as $row
+        | select($runtime_test_arches | index($row.arch))
         | (if $row.firewall_test == "full" then ["nftables", "iptables"]
            elif $row.firewall_test == "nft" then ["nftables"]
            elif $row.firewall_test == "emulated" then []

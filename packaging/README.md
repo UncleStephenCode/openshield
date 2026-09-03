@@ -57,20 +57,21 @@ path already exist. Inbound traffic is default-drop even in `Learning`.
 ## Release-package matrix
 
 The authoritative release workflow builds 43 architecture/family binaries and
-43 matching packages, then installs them in 86 pinned
-distribution/OCI-platform rows. Family/architecture artifacts are reused only
-for compilation and packaging; installation evidence remains independent for
-each distribution version and platform. Every installed-package row is assigned
-both the nftables and iptables Learning-to-Enforcing scenarios, for 172
-firewall jobs that must succeed before publication. These are workflow gates,
-not a claim that a newly edited matrix has already passed.
+43 matching packages. Its runtime submatrix covers 19 package variants in 37
+pinned distribution/OCI-platform rows: 16 `amd64`, 15 `arm64`, and 6 `386`.
+Installation evidence remains independent for every selected distribution
+version and platform. Each installed-package row runs both the nftables and
+iptables Learning-to-Enforcing scenarios, for 74 firewall jobs that must
+succeed before publication. These are workflow gates, not a claim that a newly
+edited matrix has already passed.
 
-Native runners execute `amd64` and `arm64`, while `386` uses x86 compatibility
-and the remaining non-native architectures use selected digest-pinned
-Cross/QEMU environments. QEMU results demonstrate emulated execution only; they
-do not certify physical hardware or a distribution-owned kernel. See the
-[release CI guide](../.github/README-CI.md) for the exact matrix and evidence
-boundary.
+Native runners execute `amd64` and `arm64`; `386` uses the x86-64 kernel's
+direct 32-bit compatibility path. The other 24 ARMv5/6/7, PowerPC64LE, RISC-V
+64, and IBM Z package variants account for 49 of the 86 declared
+distribution/platform mappings and are build-only. Their digest-pinned
+Cross/QEMU lanes provide ELF validation and a target-image `--version` smoke,
+but no package-install, firewall, or native-hardware evidence. See the [release
+CI guide](../.github/README-CI.md) for the exact matrix and evidence boundary.
 
 ## Init-system notes
 
