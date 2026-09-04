@@ -272,6 +272,7 @@ jobs:
               PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
                 tests/perf/test_harness.py \
                 tests/perf/test_environment.py \
+                tests/perf/test_metrics.py \
                 tests/perf/workloads/test_workloads.py
               scripts/check-target-matrix.sh validate
               scripts/test-init-matrix.sh validate
@@ -744,7 +745,10 @@ jobs:
     # succeeded. It is a bounded release gate, not a replacement for E2E.
     needs: [version, build, e2e]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Keep ten minutes outside the 1200-second process-group deadline so the
+    # wrapper can terminate/clean its labelled Docker resources and Actions can
+    # upload bounded failure evidence before the job-level kill.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -789,7 +793,7 @@ jobs:
         shell: bash
         env:
           OPENSHIELD_DAEMON: ${{ runner.temp }}/openshield-performance-binary/openshield-daemon
-          PERF_TIMEOUT_SECONDS: 900
+          PERF_TIMEOUT_SECONDS: 1200
           PERFORMANCE_OUTPUT: ${{ runner.temp }}/openshield-performance-report
         run: bash tests/perf/ci-smoke.sh "$PERFORMANCE_OUTPUT"
 

@@ -179,13 +179,17 @@ mode in a private runner directory, verifies its version, and passes that
 absolute path to the performance harness. It does not rebuild the daemon or
 expand into a distribution/architecture performance matrix.
 
-`tests/perf/ci-smoke.sh` accepts only a local Unix-socket Docker context. The
-harness uses a disposable DUT, pressure peer, independent canary peer, and two
-internal networks; only the DUT receives the capabilities required for its
-private firewall namespace. The wrapper limits the harness to 900 seconds, the
-workflow limits the complete job to 20 minutes, and report/log sizes are
-bounded. Neither the wrapper nor the harness runs `sudo`, `nft`, or `iptables`
-against the runner host.
+`tests/perf/ci-smoke.sh` accepts only a local Unix-socket Docker context. For
+each backend the harness creates separate pristine-baseline and protected DUT
+generations with their own peers and internal networks; only the DUTs receive
+the capabilities required for their private firewall namespaces. The daemon is
+never started on the baseline DUT. Its captured environment must exactly equal
+the protected environment while the immutable container IDs must differ. The
+wrapper limits the enlarged paired harness to 1200 seconds, the workflow leaves
+a 30-minute outer bound for cleanup and evidence upload, and report/log sizes
+are bounded. Neither the
+wrapper nor the harness runs `sudo`, `nft`, or `iptables` against the runner
+host.
 
 The canary network has two distinct same-transport endpoints on the same veth:
 an application-bound target for wrong-executable probes and a network-only
@@ -208,9 +212,19 @@ of operations in each steady window instead of deriving percentiles from
 single-digit samples. Every repeated window must pass. A pass requires all of
 the following:
 
+The comparison order is fixed before measurement and alternates nearest
+pristine baselines as `A0, B0, B1, A1, B2, B3, A2, ...`. A protected block can
+use only its predetermined immediately adjacent baseline; observed values
+never select a more favourable reference. `baseline_pairing` evidence records
+the schedule, exact environment equality, distinct DUT identities, order,
+monotonic block boundaries, and comparison gap. The CI wrapper independently
+reconstructs and validates that plan.
+
 - the runner exits successfully before the hard timeout;
-- `report.json` uses schema `openshield.perf.report.v1`, sets both `valid` and
-  `passed` to `true`, contains results, and reports nftables as `passed`;
+- `report.json` uses schema `openshield.perf.report.v2`, sets both `valid` and
+  `passed` to `true`, contains valid
+  `openshield.perf.baseline-pairing.v1` evidence, and reports nftables as
+  `passed`;
 - iptables is also `passed`; an `unsupported` result is neutral only for a
   profile that explicitly sets `allow_unsupported_iptables` to `true`, which
   the release smoke profile does not do;

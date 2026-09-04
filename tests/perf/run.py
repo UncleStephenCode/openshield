@@ -103,10 +103,20 @@ validate_uname = _ENVIRONMENT_SOURCE["validate_uname"]
 
 
 CONFIG_SCHEMA = "openshield.perf.config.v1"
-REPORT_SCHEMA = "openshield.perf.report.v1"
+REPORT_SCHEMA = "openshield.perf.report.v2"
+OVERLOAD_SCHEMA = "openshield.perf.overload.v2"
+BASELINE_PAIRING_SCHEMA = "openshield.perf.baseline-pairing.v1"
 WORKLOAD_SCHEMA = "openshield.perf.workload.v1"
-METRICS_SCHEMA = "openshield.perf.metrics.v1"
-METRICS_CONTROL_SCHEMA = "openshield.perf.metrics.control.v1"
+METRICS_SCHEMA = "openshield.perf.metrics.v2"
+METRICS_CONTROL_SCHEMA = "openshield.perf.metrics.control.v2"
+WORKLOAD_CONTROL_PROTOCOL = "stdin_start_finish_release_v2"
+# The inner client/collector waits are deliberately longer than every bounded
+# controller pre-start operation. A delayed controller therefore fails and
+# cancels the exact inner process before the inner protocol can time out alone.
+INNER_CONTROL_WAIT_SECONDS = 120.0
+CONTROLLER_PRESTART_BOUND_SECONDS = 60.0
+CONTROLLER_FINISH_RELEASE_BOUND_SECONDS = 45.0
+PROCESS_TERMINATION_GRACE_SECONDS = 3.0
 MAX_CONFIG_BYTES = 512 * 1024
 MAX_PROFILES = 32
 MAX_LOAD_LEVELS = 32
@@ -1077,17 +1087,9 @@ def estimate_workload_seconds(config: dict[str, Any]) -> float:
         + float(phases["burst"]["duration_seconds"])
         + float(phases["cooldown_seconds"])
     )
-    scenarios = 0
-    for profile in config["profiles"]:
-        for policy in profile["policy_cases"]:
-            if policy == "baseline":
-                scenarios += 1
-            elif policy == "network_only":
-                scenarios += len(config["modes"])
-            else:
-                scenarios += 1  # Enforcing.
-                scenarios += len(config["learning_variants"])
-    total = phase_seconds * scenarios * len(config["backends"]) * len(config["load_levels"])
+    first_backend = config["backends"][0]
+    blocks_per_backend = sum(1 for _ in paired_load_plan(config, first_backend))
+    total = phase_seconds * blocks_per_backend * len(config["backends"])
     overload = config.get("overload", {})
     if overload.get("enabled"):
         overload_window = (
@@ -1164,6 +1166,111 @@ def scenario_plan(config: dict[str, Any], policy_filter: str) -> Iterable[dict[s
             yield {"profile": profile, "policy": policy_filter, "mode": "enforcing", "learning_variant": None}
             for variant in config["learning_variants"]:
                 yield {"profile": profile, "policy": policy_filter, "mode": "learning", "learning_variant": variant}
+
+
+def protected_scenarios_for_profile(
+    config: dict[str, Any], profile: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return the deterministic protected policy order for one profile."""
+
+    scenarios: list[dict[str, Any]] = []
+    if "network_only" in profile["policy_cases"]:
+        scenarios.extend(
+            {
+                "profile": profile,
+                "policy": "network_only",
+                "mode": mode,
+                "learning_variant": None,
+            }
+            for mode in config["modes"]
+        )
+    application_policy = f"application_{profile['transport']}"
+    if application_policy in profile["policy_cases"]:
+        scenarios.append(
+            {
+                "profile": profile,
+                "policy": application_policy,
+                "mode": "enforcing",
+                "learning_variant": None,
+            }
+        )
+        scenarios.extend(
+            {
+                "profile": profile,
+                "policy": application_policy,
+                "mode": "learning",
+                "learning_variant": variant,
+            }
+            for variant in config["learning_variants"]
+        )
+    return scenarios
+
+
+def paired_load_plan(
+    config: dict[str, Any], backend: str
+) -> Iterable[tuple[dict[str, Any], float]]:
+    """Yield the fixed nearest-baseline AB/BA schedule for one backend.
+
+    A pristine sample may bracket at most two protected blocks: the preceding
+    protected block uses it as BA and the following block uses it as AB.  Pair
+    identity and order are fixed before measurement, so observed values cannot
+    influence baseline selection.
+    """
+
+    sequence = 0
+    sample_index = 0
+
+    def sample_id() -> str:
+        nonlocal sample_index
+        value = f"b{sample_index:05d}"
+        sample_index += 1
+        return value
+
+    def baseline(
+        profile: dict[str, Any], sample: str
+    ) -> dict[str, Any]:
+        return {
+            "profile": profile,
+            "policy": "baseline",
+            "mode": None,
+            "learning_variant": None,
+            "backend": backend,
+            "baseline_sample_id": sample,
+            "comparison_order": None,
+            "topology_role": "baseline",
+        }
+
+    for profile in config["profiles"]:
+        protected = protected_scenarios_for_profile(config, profile)
+        for load_level_value in config["load_levels"]:
+            load_level = float(load_level_value)
+            current_sample = sample_id()
+            first = baseline(profile, current_sample)
+            first["execution_sequence"] = sequence
+            sequence += 1
+            yield first, load_level
+            for index, original in enumerate(protected):
+                scenario = dict(original)
+                scenario["backend"] = backend
+                scenario["topology_role"] = "protected"
+                if index % 2 == 0:
+                    scenario["baseline_sample_id"] = current_sample
+                    scenario["comparison_order"] = "ab"
+                    scenario["execution_sequence"] = sequence
+                    sequence += 1
+                    yield scenario, load_level
+                    continue
+                next_sample = sample_id()
+                scenario["baseline_sample_id"] = next_sample
+                scenario["comparison_order"] = "ba"
+                scenario["execution_sequence"] = sequence
+                sequence += 1
+                yield scenario, load_level
+                following = baseline(profile, next_sample)
+                following["execution_sequence"] = sequence
+                sequence += 1
+                yield following, load_level
+                current_sample = next_sample
 
 
 def safe_tail(value: str, maximum: int = 4_096) -> str:
@@ -1326,18 +1433,25 @@ def nfqueue_runtime_counter_evidence(
 
 
 def overload_evidence_timestamps_ordered(
+    metric_starts: tuple[dict[str, Any], ...],
     before_stop: dict[str, Any],
     stopped_at_ns: int,
     saturation: dict[str, Any] | None,
     probes: list[dict[str, Any]],
+    pressure_reaped_at_ns: int,
     before_continue: dict[str, Any],
     continued_at_ns: int,
+    metric_boundary_ns: int,
 ) -> bool:
-    """Verify that all fail-closed observations occurred in the stopped window."""
+    """Verify the stopped-pressure, resume, and metric-boundary ordering."""
 
     if saturation is None:
         return False
     values: list[Any] = [
+        *(
+            start.get("boundary_monotonic_ns")
+            for start in metric_starts
+        ),
         before_stop.get("observed_at_monotonic_ns"),
         stopped_at_ns,
         saturation.get("observed_at_monotonic_ns"),
@@ -1373,8 +1487,10 @@ def overload_evidence_timestamps_ordered(
         )
     values.extend(
         [
+            pressure_reaped_at_ns,
             before_continue.get("observed_at_monotonic_ns"),
             continued_at_ns,
+            metric_boundary_ns,
         ]
     )
     return all(
@@ -1425,6 +1541,122 @@ def overload_recovery_passed(
     )
 
 
+def controlled_udp_send_backpressure_evidence(
+    transport: str,
+    saturation_proven: bool,
+    stall_drop_delta: dict[str, int | None],
+    minimum_nfqueue_drops: int,
+    pressure_summary: dict[str, Any] | None,
+    dut_sndbuf_errors: float | None,
+) -> dict[str, Any]:
+    """Prove that a DUT UDP send error came from the controlled stall.
+
+    The kernel counter is container-wide, so a direct NFQUEUE drop alone is
+    insufficient.  The exception is authorized only when the pressure
+    workload reports the same number of explicitly classified send failures,
+    every failure is timeout/EAGAIN/ENOBUFS backpressure, and that count does
+    not exceed the directly observed kernel NFQUEUE drops.
+    """
+
+    kernel_drops = numeric(stall_drop_delta.get("kernel_dropped"))
+    metrics = nested(pressure_summary or {}, "metrics", default={})
+    counter_names = (
+        "data_send_failures",
+        "data_send_timeouts",
+        "data_send_enobufs",
+        "data_send_would_block",
+        "data_send_other_os_errors",
+        "barrier_send_failures",
+        "barrier_send_timeouts",
+        "barrier_send_enobufs",
+        "barrier_send_would_block",
+        "barrier_send_other_os_errors",
+    )
+    counters: dict[str, int | None] = {}
+    for name in counter_names:
+        value = metrics.get(name) if isinstance(metrics, dict) else None
+        counters[name] = (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+    counters_valid = all(value is not None for value in counters.values())
+    data_failures = counters["data_send_failures"]
+    barrier_failures = counters["barrier_send_failures"]
+    total_send_failures = (
+        None
+        if data_failures is None or barrier_failures is None
+        else data_failures + barrier_failures
+    )
+    data_classified = (
+        counters["data_send_timeouts"],
+        counters["data_send_enobufs"],
+        counters["data_send_would_block"],
+        counters["data_send_other_os_errors"],
+    )
+    barrier_classified = (
+        counters["barrier_send_timeouts"],
+        counters["barrier_send_enobufs"],
+        counters["barrier_send_would_block"],
+        counters["barrier_send_other_os_errors"],
+    )
+    classification_exact = (
+        counters_valid
+        and data_failures == sum(value for value in data_classified if value is not None)
+        and barrier_failures
+        == sum(value for value in barrier_classified if value is not None)
+    )
+    only_backpressure_classes = (
+        counters_valid
+        and counters["data_send_other_os_errors"] == 0
+        and counters["barrier_send_other_os_errors"] == 0
+    )
+    exact_kernel_workload_match = (
+        dut_sndbuf_errors is not None
+        and float(dut_sndbuf_errors).is_integer()
+        and total_send_failures is not None
+        and int(dut_sndbuf_errors) == total_send_failures
+    )
+    within_direct_drop_bound = (
+        kernel_drops is not None
+        and total_send_failures is not None
+        and total_send_failures <= kernel_drops
+    )
+    eligible = (
+        transport == "udp"
+        and saturation_proven
+        and dut_sndbuf_errors is not None
+        and dut_sndbuf_errors > 0
+        and kernel_drops is not None
+        and kernel_drops >= minimum_nfqueue_drops
+        and counters_valid
+        and classification_exact
+        and only_backpressure_classes
+        and exact_kernel_workload_match
+        and within_direct_drop_bound
+    )
+    return {
+        "applicable": transport == "udp",
+        "exception_eligible": eligible,
+        "exception_applied": bool(
+            eligible and dut_sndbuf_errors is not None and dut_sndbuf_errors > 0
+        ),
+        "dut_sndbuf_errors": dut_sndbuf_errors,
+        "stall_kernel_drop_delta": kernel_drops,
+        "workload_send_counters": counters,
+        "total_send_failures": total_send_failures,
+        "classification_exact": classification_exact,
+        "only_backpressure_classes": only_backpressure_classes,
+        "exact_kernel_workload_match": exact_kernel_workload_match,
+        "within_direct_drop_bound": within_direct_drop_bound,
+        "scope": (
+            "DUT UDP send-side timeout/EAGAIN/ENOBUFS failures during the "
+            "timestamp-ordered controlled SIGSTOP NFQUEUE pressure window; "
+            "the atomically adjacent resume window must remain clean"
+        ),
+    }
+
+
 def overload_metric_validity_reasons(
     metrics: dict[str, Any] | None,
     *,
@@ -1432,11 +1664,34 @@ def overload_metric_validity_reasons(
     transport: str,
     maximum_process_cpu_ratio: float | None = None,
     process_sections: tuple[str, ...] = (),
+    allow_controlled_udp_send_backpressure: bool = False,
+    expected_stop_reason: str = "requested",
+    require_clean_dut_recovery: bool = False,
+    expected_daemon_pid: int | None = None,
 ) -> list[str]:
-    """Reject overload evidence when a measured endpoint was itself saturated."""
+    """Reject overload evidence when a measured endpoint was itself saturated.
+
+    ``allow_controlled_udp_send_backpressure`` is deliberately narrower than a
+    generic socket-error exception.  The overload caller may enable it only
+    after the stopped NFQUEUE consumer has produced a timestamp-ordered,
+    direct kernel-drop delta and the stopped-window workload has terminated.
+    In that one experiment an exactly reconstructed local UDP send timeout,
+    ``EAGAIN``, or ``ENOBUFS`` is an expected consequence of the fail-closed
+    queue pressure being proved, rather than evidence that the remote peer
+    became the bottleneck. Receive errors and every recovery, peer, or canary
+    socket error remain invalidating.
+
+    A clean DUT recovery window additionally requires an alive authenticated
+    daemon, an empty queue, zero late NFQUEUE drops, and zero TCP retransmits.
+    These checks close the tail after the last status RPC; missing evidence is
+    never interpreted as zero.
+    """
 
     reasons: list[str] = []
-    if not isinstance(metrics, dict) or metrics.get("stop_reason") != "requested":
+    if (
+        not isinstance(metrics, dict)
+        or metrics.get("stop_reason") != expected_stop_reason
+    ):
         return [f"{label} metric collection was unavailable or unsynchronized"]
     network = metrics.get("network")
     if not isinstance(network, dict):
@@ -1466,26 +1721,66 @@ def overload_metric_validity_reasons(
         or conntrack_peak < conntrack_start
     ):
         reasons.append(f"{label} conntrack start/peak evidence is unavailable")
-    if transport == "tcp":
-        listen = metrics.get("tcp_listen")
-        for name in ("listen_drops", "listen_overflows"):
-            value = numeric(listen.get(name)) if isinstance(listen, dict) else None
-            if value is None or value < 0:
-                reasons.append(f"{label} TCP {name} is unavailable")
-            elif value > 0:
-                reasons.append(f"{label} TCP {name} was nonzero")
-    else:
-        udp_errors = metrics.get("udp_errors")
-        for name in ("in_errors", "rcvbuf_errors", "sndbuf_errors"):
-            value = (
-                numeric(udp_errors.get(name))
-                if isinstance(udp_errors, dict)
-                else None
+    listen = metrics.get("tcp_listen")
+    for name in ("listen_drops", "listen_overflows"):
+        value = numeric(listen.get(name)) if isinstance(listen, dict) else None
+        if value is None or value < 0:
+            reasons.append(f"{label} TCP {name} is unavailable")
+        elif value > 0:
+            reasons.append(f"{label} TCP {name} was nonzero")
+    udp_errors = metrics.get("udp_errors")
+    for name in ("in_errors", "rcvbuf_errors", "sndbuf_errors"):
+        value = (
+            numeric(udp_errors.get(name))
+            if isinstance(udp_errors, dict)
+            else None
+        )
+        if value is None or value < 0:
+            reasons.append(f"{label} UDP {name} is unavailable")
+        elif (
+            value > 0
+            and not (
+                transport == "udp"
+                and name == "sndbuf_errors"
+                and allow_controlled_udp_send_backpressure
             )
-            if value is None or value < 0:
-                reasons.append(f"{label} UDP {name} is unavailable")
-            elif value > 0:
-                reasons.append(f"{label} UDP {name} was nonzero")
+        ):
+            reasons.append(f"{label} UDP {name} was nonzero")
+    if require_clean_dut_recovery:
+        nfqueue = metrics.get("nfqueue")
+        if not isinstance(nfqueue, dict):
+            reasons.append(f"{label} NFQUEUE metrics are unavailable")
+        else:
+            for name in ("kernel_dropped", "user_dropped"):
+                value = numeric(nfqueue.get(name))
+                if value is None or value < 0:
+                    reasons.append(f"{label} NFQUEUE {name} is unavailable")
+                elif value > 0:
+                    reasons.append(f"{label} NFQUEUE {name} was nonzero")
+            depth_end = numeric(nfqueue.get("depth_end"))
+            if depth_end is None or depth_end < 0:
+                reasons.append(f"{label} NFQUEUE final depth is unavailable")
+            elif depth_end > 0:
+                reasons.append(f"{label} NFQUEUE final depth was nonzero")
+        retransmits = numeric(metrics.get("tcp_retransmits"))
+        if retransmits is None or retransmits < 0:
+            reasons.append(f"{label} TCP retransmits are unavailable")
+        elif retransmits > 0:
+            reasons.append(f"{label} TCP retransmits were nonzero")
+        daemon = metrics.get("daemon")
+        daemon_pid = daemon.get("pid") if isinstance(daemon, dict) else None
+        daemon_alive = (
+            daemon.get("alive_end") if isinstance(daemon, dict) else None
+        )
+        if (
+            isinstance(expected_daemon_pid, bool)
+            or not isinstance(expected_daemon_pid, int)
+            or expected_daemon_pid <= 0
+            or daemon_pid != expected_daemon_pid
+        ):
+            reasons.append(f"{label} daemon identity is unavailable or changed")
+        if daemon_alive is not True:
+            reasons.append(f"{label} daemon exited during measurement")
     if maximum_process_cpu_ratio is not None:
         for section_name in process_sections:
             section = metrics.get(section_name)
@@ -2488,7 +2783,10 @@ class DockerBackendRun:
         config: dict[str, Any],
         backend: str,
         token: str,
+        topology_role: str = "protected",
     ) -> None:
+        if topology_role not in {"baseline", "protected"}:
+            raise HarnessError("topology role must be baseline or protected")
         self.repository = repository
         self.daemon = daemon
         self.output = output
@@ -2497,12 +2795,16 @@ class DockerBackendRun:
         self.config = config
         self.backend = backend
         self.token = token
+        self.topology_role = topology_role
+        role_suffix = "base" if topology_role == "baseline" else "prot"
         self.label = f"{RUN_LABEL_KEY}={token}"
-        self.network_name = f"openshield-perf-{backend[:3]}-{token}"
-        self.client_name = f"openshield-perf-dut-{backend[:3]}-{token}"
-        self.peer_name = f"openshield-perf-peer-{backend[:3]}-{token}"
-        self.canary_name = f"openshield-perf-canary-{backend[:3]}-{token}"
-        self.canary_network_name = f"openshield-perf-canary-{backend[:3]}-{token}"
+        self.network_name = f"openshield-perf-{backend[:3]}-{role_suffix}-{token}"
+        self.client_name = f"openshield-perf-dut-{backend[:3]}-{role_suffix}-{token}"
+        self.peer_name = f"openshield-perf-peer-{backend[:3]}-{role_suffix}-{token}"
+        self.canary_name = f"openshield-perf-canary-{backend[:3]}-{role_suffix}-{token}"
+        self.canary_network_name = (
+            f"openshield-perf-canary-{backend[:3]}-{role_suffix}-{token}"
+        )
         self.network_id: str | None = None
         self.canary_network_id: str | None = None
         self.client_id: str | None = None
@@ -2521,7 +2823,7 @@ class DockerBackendRun:
         self.daemon_started = False
         self.daemon_log_seen = ""
         self.environment_evidence: dict[str, Any] | None = None
-        self.raw = output / "raw" / backend
+        self.raw = output / "raw" / backend / topology_role
         self.raw.mkdir(parents=True, mode=0o700, exist_ok=True)
 
     def docker(
@@ -3095,6 +3397,8 @@ class DockerBackendRun:
         return None
 
     def start_daemon(self) -> dict[str, Any]:
+        if self.topology_role != "protected":
+            raise HarnessError("the daemon must never start in a baseline topology")
         if self.daemon_started or not self.client_id:
             raise HarnessError("daemon lifecycle is invalid")
         exact = ["setpriv", *CAPABILITY_ARGUMENTS, CONTAINER_DAEMON]
@@ -3408,6 +3712,11 @@ class DockerBackendRun:
         }
 
     def prepare_policy(self, scenario: dict[str, Any]) -> dict[str, Any] | None:
+        expected_role = (
+            "baseline" if scenario.get("policy") == "baseline" else "protected"
+        )
+        if self.topology_role != expected_role:
+            raise HarnessError("scenario policy does not match its topology role")
         self.docker(["exec", self.client_id, "conntrack", "-F"], timeout=30)
         if scenario["policy"] == "baseline":
             return None
@@ -3791,46 +4100,308 @@ class DockerBackendRun:
         )
 
     @staticmethod
-    def await_metric_ready(process: subprocess.Popen[str], timeout: float = 10.0) -> None:
+    def read_canonical_protocol_document(
+        process: subprocess.Popen[str],
+        *,
+        timeout: float,
+        label: str,
+        buffer_attribute: str,
+    ) -> dict[str, Any]:
+        """Read one bounded canonical JSONL document without `readline()` hangs."""
+
         if process.stdout is None:
-            raise HarnessError("metric collector stdout is unavailable")
+            raise HarnessError(f"{label} stdout is unavailable")
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise HarnessError(f"{label} timeout is invalid")
+        buffered = getattr(process, buffer_attribute, None)
+        if buffered is None:
+            buffered = bytearray()
+            setattr(process, buffer_attribute, buffered)
+        if not isinstance(buffered, bytearray):
+            raise HarnessError(f"{label} protocol buffer is invalid")
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stdout.fileno(), selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
-        observed: list[str] = []
         try:
             while time.monotonic() < deadline:
-                events = selector.select(max(0.0, min(0.2, deadline - time.monotonic())))
+                if b"\n" in buffered:
+                    raw_line, _, remainder = buffered.partition(b"\n")
+                    buffered[:] = remainder
+                    if not raw_line or len(raw_line) > MAX_SUBPROCESS_OUTPUT:
+                        raise HarnessError(f"{label} line is outside its bound")
+                    try:
+                        document = json.loads(raw_line.decode("utf-8", errors="strict"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        raise HarnessError(f"{label} is not canonical JSON text") from error
+                    if not isinstance(document, dict):
+                        raise HarnessError(f"{label} is not a JSON object")
+                    canonical = json.dumps(
+                        document,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    if canonical != raw_line:
+                        raise HarnessError(f"{label} is not canonical JSON")
+                    return document
+                events = selector.select(
+                    max(0.0, min(0.2, deadline - time.monotonic()))
+                )
                 if not events:
                     if process.poll() is not None:
                         break
                     continue
-                line = process.stdout.readline()
-                if not line:
+                chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                if not chunk:
+                    if process.poll() is not None:
+                        break
                     continue
-                observed.append(line)
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if (
-                    isinstance(event, dict)
-                    and event.get("schema") == METRICS_CONTROL_SCHEMA
-                    and event.get("event") == "ready"
-                ):
-                    return
+                buffered.extend(chunk)
+                if len(buffered) > MAX_SUBPROCESS_OUTPUT:
+                    raise HarnessError(f"{label} output exceeds its bound")
         finally:
             selector.close()
-        raise HarnessError(
-            f"metric collector did not become ready: {safe_tail(''.join(observed))}"
+        raise HarnessError(f"{label} was not received before its bounded deadline")
+
+    @staticmethod
+    def pinned_process_identity(
+        event: dict[str, Any], *, expected_uid: int, label: str
+    ) -> dict[str, Any]:
+        pid = integer(event.get("pid"), f"{label} pid", 1, 1 << 31)
+        starttime = integer(
+            event.get("starttime"), f"{label} starttime", 1, U64_MAX
+        )
+        uid = integer(event.get("uid"), f"{label} uid", 0, (1 << 32) - 1)
+        executable = event.get("executable")
+        if uid != expected_uid:
+            raise HarnessError(f"{label} uid is not the expected isolated identity")
+        if (
+            not isinstance(executable, str)
+            or not executable.startswith("/")
+            or len(os.fsencode(executable)) > 4096
+            or "\0" in executable
+        ):
+            raise HarnessError(f"{label} executable identity is invalid")
+        return {
+            "pid": pid,
+            "starttime": starttime,
+            "executable": executable,
+            "uid": uid,
+        }
+
+    @classmethod
+    def await_metric_ready(
+        cls, process: subprocess.Popen[str], timeout: float = 10.0
+    ) -> dict[str, Any]:
+        event = cls.read_canonical_protocol_document(
+            process,
+            timeout=timeout,
+            label="metric collector readiness",
+            buffer_attribute="_openshield_metric_protocol_buffer",
+        )
+        expected = {
+            "schema",
+            "event",
+            "pid",
+            "starttime",
+            "executable",
+            "uid",
+        }
+        if (
+            set(event) != expected
+            or event.get("schema") != METRICS_CONTROL_SCHEMA
+            or event.get("event") != "ready"
+        ):
+            raise HarnessError("metric collector readiness is malformed")
+        return cls.pinned_process_identity(
+            event, expected_uid=0, label="metric collector"
         )
 
     @staticmethod
-    def start_metric(process: subprocess.Popen[str]) -> None:
+    def read_metric_protocol_documents(
+        process: subprocess.Popen[str],
+        count: int,
+        *,
+        timeout: float,
+        label: str,
+    ) -> list[dict[str, Any]]:
+        """Read an exact bounded number of line-delimited control documents."""
+
+        if process.stdout is None:
+            raise HarnessError("metric collector stdout is unavailable")
+        if count <= 0:
+            raise HarnessError("metric protocol document count is invalid")
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        documents: list[dict[str, Any]] = []
+        buffered = bytearray()
+        try:
+            while len(documents) < count and time.monotonic() < deadline:
+                events = selector.select(
+                    max(0.0, min(0.2, deadline - time.monotonic()))
+                )
+                if not events:
+                    if process.poll() is not None:
+                        break
+                    continue
+                chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                if not chunk:
+                    continue
+                buffered.extend(chunk)
+                if len(buffered) > count * MAX_SUBPROCESS_OUTPUT:
+                    raise HarnessError(
+                        f"metric collector {label} exceeds its aggregate bound"
+                    )
+                while b"\n" in buffered and len(documents) < count:
+                    raw_line, _, remainder = buffered.partition(b"\n")
+                    buffered[:] = remainder
+                    if not raw_line or len(raw_line) > MAX_SUBPROCESS_OUTPUT:
+                        raise HarnessError(
+                            f"metric collector {label} line is invalid"
+                        )
+                    try:
+                        line = raw_line.decode("utf-8", errors="strict")
+                        document = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        raise HarnessError(
+                            f"metric collector {label} is not canonical JSON text"
+                        ) from error
+                    if not isinstance(document, dict):
+                        raise HarnessError(
+                            f"metric collector {label} is not an object"
+                        )
+                    documents.append(document)
+        finally:
+            selector.close()
+        if len(documents) != count or buffered:
+            raise HarnessError(
+                f"metric collector did not produce exactly {count} {label} "
+                f"document{'s' if count != 1 else ''}"
+            )
+        return documents
+
+    @classmethod
+    def start_metric(
+        cls, process: subprocess.Popen[str], timeout: float = 10.0
+    ) -> dict[str, Any]:
+        """Start a metric window and authenticate its exact initial boundary."""
+
         if process.stdin is None:
             raise HarnessError("metric collector stdin is unavailable")
         process.stdin.write("start\n")
         process.stdin.flush()
+        acknowledgement = cls.read_metric_protocol_documents(
+            process, 1, timeout=timeout, label="start acknowledgement"
+        )[0]
+        if set(acknowledgement) != {
+            "schema",
+            "event",
+            "boundary_monotonic_ns",
+        } or acknowledgement.get("schema") != METRICS_CONTROL_SCHEMA or acknowledgement.get(
+            "event"
+        ) != "start":
+            raise HarnessError("metric collector start acknowledgement is malformed")
+        boundary = acknowledgement.get("boundary_monotonic_ns")
+        if (
+            isinstance(boundary, bool)
+            or not isinstance(boundary, int)
+            or boundary <= 0
+        ):
+            raise HarnessError("metric collector start boundary is invalid")
+        return acknowledgement
+
+    @staticmethod
+    def begin_metric(process: subprocess.Popen[str]) -> None:
+        if process.stdin is None:
+            raise HarnessError("metric collector stdin is unavailable")
+        process.stdin.write("start\n")
+        process.stdin.flush()
+
+    @classmethod
+    def authenticate_metric_start(
+        cls, process: subprocess.Popen[str], timeout: float
+    ) -> dict[str, Any]:
+        acknowledgement = cls.read_metric_protocol_documents(
+            process, 1, timeout=timeout, label="start acknowledgement"
+        )[0]
+        if set(acknowledgement) != {
+            "schema",
+            "event",
+            "boundary_monotonic_ns",
+        } or acknowledgement.get("schema") != METRICS_CONTROL_SCHEMA or acknowledgement.get(
+            "event"
+        ) != "start":
+            raise HarnessError("metric collector start acknowledgement is malformed")
+        boundary = acknowledgement.get("boundary_monotonic_ns")
+        if isinstance(boundary, bool) or not isinstance(boundary, int) or boundary <= 0:
+            raise HarnessError("metric collector start boundary is invalid")
+        return acknowledgement
+
+    @classmethod
+    def start_metrics_together(
+        cls,
+        processes: Iterable[tuple[str, subprocess.Popen[str]]],
+        *,
+        deadline: float,
+    ) -> dict[str, dict[str, Any]]:
+        items = list(processes)
+        for _label, process in items:
+            cls.begin_metric(process)
+        acknowledgements: dict[str, dict[str, Any]] = {}
+        for label, process in items:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessError("metric collectors exceeded the shared pre-start bound")
+            acknowledgements[label] = cls.authenticate_metric_start(
+                process, remaining
+            )
+        return acknowledgements
+
+    @classmethod
+    def split_metric(
+        cls, process: subprocess.Popen[str], timeout: float = 10.0
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Read an acknowledged, gap-free metric-window boundary."""
+
+        if process.stdin is None or process.stdout is None:
+            raise HarnessError("metric collector control streams are unavailable")
+        process.stdin.write("split\n")
+        process.stdin.flush()
+        documents = cls.read_metric_protocol_documents(
+            process, 2, timeout=timeout, label="split response"
+        )
+        acknowledgement, first_metrics = documents
+        if set(acknowledgement) != {
+            "schema",
+            "event",
+            "boundary_monotonic_ns",
+        } or acknowledgement.get("schema") != METRICS_CONTROL_SCHEMA or acknowledgement.get(
+            "event"
+        ) != "split":
+            raise HarnessError("metric collector split acknowledgement is malformed")
+        boundary = acknowledgement.get("boundary_monotonic_ns")
+        if (
+            isinstance(boundary, bool)
+            or not isinstance(boundary, int)
+            or boundary <= 0
+            or first_metrics.get("schema") != METRICS_SCHEMA
+            or first_metrics.get("stop_reason") != "split_boundary"
+            or first_metrics.get("finished_at_monotonic_ns") != boundary
+        ):
+            raise HarnessError("metric collector split boundary evidence is inconsistent")
+        started = first_metrics.get("started_at_monotonic_ns")
+        elapsed = numeric(first_metrics.get("elapsed_seconds"))
+        if (
+            isinstance(started, bool)
+            or not isinstance(started, int)
+            or started <= 0
+            or started > boundary
+            or elapsed is None
+            or elapsed <= 0
+        ):
+            raise HarnessError("first split metric window is invalid")
+        return acknowledgement, first_metrics
 
     @staticmethod
     def stop_metric(process: subprocess.Popen[str]) -> None:
@@ -3913,90 +4484,258 @@ class DockerBackendRun:
         config_path = self.copy_client_config(
             client_container, profile, scenario, phase, load_level, payload
         )
-        client_command = [
-            "docker",
-            *workload_exec_arguments(client_container),
-            *runtime_python_command(
-                f"workloads/{profile['transport']}.py",
-                "client",
-                "--config-file",
-                config_path,
-            ),
-        ]
+        protected_phase = scenario["policy"] != "baseline"
+        # Potentially slow daemon RPC/proc/log reads precede the inner client.
+        # This makes the ready->start controller budget a closed invariant.
+        log_before = self.read_daemon_log() if self.daemon_started else ""
+        identity_before = (
+            self.observe_daemon_process_identity() if protected_phase else None
+        )
+        status_before = self.observe_daemon_status() if protected_phase else None
+        client_command = self.workload_client_command(
+            client_container,
+            profile["transport"],
+            config_path,
+            start_gated=True,
+        )
         metric_duration = min(
             3_600.0,
             float(phase["duration"])
             + float(profile["client"]["io_timeout"])
-            + 10.0,
+            + CONTROLLER_FINISH_RELEASE_BOUND_SECONDS,
         )
-        dut_metric = self.metric_process(
-            self.client_id,
-            self.daemon_pid,
-            metric_duration,
-            workload_pid=(server_pid if profile["direction"] == "inbound" else 0),
-        )
-        peer_metric = self.metric_process(
-            self.peer_id,
-            0,
-            metric_duration,
-            workload_pid=(server_pid if profile["direction"] == "outbound" else 0),
-        )
-        protected_phase = scenario["policy"] != "baseline"
+        client_process: subprocess.Popen[str] | None = None
+        client_identity: dict[str, Any] | None = None
+        dut_metric: subprocess.Popen[str] | None = None
+        peer_metric: subprocess.Popen[str] | None = None
+        dut_metric_identity: dict[str, Any] | None = None
+        peer_metric_identity: dict[str, Any] | None = None
+        collectors_finished = False
+        client_released = False
+        primary_error: BaseException | None = None
         try:
-            self.await_metric_ready(dut_metric)
-            self.await_metric_ready(peer_metric)
-            # Status/log/proc control-plane reads are intentionally outside the
-            # measured window. The paired baseline has no corresponding daemon
-            # RPCs, so including them would contaminate protected CPU/latency.
-            log_before = self.read_daemon_log() if self.daemon_started else ""
-            identity_before = (
-                self.observe_daemon_process_identity() if protected_phase else None
+            client_process = subprocess.Popen(
+                client_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
             )
-            status_before = (
-                self.observe_daemon_status() if protected_phase else None
+            workload_start_gate = self.await_workload_ready(
+                client_process, profile["transport"], timeout=15.0
             )
-            self.start_metric(dut_metric)
-            self.start_metric(peer_metric)
-        except BaseException:
-            for metric_process in (dut_metric, peer_metric):
-                if metric_process.poll() is None:
-                    metric_process.kill()
-                try:
-                    metric_process.communicate(timeout=5)
-                except BaseException:
-                    pass
+            client_identity = self.pinned_process_identity(
+                workload_start_gate,
+                expected_uid=WORKLOAD_UID,
+                label="normal workload",
+            )
+            client_pid = client_identity["pid"]
+            prestart_deadline = time.monotonic() + CONTROLLER_PRESTART_BOUND_SECONDS
+            dut_metric = self.metric_process(
+                self.client_id,
+                self.daemon_pid,
+                metric_duration,
+                workload_pid=(
+                    server_pid
+                    if profile["direction"] == "inbound"
+                    else client_pid
+                ),
+            )
+            peer_metric = self.metric_process(
+                self.peer_id,
+                0,
+                metric_duration,
+                workload_pid=(
+                    server_pid
+                    if profile["direction"] == "outbound"
+                    else client_pid
+                ),
+            )
+            remaining = prestart_deadline - time.monotonic()
+            dut_metric_identity = self.await_metric_ready(
+                dut_metric, timeout=remaining
+            )
+            remaining = prestart_deadline - time.monotonic()
+            peer_metric_identity = self.await_metric_ready(
+                peer_metric, timeout=remaining
+            )
+            metric_starts = self.start_metrics_together(
+                (("dut", dut_metric), ("peer", peer_metric)),
+                deadline=prestart_deadline,
+            )
+            remaining = prestart_deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessError("normal workload exceeded the shared pre-start bound")
+            workload_started = self.start_workload(
+                client_process,
+                profile["transport"],
+                client_identity,
+                timeout=remaining,
+            )
+            workload_started_ns = integer(
+                workload_started.get("boundary_monotonic_ns"),
+                "normal workload start boundary",
+                1,
+                U64_MAX,
+            )
+            if any(
+                integer(
+                    evidence.get("boundary_monotonic_ns"),
+                    f"{label} metric start boundary",
+                    1,
+                    U64_MAX,
+                )
+                > workload_started_ns
+                for label, evidence in metric_starts.items()
+            ):
+                raise HarnessError("workload started before both metric boundaries")
+            timeout = (
+                float(phase["duration"])
+                + float(profile["client"]["io_timeout"])
+                + 10.0
+            )
+            workload, workload_finished = self.await_workload_finished(
+                client_process,
+                profile["transport"],
+                client_identity,
+                timeout=timeout,
+            )
+            finished_ns = integer(
+                workload_finished.get("boundary_monotonic_ns"),
+                "normal workload finish boundary",
+                1,
+                U64_MAX,
+            )
+            if finished_ns < workload_started_ns:
+                raise HarnessError("workload finish boundary precedes its start")
+            finish_release_deadline = (
+                time.monotonic() + CONTROLLER_FINISH_RELEASE_BOUND_SECONDS
+            )
+            collected = self.finish_metric_collectors(
+                (
+                    (
+                        "dut",
+                        dut_metric,
+                        self.client_id,
+                        dut_metric_identity,
+                    ),
+                    (
+                        "peer",
+                        peer_metric,
+                        self.peer_id,
+                        peer_metric_identity,
+                    ),
+                )
+            )
+            collectors_finished = True
+            dut_metrics = collected["dut"]
+            peer_metrics = collected["peer"]
+            client_side_metrics = (
+                dut_metrics
+                if profile["direction"] == "outbound"
+                else peer_metrics
+            )
+            workload_process_metrics = client_side_metrics.get("workload_process")
+            if (
+                not isinstance(workload_process_metrics, dict)
+                or workload_process_metrics.get("pid") != client_pid
+                or workload_process_metrics.get("alive_end") is not True
+                or numeric(workload_process_metrics.get("cpu_seconds")) is None
+                or numeric(workload_process_metrics.get("rss_bytes_peak")) is None
+            ):
+                raise HarnessError(
+                    "metric boundary did not capture the live workload process"
+                )
+            expected_exit_code = integer(
+                workload_finished.get("exit_code"),
+                "normal workload expected exit code",
+                0,
+                255,
+            )
+            release_timeout = min(
+                10.0, finish_release_deadline - time.monotonic()
+            )
+            if release_timeout <= 0:
+                raise HarnessError(
+                    "normal workload finish-to-release interval exceeded its bound"
+                )
+            workload_released = self.release_workload(
+                client_process,
+                profile["transport"],
+                client_identity,
+                expected_exit_code,
+                timeout=release_timeout,
+            )
+            client_released = True
+        except BaseException as error:
+            primary_error = error
             raise
-        client_process = subprocess.Popen(
-            client_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        timeout = phase["duration"] + float(profile["client"]["io_timeout"]) + 10
-        try:
-            client_output = client_process.communicate(timeout=timeout)[0]
-        except subprocess.TimeoutExpired as error:
-            client_process.kill()
-            client_output = client_process.communicate(timeout=5)[0]
-            self.stop_metric(dut_metric)
-            self.stop_metric(peer_metric)
-            dut_metric.communicate(timeout=10)
-            peer_metric.communicate(timeout=10)
-            raise HarnessError(f"workload client exceeded its phase deadline: {safe_tail(client_output)}") from error
-        self.stop_metric(dut_metric)
-        self.stop_metric(peer_metric)
-        try:
-            dut_output = dut_metric.communicate(timeout=10)[0]
-            peer_output = peer_metric.communicate(timeout=10)[0]
-        except subprocess.TimeoutExpired as error:
-            dut_metric.kill()
-            peer_metric.kill()
-            raise HarnessError("metric collector exceeded its phase deadline") from error
-        workload = parse_json_event(client_output, "summary", WORKLOAD_SCHEMA)
-        dut_metrics = parse_json_line_document(dut_output, METRICS_SCHEMA)
-        peer_metrics = parse_json_line_document(peer_output, METRICS_SCHEMA)
+        finally:
+            cleanup_errors: list[str] = []
+            if not collectors_finished:
+                for label, process, container, identity in (
+                    (
+                        "DUT metric collector",
+                        dut_metric,
+                        self.client_id,
+                        dut_metric_identity,
+                    ),
+                    (
+                        "peer metric collector",
+                        peer_metric,
+                        self.peer_id,
+                        peer_metric_identity,
+                    ),
+                ):
+                    if process is None:
+                        continue
+                    try:
+                        if identity is not None:
+                            self.cancel_pinned_attached_process(
+                                process, container, identity, label=label
+                            )
+                        else:
+                            if process.stdin is not None:
+                                process.stdin.close()
+                                process.stdin = None
+                            try:
+                                process.communicate(timeout=3)[0]
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.communicate(timeout=5)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(f"cleanup {label}: {cleanup_error}")
+            if client_process is not None and not client_released:
+                cleanup_identity = client_identity or getattr(
+                    client_process, "_openshield_pinned_identity", None
+                )
+                try:
+                    if cleanup_identity is not None:
+                        self.cancel_pinned_attached_process(
+                            client_process,
+                            client_container,
+                            cleanup_identity,
+                            label="normal workload",
+                        )
+                    else:
+                        if client_process.stdin is not None:
+                            client_process.stdin.close()
+                            client_process.stdin = None
+                        try:
+                            client_process.communicate(timeout=3)[0]
+                        except subprocess.TimeoutExpired:
+                            client_process.kill()
+                            client_process.communicate(timeout=5)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(f"cleanup normal workload: {cleanup_error}")
+            if cleanup_errors:
+                cleanup_failure = HarnessError("; ".join(cleanup_errors))
+                if primary_error is not None:
+                    raise cleanup_failure from primary_error
+                raise cleanup_failure
         if (
             dut_metrics.get("stop_reason") != "requested"
             or peer_metrics.get("stop_reason") != "requested"
@@ -4063,8 +4802,26 @@ class DockerBackendRun:
             "phase_role": phase["role"],
             "phase_scale": phase["scale"],
             "repetition": phase["repetition"],
+            "baseline_sample_id": scenario["baseline_sample_id"],
+            "comparison_order": scenario["comparison_order"],
+            "execution_sequence": scenario["execution_sequence"],
+            "topology_role": self.topology_role,
+            "block_started_monotonic_ns": scenario[
+                "block_started_monotonic_ns"
+            ],
+            "block_finished_monotonic_ns": None,
+            "comparison_gap_seconds": None,
             "seed": seed,
             "offered": payload,
+            "workload_start_gate": workload_start_gate,
+            "workload_started": workload_started,
+            "workload_finished": workload_finished,
+            "workload_released": workload_released,
+            "metric_starts": metric_starts,
+            "metric_collectors": {
+                "dut": dut_metric_identity,
+                "peer": peer_metric_identity,
+            },
             "workload": workload,
             "dut_metrics": dut_metrics,
             "peer_metrics": peer_metrics,
@@ -4086,51 +4843,77 @@ class DockerBackendRun:
         )
         return result
 
-    def run_scenario(self, scenario: dict[str, Any], results: list[dict[str, Any]]) -> None:
+    def run_load_block(
+        self,
+        scenario: dict[str, Any],
+        load_level: float,
+        results: list[dict[str, Any]],
+    ) -> None:
+        """Run one load point whose temporal pairing was fixed in advance."""
+
         profile = scenario["profile"]
         self.prepare_policy(scenario)
         phases = phase_plan(self.config)
         total_phase_time = sum(float(phase["duration"]) for phase in phases)
         maximum_duration = total_phase_time + 30
-        for load_level in self.config["load_levels"]:
-            self.docker(
-                ["exec", self.client_id, "conntrack", "-F"],
-                timeout=30,
-            )
-            seed = deterministic_seed(
-                self.config["seed"],
-                profile["name"],
-                f"{load_level:g}",
-            )
-            process, server_pid, prefix = self.start_server(profile, seed, maximum_duration)
-            server_container = self.client_id if profile["direction"] == "inbound" else self.peer_id
-            try:
-                for phase in phases:
-                    phase_seed = deterministic_seed(seed, phase["name"])
-                    result = self.run_phase(
-                        scenario, float(load_level), phase, server_pid, phase_seed
-                    )
-                    results.append(result)
-                    if (
-                        scenario["mode"] == "learning"
-                        and scenario.get("learning_variant") == "known_endpoint"
-                        and phase["role"] == "warmup"
+        start_index = len(results)
+        scenario["block_started_monotonic_ns"] = time.monotonic_ns()
+        seed = deterministic_seed(
+            self.config["seed"],
+            profile["name"],
+            f"{load_level:g}",
+        )
+        process, server_pid, prefix = self.start_server(profile, seed, maximum_duration)
+        server_container = (
+            self.client_id if profile["direction"] == "inbound" else self.peer_id
+        )
+        try:
+            for phase in phases:
+                phase_seed = deterministic_seed(seed, phase["name"])
+                result = self.run_phase(
+                    scenario, float(load_level), phase, server_pid, phase_seed
+                )
+                results.append(result)
+                if (
+                    scenario["mode"] == "learning"
+                    and scenario.get("learning_variant") == "known_endpoint"
+                    and phase["role"] == "warmup"
+                ):
+                    learned = self.control(["rules"])
+                    if not isinstance(learned, list) or not any(
+                        rule.get("spec", {}).get("origin") == "learned"
+                        for rule in learned
                     ):
-                        learned = self.control(["rules"])
-                        if not isinstance(learned, list) or not any(
-                            rule.get("spec", {}).get("origin") == "learned" for rule in learned
-                        ):
-                            result["valid"] = False
-                            result["passed"] = False
-                            result.setdefault("unreliable_reasons", []).append(
-                                "warmup did not persist an application-learning rule"
-                            )
-            finally:
-                server_summary = self.stop_server(process, server_pid, prefix, server_container)
-            apply_server_reliability(results, scenario, float(load_level), server_summary, self.config["criteria"])
-            cooldown = float(self.config["phases"]["cooldown_seconds"])
-            if cooldown:
-                time.sleep(cooldown)
+                        result["valid"] = False
+                        result["passed"] = False
+                        result.setdefault("unreliable_reasons", []).append(
+                            "warmup did not persist an application-learning rule"
+                        )
+        finally:
+            server_summary = self.stop_server(
+                process, server_pid, prefix, server_container
+            )
+        apply_server_reliability(
+            results,
+            scenario,
+            float(load_level),
+            server_summary,
+            self.config["criteria"],
+        )
+        finished = time.monotonic_ns()
+        for result in results[start_index:]:
+            result["block_finished_monotonic_ns"] = finished
+        cooldown = float(self.config["phases"]["cooldown_seconds"])
+        if cooldown:
+            time.sleep(cooldown)
+
+    def run_scenario(
+        self, scenario: dict[str, Any], results: list[dict[str, Any]]
+    ) -> None:
+        """Run every configured load point using the same bounded block path."""
+
+        for load_level in self.config["load_levels"]:
+            self.run_load_block(scenario, float(load_level), results)
 
     def daemon_process_identity(self) -> dict[str, Any]:
         """Read and authenticate the daemon PID identity from procfs."""
@@ -4290,64 +5073,463 @@ finally:
     def await_workload_ready(
         process: subprocess.Popen[str], transport: str, timeout: float = 10.0
     ) -> dict[str, Any]:
-        """Read one exact client ready event and return its pinned inner PID."""
+        """Read one exact ready event and pin the inner process identity."""
 
-        if process.stdout is None:
-            raise HarnessError("start-gated workload stdout is unavailable")
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
-        observed: list[str] = []
-        try:
-            while time.monotonic() < deadline:
-                events = selector.select(
-                    max(0.0, min(0.2, deadline - time.monotonic()))
-                )
-                if not events:
-                    if process.poll() is not None:
-                        break
-                    continue
-                line = process.stdout.readline()
-                if not line:
-                    continue
-                observed.append(line)
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if (
-                    isinstance(event, dict)
-                    and event.get("schema") == WORKLOAD_SCHEMA
-                    and event.get("event") == "ready"
-                    and event.get("role") == "client"
-                    and event.get("transport") == transport
-                    and event.get("start_gate") == "stdin_line_v1"
-                ):
-                    return {
-                        "schema": WORKLOAD_SCHEMA,
-                        "event": "ready",
-                        "role": "client",
-                        "transport": transport,
-                        "start_gate": "stdin_line_v1",
-                        "pid": integer(
-                            event.get("pid"), "start-gated workload pid", 1, 1 << 31
-                        ),
-                    }
-        finally:
-            selector.close()
-        raise HarnessError(
-            "start-gated workload did not become ready: "
-            + safe_tail("".join(observed))
+        spawned = DockerBackendRun.read_canonical_protocol_document(
+            process,
+            timeout=timeout,
+            label="start-gated workload spawn identity",
+            buffer_attribute="_openshield_workload_protocol_buffer",
         )
+        spawned_expected = {
+            "schema",
+            "event",
+            "role",
+            "transport",
+            "control_protocol",
+            "pid",
+            "starttime",
+            "executable",
+            "uid",
+            "boundary_monotonic_ns",
+        }
+        if (
+            set(spawned) != spawned_expected
+            or spawned.get("schema") != WORKLOAD_SCHEMA
+            or spawned.get("event") != "spawned"
+            or spawned.get("role") != "client"
+            or spawned.get("transport") != transport
+            or spawned.get("control_protocol") != WORKLOAD_CONTROL_PROTOCOL
+        ):
+            raise HarnessError("start-gated workload spawn identity is malformed")
+        identity = DockerBackendRun.pinned_process_identity(
+            spawned, expected_uid=WORKLOAD_UID, label="start-gated workload"
+        )
+        setattr(process, "_openshield_pinned_identity", identity)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarnessError("start-gated workload preparation exceeded its bound")
+        event = DockerBackendRun.read_canonical_protocol_document(
+            process,
+            timeout=remaining,
+            label="start-gated workload readiness",
+            buffer_attribute="_openshield_workload_protocol_buffer",
+        )
+        ready_expected = spawned_expected - {"boundary_monotonic_ns"}
+        if (
+            set(event) != ready_expected
+            or event.get("schema") != WORKLOAD_SCHEMA
+            or event.get("event") != "ready"
+            or event.get("role") != "client"
+            or event.get("transport") != transport
+            or event.get("control_protocol") != WORKLOAD_CONTROL_PROTOCOL
+            or DockerBackendRun.pinned_process_identity(
+                event, expected_uid=WORKLOAD_UID, label="ready workload"
+            )
+            != identity
+        ):
+            raise HarnessError("start-gated workload readiness is malformed")
+        return {**event, "spawned": spawned}
 
-    @staticmethod
-    def start_workload(process: subprocess.Popen[str]) -> None:
+    @classmethod
+    def start_workload(
+        cls,
+        process: subprocess.Popen[str],
+        transport: str,
+        identity: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
         if process.stdin is None:
             raise HarnessError("start-gated workload stdin is unavailable")
         process.stdin.write("start\n")
         process.stdin.flush()
+        event = cls.read_canonical_protocol_document(
+            process,
+            timeout=timeout,
+            label="workload start acknowledgement",
+            buffer_attribute="_openshield_workload_protocol_buffer",
+        )
+        expected = {
+            "schema",
+            "event",
+            "role",
+            "transport",
+            "control_protocol",
+            "pid",
+            "starttime",
+            "executable",
+            "uid",
+            "boundary_monotonic_ns",
+        }
+        if (
+            set(event) != expected
+            or event.get("schema") != WORKLOAD_SCHEMA
+            or event.get("event") != "started"
+            or event.get("role") != "client"
+            or event.get("transport") != transport
+            or event.get("control_protocol") != WORKLOAD_CONTROL_PROTOCOL
+            or cls.pinned_process_identity(
+                event, expected_uid=WORKLOAD_UID, label="started workload"
+            )
+            != identity
+        ):
+            raise HarnessError("workload start acknowledgement is malformed")
+        integer(
+            event.get("boundary_monotonic_ns"),
+            "workload start boundary",
+            1,
+            U64_MAX,
+        )
+        return event
+
+    @classmethod
+    def await_workload_finished(
+        cls,
+        process: subprocess.Popen[str],
+        transport: str,
+        identity: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        summary = cls.read_canonical_protocol_document(
+            process,
+            timeout=timeout,
+            label="workload summary",
+            buffer_attribute="_openshield_workload_protocol_buffer",
+        )
+        if (
+            summary.get("schema") != WORKLOAD_SCHEMA
+            or summary.get("event") != "summary"
+            or summary.get("role") != "client"
+            or summary.get("transport") != transport
+        ):
+            raise HarnessError("workload did not publish its expected summary")
+        finished = cls.read_canonical_protocol_document(
+            process,
+            timeout=min(10.0, timeout),
+            label="workload finished acknowledgement",
+            buffer_attribute="_openshield_workload_protocol_buffer",
+        )
+        expected = {
+            "schema",
+            "event",
+            "role",
+            "transport",
+            "control_protocol",
+            "pid",
+            "starttime",
+            "executable",
+            "uid",
+            "boundary_monotonic_ns",
+            "summary_sha256",
+            "exit_code",
+            "hold",
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                summary,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            set(finished) != expected
+            or finished.get("schema") != WORKLOAD_SCHEMA
+            or finished.get("event") != "finished"
+            or finished.get("role") != "client"
+            or finished.get("transport") != transport
+            or finished.get("control_protocol") != WORKLOAD_CONTROL_PROTOCOL
+            or finished.get("hold") != "awaiting_release"
+            or finished.get("summary_sha256") != digest
+            or cls.pinned_process_identity(
+                finished, expected_uid=WORKLOAD_UID, label="finished workload"
+            )
+            != identity
+        ):
+            raise HarnessError("workload finished acknowledgement is malformed")
+        integer(
+            finished.get("boundary_monotonic_ns"),
+            "workload finish boundary",
+            1,
+            U64_MAX,
+        )
+        integer(finished.get("exit_code"), "workload exit code", 0, 255)
+        if process.poll() is not None:
+            raise HarnessError("workload exited instead of holding for metric release")
+        return summary, finished
+
+    @classmethod
+    def release_workload(
+        cls,
+        process: subprocess.Popen[str],
+        transport: str,
+        identity: dict[str, Any],
+        expected_exit_code: int,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        if process.stdin is None:
+            raise HarnessError("workload stdin closed before release")
+        process.stdin.write("release\n")
+        process.stdin.flush()
+        released = cls.read_canonical_protocol_document(
+            process,
+            timeout=timeout,
+            label="workload release acknowledgement",
+            buffer_attribute="_openshield_workload_protocol_buffer",
+        )
+        expected = {
+            "schema",
+            "event",
+            "role",
+            "transport",
+            "control_protocol",
+            "pid",
+            "starttime",
+            "executable",
+            "uid",
+            "boundary_monotonic_ns",
+        }
+        if (
+            set(released) != expected
+            or released.get("schema") != WORKLOAD_SCHEMA
+            or released.get("event") != "released"
+            or released.get("role") != "client"
+            or released.get("transport") != transport
+            or released.get("control_protocol") != WORKLOAD_CONTROL_PROTOCOL
+            or cls.pinned_process_identity(
+                released, expected_uid=WORKLOAD_UID, label="released workload"
+            )
+            != identity
+        ):
+            raise HarnessError("workload release acknowledgement is malformed")
+        integer(
+            released.get("boundary_monotonic_ns"),
+            "workload release boundary",
+            1,
+            U64_MAX,
+        )
         process.stdin.close()
         process.stdin = None
+        buffered = getattr(process, "_openshield_workload_protocol_buffer", bytearray())
+        suffix = process.communicate(timeout=timeout)[0]
+        if buffered or suffix:
+            raise HarnessError("workload emitted unexpected output after release")
+        if process.returncode != expected_exit_code:
+            raise HarnessError(
+                f"workload exited with status {process.returncode}, expected {expected_exit_code}"
+            )
+        return released
+
+    def signal_pinned_inner_process(
+        self,
+        container: str,
+        identity: dict[str, Any],
+        signum: int,
+        *,
+        label: str,
+    ) -> dict[str, Any]:
+        """Signal one exact container process through a verified pidfd."""
+
+        script = r"""
+import json, os, signal, sys
+pid, starttime, executable, uid, signum = (
+    int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+)
+def observe():
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="ascii") as source:
+            value = source.read(4096)
+        closing = value.rfind(")")
+        fields = value[closing + 2:].split() if closing >= 0 else []
+        if len(fields) <= 19:
+            raise RuntimeError("short stat")
+        return (int(fields[19], 10), os.readlink(f"/proc/{pid}/exe"), os.stat(f"/proc/{pid}").st_uid)
+    except FileNotFoundError:
+        return None
+expected = (starttime, executable, uid)
+before = observe()
+if before is None:
+    print(json.dumps({"state":"gone"}, sort_keys=True, separators=(",",":")))
+    raise SystemExit(0)
+if before != expected:
+    print(json.dumps({"state":"identity_mismatch"}, sort_keys=True, separators=(",",":")))
+    raise SystemExit(42)
+try:
+    descriptor = os.pidfd_open(pid, 0)
+except ProcessLookupError:
+    print(json.dumps({"state":"gone"}, sort_keys=True, separators=(",",":")))
+    raise SystemExit(0)
+try:
+    after = observe()
+    if after is None:
+        print(json.dumps({"state":"gone"}, sort_keys=True, separators=(",",":")))
+        raise SystemExit(0)
+    if after != expected:
+        print(json.dumps({"state":"identity_mismatch"}, sort_keys=True, separators=(",",":")))
+        raise SystemExit(42)
+    try:
+        signal.pidfd_send_signal(descriptor, signum)
+    except ProcessLookupError:
+        print(json.dumps({"state":"gone"}, sort_keys=True, separators=(",",":")))
+        raise SystemExit(0)
+finally:
+    os.close(descriptor)
+print(json.dumps({"state":"signaled","signal":signum}, sort_keys=True, separators=(",",":")))
+"""
+        result = self.docker(
+            [
+                "exec",
+                container,
+                *isolated_python_inline(
+                    script,
+                    str(identity["pid"]),
+                    str(identity["starttime"]),
+                    str(identity["executable"]),
+                    str(identity["uid"]),
+                    str(signum),
+                ),
+            ],
+            check=False,
+            timeout=10,
+        )
+        try:
+            output = result.stdout.decode("utf-8", errors="strict")
+            document = json.loads(output)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HarnessError(f"cannot control {label}: invalid helper response") from error
+        if not isinstance(document, dict):
+            raise HarnessError(f"cannot control {label}: invalid helper response")
+        if result.returncode == 42 or document.get("state") == "identity_mismatch":
+            raise HarnessError(
+                f"refusing to signal {label}: pinned process identity changed"
+            )
+        state = document.get("state")
+        response_valid = (
+            state == "gone" and set(document) == {"state"}
+        ) or (
+            state == "signaled"
+            and set(document) == {"state", "signal"}
+            and document.get("signal") == signum
+        )
+        if result.returncode != 0 or not response_valid:
+            diagnostic = safe_tail(
+                output + result.stderr.decode("utf-8", errors="replace")
+            )
+            raise HarnessError(f"cannot signal {label}: {diagnostic}")
+        return document
+
+    def cancel_pinned_attached_process(
+        self,
+        process: subprocess.Popen[str],
+        container: str,
+        identity: dict[str, Any],
+        *,
+        label: str,
+    ) -> str:
+        """Boundedly terminate both the exact inner process and attached CLI."""
+
+        errors: list[str] = []
+        output = ""
+
+        def communicate_once(stage: str, timeout: float) -> bool:
+            """Attempt one bounded reap without preventing later escalation."""
+
+            nonlocal output
+            try:
+                observed = process.communicate(timeout=timeout)[0]
+                if isinstance(observed, str):
+                    output = observed
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+            except BaseException as error:
+                errors.append(f"{stage}: {error}")
+                return False
+
+        if process.poll() is None:
+            try:
+                self.signal_pinned_inner_process(
+                    container, identity, int(signal.SIGTERM), label=label
+                )
+            except BaseException as error:
+                errors.append(f"signal SIGTERM: {error}")
+        reaped = communicate_once(
+            "reap after SIGTERM", PROCESS_TERMINATION_GRACE_SECONDS
+        )
+        if not reaped:
+            try:
+                self.signal_pinned_inner_process(
+                    container, identity, int(signal.SIGKILL), label=label
+                )
+            except BaseException as error:
+                errors.append(f"signal SIGKILL: {error}")
+            reaped = communicate_once(
+                "reap after SIGKILL", PROCESS_TERMINATION_GRACE_SECONDS
+            )
+        if not reaped:
+            # This kills only the local attached Docker CLI. The exact inner
+            # process was addressed above; never use a broad pkill.
+            try:
+                process.kill()
+            except BaseException as error:
+                errors.append(f"kill local attached process: {error}")
+            reaped = communicate_once("reap local attached process", 5.0)
+        if not reaped or process.poll() is None:
+            errors.append(f"local attached process for {label} is still alive")
+        if errors:
+            raise HarnessError("; ".join(errors))
+        return output
+
+    def finish_metric_collectors(
+        self,
+        collectors: Iterable[
+            tuple[str, subprocess.Popen[str], str, dict[str, Any]]
+        ],
+    ) -> dict[str, dict[str, Any]]:
+        """Stop and reap every collector independently before reporting errors."""
+
+        items = list(collectors)
+        stop_errors: dict[str, BaseException] = {}
+        for label, process, _container, _identity in items:
+            try:
+                self.stop_metric(process)
+            except BaseException as error:
+                stop_errors[label] = error
+        documents: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        for label, process, container, identity in items:
+            output = ""
+            if label in stop_errors:
+                errors.append(f"stop {label}: {stop_errors[label]}")
+                try:
+                    output = self.cancel_pinned_attached_process(
+                        process, container, identity, label=label
+                    )
+                except BaseException as error:
+                    errors.append(f"cancel {label}: {error}")
+                continue
+            try:
+                output = process.communicate(timeout=10)[0]
+            except BaseException as error:
+                errors.append(f"reap {label}: {error}")
+                try:
+                    output = self.cancel_pinned_attached_process(
+                        process, container, identity, label=label
+                    )
+                except BaseException as cleanup_error:
+                    errors.append(f"cancel {label}: {cleanup_error}")
+                continue
+            try:
+                documents[label] = parse_json_line_document(output, METRICS_SCHEMA)
+            except BaseException as error:
+                errors.append(f"validate {label}: {error}")
+        if errors:
+            raise HarnessError("; ".join(errors))
+        return documents
 
     def overload_payload(
         self,
@@ -4911,23 +6093,37 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             str, tuple[subprocess.Popen[str], int, str, str]
         ] = {}
         pressure_process: subprocess.Popen[str] | None = None
+        pressure_identity: dict[str, Any] | None = None
         dut_metric: subprocess.Popen[str] | None = None
         peer_metric: subprocess.Popen[str] | None = None
         canary_metric: subprocess.Popen[str] | None = None
+        dut_metric_identity: dict[str, Any] | None = None
+        peer_metric_identity: dict[str, Any] | None = None
+        canary_metric_identity: dict[str, Any] | None = None
         daemon_may_be_stopped = False
         primary_error: BaseException | None = None
 
-        def finish_metric(process: subprocess.Popen[str]) -> dict[str, Any]:
+        def finish_metric(
+            process: subprocess.Popen[str],
+            container: str,
+            identity: dict[str, Any],
+        ) -> dict[str, Any]:
             if process.poll() is None and process.stdin is not None:
                 self.stop_metric(process)
             try:
                 output = process.communicate(timeout=10)[0]
             except subprocess.TimeoutExpired as error:
-                process.kill()
                 try:
-                    process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+                    self.cancel_pinned_attached_process(
+                        process,
+                        container,
+                        identity,
+                        label="overload metric collector",
+                    )
+                except BaseException as cleanup_error:
+                    raise HarnessError(
+                        "overload metric collector timed out and exact cleanup failed"
+                    ) from cleanup_error
                 raise HarnessError(
                     "overload metric collector exceeded its bounded deadline"
                 ) from error
@@ -5049,6 +6245,11 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             pressure_readiness = self.await_workload_ready(
                 pressure_process, transport
             )
+            pressure_identity = self.pinned_process_identity(
+                pressure_readiness,
+                expected_uid=WORKLOAD_UID,
+                label="overload pressure workload",
+            )
             metric_duration = min(
                 3_600.0,
                 server_lifetime - 5.0,
@@ -5069,19 +6270,39 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                 interface_override=self.canary_peer_interface,
                 workload_pid=liveness_servers[transport][1],
             )
-            self.await_metric_ready(dut_metric)
-            self.await_metric_ready(peer_metric)
-            self.await_metric_ready(canary_metric)
-            self.start_metric(dut_metric)
-            self.start_metric(peer_metric)
-            self.start_metric(canary_metric)
+            metric_deadline = time.monotonic() + CONTROLLER_PRESTART_BOUND_SECONDS
+            dut_metric_identity = self.await_metric_ready(
+                dut_metric, timeout=metric_deadline - time.monotonic()
+            )
+            peer_metric_identity = self.await_metric_ready(
+                peer_metric, timeout=metric_deadline - time.monotonic()
+            )
+            canary_metric_identity = self.await_metric_ready(
+                canary_metric, timeout=metric_deadline - time.monotonic()
+            )
+            metric_starts = self.start_metrics_together(
+                (
+                    ("dut", dut_metric),
+                    ("peer", peer_metric),
+                    ("canary", canary_metric),
+                ),
+                deadline=metric_deadline,
+            )
+            dut_metric_start = metric_starts["dut"]
+            peer_metric_start = metric_starts["peer"]
+            canary_metric_start = metric_starts["canary"]
 
             log_before = self.read_daemon_log()
             queue_before_stop = self.nfqueue_snapshot()
             daemon_may_be_stopped = True
             stopped_identity = self.signal_daemon(int(signal.SIGSTOP))
             stopped_at_ns = time.monotonic_ns()
-            self.start_workload(pressure_process)
+            pressure_started = self.start_workload(
+                pressure_process,
+                transport,
+                pressure_identity,
+                timeout=10.0,
+            )
 
             saturation_snapshot: dict[str, Any] | None = None
             saturation_delta: dict[str, int | None] = {
@@ -5160,7 +6381,41 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     )
                     observations.append(observation)
 
+            if pressure_process is None:
+                raise HarnessError("overload pressure process was not started")
+            active_pressure = pressure_process
+            pressure_summary, pressure_finished = self.await_workload_finished(
+                active_pressure,
+                transport,
+                pressure_identity,
+                timeout=(
+                    float(overload["client_duration_seconds"])
+                    + float(profile["client"]["io_timeout"])
+                    + 10.0
+                ),
+            )
+            pressure_exit_code = integer(
+                pressure_finished.get("exit_code"),
+                "overload pressure exit code",
+                0,
+                255,
+            )
+            pressure_released = self.release_workload(
+                active_pressure,
+                transport,
+                pressure_identity,
+                pressure_exit_code,
+            )
+            pressure_process = None
+            # This upper-bound timestamp is captured only after the pressure
+            # process has exited. Consequently every classified send failure
+            # in its summary belongs to the stopped-consumer metric window.
+            pressure_reaped_at_ns = time.monotonic_ns()
+
             queue_before_continue = self.nfqueue_snapshot()
+            stall_drop_delta = nfqueue_drop_delta(
+                queue_before_stop, queue_before_continue
+            )
             identity_before_continue = self.daemon_process_identity()
             if identity_before_continue["state"] not in {"T", "t"}:
                 raise HarnessError("daemon was not stopped immediately before SIGCONT")
@@ -5168,38 +6423,12 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             daemon_may_be_stopped = False
             continued_at_ns = time.monotonic_ns()
 
-            if pressure_process is None:
-                raise HarnessError("overload pressure process was not started")
-            active_pressure = pressure_process
-            pressure_process = None
-            try:
-                pressure_output = active_pressure.communicate(
-                    timeout=(
-                        float(overload["client_duration_seconds"])
-                        + float(profile["client"]["io_timeout"])
-                        + 10.0
-                    )
-                )[0]
-            except subprocess.TimeoutExpired as error:
-                active_pressure.kill()
-                try:
-                    active_pressure.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                raise HarnessError(
-                    "overload workload exceeded its bounded deadline"
-                ) from error
-            pressure_exit_code = active_pressure.returncode
-            pressure_summary = parse_json_event(
-                pressure_output, "summary", WORKLOAD_SCHEMA
-            )
-
-            active_metric = dut_metric
-            dut_metric = None
-            dut_metrics = finish_metric(active_metric)
-            active_metric = peer_metric
-            peer_metric = None
-            peer_metrics = finish_metric(active_metric)
+            # Resume first, then split one continuous collector. Its exact
+            # boundary snapshot closes the stopped-pressure/resume-transition
+            # interval and opens a clean recovery interval. No counter can
+            # disappear in a process-launch hand-off, and the second window
+            # never starts while the NFQUEUE consumer is deliberately stopped.
+            metric_boundary, dut_metrics = self.split_metric(dut_metric)
 
             recovery_queue_drain = self.await_nfqueue_drain(
                 min(
@@ -5277,27 +6506,62 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     else None
                 )
             )
+            active_metric = dut_metric
+            dut_metric = None
+            post_resume_dut_metrics = finish_metric(
+                active_metric, self.client_id, dut_metric_identity
+            )
+            # Keep observing the dedicated pressure peer through the complete
+            # drain and recovery interval. A packet can reach its socket after
+            # NFQUEUE depth first becomes zero; stopping at that instant would
+            # leave a receive/listen-overflow race outside the validity proof.
+            active_metric = peer_metric
+            peer_metric = None
+            peer_metrics = finish_metric(
+                active_metric, self.peer_id, peer_metric_identity
+            )
             active_metric = canary_metric
             canary_metric = None
-            canary_metrics = finish_metric(active_metric)
+            canary_metrics = finish_metric(
+                active_metric, self.canary_id, canary_metric_identity
+            )
             self.daemon_log_seen = log_before
             daemon_log = self.daemon_log_delta()
 
             temporal_ordering = overload_evidence_timestamps_ordered(
+                (dut_metric_start, peer_metric_start, canary_metric_start),
                 queue_before_stop,
                 stopped_at_ns,
                 saturation_snapshot,
                 observations,
+                pressure_reaped_at_ns,
                 queue_before_continue,
                 continued_at_ns,
+                metric_boundary["boundary_monotonic_ns"],
             )
             saturation_proven = (
                 saturation_snapshot is not None
                 and saturation_delta["total"] is not None
                 and saturation_delta["total"]
                 >= int(overload["minimum_nfqueue_drops"])
+                and stall_drop_delta["total"] is not None
+                and stall_drop_delta["total"]
+                >= int(overload["minimum_nfqueue_drops"])
                 and stopped_identity["state"] in {"T", "t"}
                 and temporal_ordering
+            )
+            dut_udp_sndbuf_errors = numeric(
+                nested(dut_metrics, "udp_errors", "sndbuf_errors")
+            )
+            controlled_udp_send_backpressure = (
+                controlled_udp_send_backpressure_evidence(
+                    transport,
+                    saturation_proven,
+                    stall_drop_delta,
+                    int(overload["minimum_nfqueue_drops"]),
+                    pressure_summary,
+                    dut_udp_sndbuf_errors,
+                )
             )
             during_fail_open = any(
                 item.get("fail_open") is True for item in observations
@@ -5409,6 +6673,19 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     dut_metrics,
                     label="overload DUT",
                     transport=transport,
+                    allow_controlled_udp_send_backpressure=(
+                        controlled_udp_send_backpressure["exception_applied"]
+                    ),
+                    expected_stop_reason="split_boundary",
+                )
+            )
+            resource_failure_reasons.extend(
+                overload_metric_validity_reasons(
+                    post_resume_dut_metrics,
+                    label="overload DUT after NFQUEUE consumer resume",
+                    transport=transport,
+                    require_clean_dut_recovery=True,
+                    expected_daemon_pid=self.daemon_pid,
                 )
             )
             resource_failure_reasons.extend(
@@ -5422,20 +6699,17 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     process_sections=("daemon",),
                 )
             )
-            for canary_transport in ("tcp", "udp"):
-                resource_failure_reasons.extend(
-                    overload_metric_validity_reasons(
-                        canary_metrics,
-                        label=f"overload canary ({canary_transport})",
-                        transport=canary_transport,
-                        maximum_process_cpu_ratio=float(
-                            criteria["maximum_peer_wall_cpu_ratio"]
-                        ),
-                        process_sections=("daemon", "workload_process")
-                        if canary_transport == transport
-                        else (),
-                    )
+            resource_failure_reasons.extend(
+                overload_metric_validity_reasons(
+                    canary_metrics,
+                    label="overload canary",
+                    transport=transport,
+                    maximum_process_cpu_ratio=float(
+                        criteria["maximum_peer_wall_cpu_ratio"]
+                    ),
+                    process_sections=("daemon", "workload_process"),
                 )
+            )
             if pressure_exit_code is None or not isinstance(pressure_summary, dict):
                 validity_failures.append("overload pressure workload has no summary")
             else:
@@ -5541,7 +6815,7 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                 else measured_kernel_drops + measured_user_drops
             )
             result = {
-                "schema": "openshield.perf.overload.v1",
+                "schema": OVERLOAD_SCHEMA,
                 "backend": self.backend,
                 "policy": policy,
                 "mode": "enforcing",
@@ -5569,8 +6843,21 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                 },
                 "pressure_exit_code": pressure_exit_code,
                 "pressure_start_gate": pressure_readiness,
+                "pressure_started": pressure_started,
+                "pressure_finished": pressure_finished,
+                "pressure_released": pressure_released,
                 "pressure_workload": pressure_summary,
+                "metric_starts": {
+                    **metric_starts,
+                },
+                "metric_collectors": {
+                    "dut": dut_metric_identity,
+                    "peer": peer_metric_identity,
+                    "canary": canary_metric_identity,
+                },
                 "dut_metrics": dut_metrics,
+                "dut_metric_boundary": metric_boundary,
+                "post_resume_dut_metrics": post_resume_dut_metrics,
                 "peer_metrics": peer_metrics,
                 "canary_metrics": canary_metrics,
                 "allowed_preflight": {
@@ -5626,7 +6913,14 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     "snapshot_before_stop": queue_before_stop,
                     "snapshot_at_barrier": saturation_snapshot,
                     "snapshot_before_continue": queue_before_continue,
-                    "stall_drop_delta": saturation_delta,
+                    "stopped_at_monotonic_ns": stopped_at_ns,
+                    "pressure_reaped_at_monotonic_ns": pressure_reaped_at_ns,
+                    "metric_boundary_monotonic_ns": metric_boundary[
+                        "boundary_monotonic_ns"
+                    ],
+                    "continued_at_monotonic_ns": continued_at_ns,
+                    "threshold_drop_delta": saturation_delta,
+                    "stall_drop_delta": stall_drop_delta,
                     "timestamps_ordered": temporal_ordering,
                     "observed_kernel_drops": measured_kernel_drops,
                     "observed_user_drops": measured_user_drops,
@@ -5647,6 +6941,9 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                 "resource_validity": {
                     "valid": not resource_failure_reasons,
                     "failure_reasons": sorted(set(resource_failure_reasons)),
+                    "controlled_udp_send_backpressure": (
+                        controlled_udp_send_backpressure
+                    ),
                 },
                 "validity_failure_reasons": sorted(set(validity_failures)),
                 "safety_failure_reasons": sorted(set(safety_failures)),
@@ -5670,11 +6967,35 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     self.signal_daemon(int(signal.SIGCONT))
                 except BaseException as cleanup_error:
                     cleanup_errors.append(f"resume daemon: {cleanup_error}")
-            for label, process, is_metric in (
-                ("DUT metric collector", dut_metric, True),
-                ("peer metric collector", peer_metric, True),
-                ("canary metric collector", canary_metric, True),
-                ("pressure workload", pressure_process, False),
+            for label, process, is_metric, container, identity in (
+                (
+                    "DUT metric collector",
+                    dut_metric,
+                    True,
+                    self.client_id,
+                    dut_metric_identity,
+                ),
+                (
+                    "peer metric collector",
+                    peer_metric,
+                    True,
+                    self.peer_id,
+                    peer_metric_identity,
+                ),
+                (
+                    "canary metric collector",
+                    canary_metric,
+                    True,
+                    self.canary_id,
+                    canary_metric_identity,
+                ),
+                (
+                    "pressure workload",
+                    pressure_process,
+                    False,
+                    self.client_id,
+                    pressure_identity,
+                ),
             ):
                 if process is None:
                     continue
@@ -5685,9 +7006,18 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                         and process.stdin is not None
                     ):
                         self.stop_metric(process)
-                    if process.poll() is None:
-                        process.kill()
-                    process.communicate(timeout=5)
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        if identity is None or container is None:
+                            process.kill()
+                            process.communicate(timeout=5)
+                            raise HarnessError(
+                                f"cannot safely pin timed-out {label}"
+                            )
+                        self.cancel_pinned_attached_process(
+                            process, container, identity, label=label
+                        )
                 except BaseException as cleanup_error:
                     cleanup_errors.append(f"reap {label}: {cleanup_error}")
             for label, resource in (
@@ -5702,8 +7032,11 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
                     self.stop_server(*resource)
                 except BaseException as cleanup_error:
                     cleanup_errors.append(f"stop {label}: {cleanup_error}")
-            if primary_error is None and cleanup_errors:
-                raise HarnessError("; ".join(cleanup_errors))
+            if cleanup_errors:
+                cleanup_failure = HarnessError("; ".join(cleanup_errors))
+                if primary_error is not None:
+                    raise cleanup_failure from primary_error
+                raise cleanup_failure
 
 
 def parse_json_line_document(output: str, schema: str) -> dict[str, Any]:
@@ -6556,6 +7889,8 @@ def raw_result_path(output: Path, result: dict[str, Any]) -> Path:
         "mode": result.get("mode") or "none",
         "variant": result.get("learning_variant") or "none",
         "phase": result.get("phase"),
+        "sample": result.get("baseline_sample_id"),
+        "topology": result.get("topology_role"),
     }
     if any(
         not isinstance(value, str) or not NAME_PATTERN.fullmatch(value)
@@ -6564,10 +7899,17 @@ def raw_result_path(output: Path, result: dict[str, Any]) -> Path:
         raise HarnessError("result contains an unsafe raw-evidence path component")
     load_level = finite_number(result.get("load_level"), "result load level", 0.01, 100.0)
     filename = (
-        f"result-{components['profile']}-{components['policy']}-{components['mode']}-"
+        f"result-{components['sample']}-{components['profile']}-"
+        f"{components['policy']}-{components['mode']}-"
         f"{components['variant']}-{load_level:g}-{components['phase']}.json"
     )
-    return output / "raw" / components["backend"] / filename
+    return (
+        output
+        / "raw"
+        / components["backend"]
+        / components["topology"]
+        / filename
+    )
 
 
 def rewrite_canonical_raw_results(output: Path, results: list[dict[str, Any]]) -> None:
@@ -6635,10 +7977,19 @@ def recompute_result_outcome(
 def add_baseline_comparisons(
     results: list[dict[str, Any]], criteria: dict[str, Any]
 ) -> None:
-    baselines: dict[tuple[str, str, float, str], dict[str, Any]] = {}
+    baselines: dict[
+        tuple[str, str, str, float, str], list[dict[str, Any]]
+    ] = {}
     for result in results:
         if result["policy"] == "baseline":
-            baselines[(result["backend"], result["profile"], result["load_level"], result["phase"])] = result
+            key = (
+                result["backend"],
+                result.get("baseline_sample_id"),
+                result["profile"],
+                result["load_level"],
+                result["phase"],
+            )
+            baselines.setdefault(key, []).append(result)
     for result in results:
         if result["policy"] == "baseline":
             continue
@@ -6656,28 +8007,89 @@ def add_baseline_comparisons(
             if reason
             not in {
                 "paired baseline is missing",
+                "paired baseline is ambiguous",
                 "paired baseline is saturated or invalid",
+                "paired baseline is not the predetermined adjacent sample",
             }
         ]
         result["relative_performance_failure_reasons"] = []
-        baseline = baselines.get(
-            (result["backend"], result["profile"], result["load_level"], result["phase"])
+        baseline_candidates = baselines.get(
+            (
+                result["backend"],
+                result.get("baseline_sample_id"),
+                result["profile"],
+                result["load_level"],
+                result["phase"],
+            ),
+            [],
         )
         gated_phase = result["phase_role"] in {"steady", "burst"}
-        if baseline is None:
-            result["unreliable_reasons"].append("paired baseline is missing")
+        if len(baseline_candidates) != 1:
+            result["unreliable_reasons"].append(
+                "paired baseline is missing"
+                if not baseline_candidates
+                else "paired baseline is ambiguous"
+            )
             recompute_result_outcome(result, criteria)
             continue
+        baseline = baseline_candidates[0]
+        baseline_sequence = baseline.get("execution_sequence")
+        current_sequence = result.get("execution_sequence")
+        baseline_started = baseline.get("block_started_monotonic_ns")
+        baseline_finished = baseline.get("block_finished_monotonic_ns")
+        current_started = result.get("block_started_monotonic_ns")
+        current_finished = result.get("block_finished_monotonic_ns")
+        order = result.get("comparison_order")
+        temporal_values = (
+            baseline_sequence,
+            current_sequence,
+            baseline_started,
+            baseline_finished,
+            current_started,
+            current_finished,
+        )
+        temporal_valid = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in temporal_values
+        )
+        gap_seconds: float | None = None
+        if temporal_valid and order == "ab":
+            temporal_valid = (
+                current_sequence == baseline_sequence + 1
+                and baseline_started <= baseline_finished <= current_started
+                and current_started <= current_finished
+            )
+            if temporal_valid:
+                gap_seconds = (current_started - baseline_finished) / 1_000_000_000
+        elif temporal_valid and order == "ba":
+            temporal_valid = (
+                baseline_sequence == current_sequence + 1
+                and current_started <= current_finished <= baseline_started
+                and baseline_started <= baseline_finished
+            )
+            if temporal_valid:
+                gap_seconds = (baseline_started - current_finished) / 1_000_000_000
+        else:
+            temporal_valid = False
+        result["comparison_gap_seconds"] = gap_seconds
+        if not temporal_valid:
+            result["unreliable_reasons"].append(
+                "paired baseline is not the predetermined adjacent sample"
+            )
         baseline_eligible = baseline.get("valid") is True and (
             not gated_phase
             or (
                 baseline.get("capacity_pass") is True
                 and baseline.get("safety_pass") is True
             )
-        )
+        ) and temporal_valid
         if not baseline_eligible:
             result["unreliable_reasons"].append("paired baseline is saturated or invalid")
         result["baseline"] = {
+            "sample_id": baseline.get("baseline_sample_id"),
+            "comparison_order": order,
+            "execution_sequence": baseline_sequence,
+            "comparison_gap_seconds": gap_seconds,
             "valid": baseline.get("valid"),
             "capacity_pass": baseline.get("capacity_pass"),
             "safety_pass": baseline.get("safety_pass"),
@@ -6821,6 +8233,266 @@ def add_baseline_comparisons(
         # of capacity failures so reports can distinguish an unsustainable
         # offered point from a valid point whose firewall overhead is too high.
         recompute_result_outcome(result, criteria)
+
+
+def baseline_pairing_evidence(
+    results: list[dict[str, Any]],
+    config: dict[str, Any],
+    baseline_environments: list[dict[str, Any]],
+    protected_environments: list[dict[str, Any]],
+    generation_pairs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate the predetermined nearest pristine-baseline schedule."""
+
+    failures: list[str] = []
+    expected_backends = list(config["backends"])
+    if len(baseline_environments) != len(expected_backends):
+        failures.append("baseline environment evidence count does not match backends")
+    if len(protected_environments) != len(expected_backends):
+        failures.append("protected environment evidence count does not match backends")
+    if len(generation_pairs) != len(expected_backends):
+        failures.append("DUT generation evidence count does not match backends")
+    baseline_by_backend = {
+        item.get("backend"): item
+        for item in baseline_environments
+        if isinstance(item, dict)
+    }
+    protected_by_backend = {
+        item.get("backend"): item
+        for item in protected_environments
+        if isinstance(item, dict)
+    }
+    generations_by_backend = {
+        item.get("backend"): item
+        for item in generation_pairs
+        if isinstance(item, dict)
+    }
+    environment_pairs: list[dict[str, Any]] = []
+    if len(baseline_by_backend) != len(baseline_environments):
+        failures.append("baseline environment evidence has duplicate backend identities")
+    if len(protected_by_backend) != len(protected_environments):
+        failures.append("protected environment evidence has duplicate backend identities")
+    if len(generations_by_backend) != len(generation_pairs):
+        failures.append("DUT generation evidence has duplicate backend identities")
+    for backend in expected_backends:
+        baseline_environment = baseline_by_backend.get(backend)
+        protected_environment = protected_by_backend.get(backend)
+        generation = generations_by_backend.get(backend)
+        pair_failures: list[str] = []
+        if baseline_environment is None or protected_environment is None:
+            pair_failures.append("baseline or protected environment evidence is missing")
+        elif baseline_environment != protected_environment:
+            pair_failures.append("baseline and protected environments differ")
+        if not isinstance(generation, dict):
+            pair_failures.append("DUT generation evidence is missing")
+            baseline_client_id = None
+            protected_client_id = None
+            baseline_daemon_started = None
+        else:
+            baseline_client_id = generation.get("baseline_client_id")
+            protected_client_id = generation.get("protected_client_id")
+            baseline_daemon_started = generation.get("baseline_daemon_started")
+            if (
+                not isinstance(baseline_client_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", baseline_client_id) is None
+                or not isinstance(protected_client_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", protected_client_id) is None
+                or baseline_client_id == protected_client_id
+            ):
+                pair_failures.append("baseline and protected DUT identities are invalid")
+            if baseline_daemon_started is not False:
+                pair_failures.append("baseline DUT started the OpenShield daemon")
+        environment_pairs.append(
+            {
+                "backend": backend,
+                "valid": not pair_failures,
+                "failure_reasons": sorted(set(pair_failures)),
+                "baseline_client_id": baseline_client_id,
+                "protected_client_id": protected_client_id,
+                "baseline_daemon_started": baseline_daemon_started,
+            }
+        )
+        failures.extend(f"{backend}: {reason}" for reason in pair_failures)
+
+    block_rows: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    observed_block_order: dict[str, list[int]] = {}
+    last_sequence: dict[str, int] = {}
+    closed_blocks: set[tuple[str, int]] = set()
+    for result in results:
+        backend = result.get("backend")
+        sequence = result.get("execution_sequence")
+        if (
+            not isinstance(backend, str)
+            or backend not in expected_backends
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 0
+        ):
+            failures.append("a result has invalid block identity")
+            continue
+        block_key = (backend, sequence)
+        if last_sequence.get(backend) != sequence:
+            previous = last_sequence.get(backend)
+            if previous is not None:
+                closed_blocks.add((backend, previous))
+            if block_key in closed_blocks:
+                failures.append(f"{backend}: block {sequence} is not contiguous")
+            observed_block_order.setdefault(backend, []).append(sequence)
+            last_sequence[backend] = sequence
+        block_rows.setdefault(block_key, []).append(result)
+
+    expected_phases = [phase["name"] for phase in phase_plan(config)]
+    comparison_count = 0
+    baseline_sample_count = 0
+    order_counts = {"ab": 0, "ba": 0}
+    gaps: list[float] = []
+    for backend in config["backends"]:
+        actual_sequences = observed_block_order.get(backend, [])
+        if not actual_sequences:
+            continue
+        expected = list(paired_load_plan(config, backend))
+        if actual_sequences != list(range(len(expected))):
+            failures.append(f"{backend}: execution sequence is incomplete or non-canonical")
+            continue
+        for sequence, (expected_scenario, expected_load) in enumerate(expected):
+            rows = block_rows[(backend, sequence)]
+            first = rows[0]
+            identity = (
+                first.get("profile"),
+                first.get("policy"),
+                first.get("mode"),
+                first.get("learning_variant"),
+                first.get("load_level"),
+                first.get("baseline_sample_id"),
+                first.get("comparison_order"),
+                first.get("topology_role"),
+                first.get("block_started_monotonic_ns"),
+                first.get("block_finished_monotonic_ns"),
+            )
+            if any(
+                (
+                    row.get("profile"),
+                    row.get("policy"),
+                    row.get("mode"),
+                    row.get("learning_variant"),
+                    row.get("load_level"),
+                    row.get("baseline_sample_id"),
+                    row.get("comparison_order"),
+                    row.get("topology_role"),
+                    row.get("block_started_monotonic_ns"),
+                    row.get("block_finished_monotonic_ns"),
+                )
+                != identity
+                for row in rows
+            ):
+                failures.append(f"{backend}: block {sequence} has inconsistent rows")
+            expected_identity = (
+                expected_scenario["profile"]["name"],
+                expected_scenario["policy"],
+                expected_scenario["mode"],
+                expected_scenario.get("learning_variant"),
+                expected_load,
+                expected_scenario["baseline_sample_id"],
+                expected_scenario["comparison_order"],
+                expected_scenario["topology_role"],
+            )
+            if identity[:8] != expected_identity:
+                failures.append(f"{backend}: block {sequence} differs from the AB/BA plan")
+            phases = [row.get("phase") for row in rows]
+            if sorted(phases) != sorted(expected_phases) or len(phases) != len(
+                set(phases)
+            ):
+                failures.append(f"{backend}: block {sequence} has an incomplete phase set")
+            started, finished = identity[8:]
+            if (
+                not isinstance(started, int)
+                or isinstance(started, bool)
+                or not isinstance(finished, int)
+                or isinstance(finished, bool)
+                or started <= 0
+                or finished <= started
+            ):
+                failures.append(f"{backend}: block {sequence} timestamps are invalid")
+            if first.get("policy") == "baseline":
+                baseline_sample_count += 1
+                if any(row.get("comparison_gap_seconds") is not None for row in rows):
+                    failures.append(f"{backend}: baseline block exposes a comparison gap")
+            else:
+                comparison_count += 1
+                order = first.get("comparison_order")
+                if order in order_counts:
+                    order_counts[order] += 1
+                else:
+                    failures.append(f"{backend}: protected block has invalid pair order")
+                block_gaps = [row.get("comparison_gap_seconds") for row in rows]
+                reported_gap = block_gaps[0] if block_gaps else None
+                if (
+                    any(value != reported_gap for value in block_gaps[1:])
+                    or not isinstance(reported_gap, (int, float))
+                    or isinstance(reported_gap, bool)
+                    or not math.isfinite(float(reported_gap))
+                    or float(reported_gap) < 0
+                ):
+                    failures.append(f"{backend}: protected block gap is invalid")
+                else:
+                    baseline_sequence = sequence - 1 if order == "ab" else sequence + 1
+                    baseline_rows = block_rows.get((backend, baseline_sequence), [])
+                    adjacent = baseline_rows[0] if baseline_rows else None
+                    if (
+                        not isinstance(adjacent, dict)
+                        or adjacent.get("policy") != "baseline"
+                        or adjacent.get("topology_role") != "baseline"
+                        or adjacent.get("baseline_sample_id")
+                        != first.get("baseline_sample_id")
+                    ):
+                        failures.append(
+                            f"{backend}: protected block {sequence} lacks its adjacent baseline"
+                        )
+                    else:
+                        protected_boundary = started if order == "ab" else finished
+                        baseline_boundary = adjacent.get(
+                            "block_finished_monotonic_ns"
+                            if order == "ab"
+                            else "block_started_monotonic_ns"
+                        )
+                        if any(
+                            not isinstance(value, int) or isinstance(value, bool)
+                            for value in (protected_boundary, baseline_boundary)
+                        ):
+                            failures.append(
+                                f"{backend}: protected block {sequence} has invalid adjacent timestamps"
+                            )
+                        else:
+                            gap_ns = (
+                                protected_boundary - baseline_boundary
+                                if order == "ab"
+                                else baseline_boundary - protected_boundary
+                            )
+                            expected_gap = gap_ns / 1_000_000_000.0
+                            if gap_ns < 0 or not math.isclose(
+                                float(reported_gap),
+                                expected_gap,
+                                rel_tol=0.0,
+                                abs_tol=1e-9,
+                            ):
+                                failures.append(
+                                    f"{backend}: protected block {sequence} gap differs from timestamps"
+                                )
+                            else:
+                                gaps.append(float(reported_gap))
+
+    return {
+        "schema": BASELINE_PAIRING_SCHEMA,
+        "strategy": "nearest_pristine_ab_ba",
+        "valid": not failures,
+        "failure_reasons": sorted(set(failures)),
+        "baseline_environments": baseline_environments,
+        "environment_pairs": environment_pairs,
+        "baseline_sample_count": baseline_sample_count,
+        "comparison_count": comparison_count,
+        "orders": order_counts,
+        "maximum_gap_seconds": max(gaps) if gaps else None,
+    }
 
 
 def maximum_sustainable(
@@ -6984,6 +8656,13 @@ CSV_FIELDS = [
     "phase",
     "phase_role",
     "phase_scale",
+    "baseline_sample_id",
+    "comparison_order",
+    "execution_sequence",
+    "topology_role",
+    "block_started_monotonic_ns",
+    "block_finished_monotonic_ns",
+    "comparison_gap_seconds",
     "valid",
     "passed",
     "safety_pass",
@@ -7339,6 +9018,11 @@ def write_overload_csv(path: Path, results: list[dict[str, Any]]) -> None:
 
 def markdown_report(report: dict[str, Any]) -> str:
     outcome = "PASS" if report["passed"] and report["valid"] else "FAIL"
+    pairing = report.get("baseline_pairing", {})
+    pairing_gap = numeric(pairing.get("maximum_gap_seconds"))
+    pairing_gap_display = (
+        "unavailable" if pairing_gap is None else f"{pairing_gap:.6f} s"
+    )
     lines = [
         "# OpenShield performance report",
         "",
@@ -7353,6 +9037,9 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Controlled overload proofs: {len(report.get('overload_results', []))}",
         f"- Controlled overload plan complete: {report.get('overload_plan_complete', False)}",
         f"- Environment consistency: {nested(report, 'environment_consistency', 'valid', default=False)}",
+        f"- Pristine AB/BA pairing: {pairing.get('valid', False)}",
+        f"- Baseline samples/protected comparisons: {pairing.get('baseline_sample_count', 0)}/{pairing.get('comparison_count', 0)}",
+        f"- Maximum baseline comparison gap: {pairing_gap_display}",
         f"- Estimated configured workload time: {report['estimated_workload_seconds']:.1f} s",
         "",
         "## Environment evidence",
@@ -7370,6 +9057,37 @@ def markdown_report(report: dict[str, Any]) -> str:
                 uname=environment.get("uname", "unavailable"),
                 repo=environment.get("repo_oss_repomd_sha256", "unavailable"),
                 rpm=environment.get("rpm_manifest_sha256", "unavailable"),
+            )
+        )
+    lines.extend(
+        [
+        "",
+        "## Pristine baseline pairing",
+        "",
+        "Protected blocks are paired only with the predetermined adjacent sample from a separate pristine DUT generation. The OpenShield daemon is never started on that baseline DUT; exact environment equality and distinct Docker identities are mandatory.",
+        "",
+        "| Backend | Strategy | Pair valid | Baseline DUT daemon started | Baseline DUT ID | Protected DUT ID |",
+        "|---|---|---:|---:|---|---|",
+        ]
+    )
+    environment_pairs = pairing.get("environment_pairs", [])
+    if not environment_pairs:
+        lines.append("| — | — | no | — | — | — |")
+    for environment_pair in environment_pairs:
+        lines.append(
+            "| {backend} | {strategy} | {valid} | {started} | `{baseline}` | `{protected}` |".format(
+                backend=environment_pair.get("backend", "—"),
+                strategy=pairing.get("strategy", "—"),
+                valid="yes" if environment_pair.get("valid") else "no",
+                started=(
+                    "yes"
+                    if environment_pair.get("baseline_daemon_started") is True
+                    else "no"
+                    if environment_pair.get("baseline_daemon_started") is False
+                    else "unknown"
+                ),
+                baseline=environment_pair.get("baseline_client_id", "unavailable"),
+                protected=environment_pair.get("protected_client_id", "unavailable"),
             )
         )
     lines.extend(
@@ -7971,7 +9689,20 @@ def run_harness(
     all_overload_results: list[dict[str, Any]] = []
     backend_results: list[dict[str, Any]] = []
     environments: list[dict[str, Any]] = []
+    baseline_environments: list[dict[str, Any]] = []
+    generation_pairs: list[dict[str, Any]] = []
     for backend in config["backends"]:
+        baseline_topology = DockerBackendRun(
+            repository,
+            daemon,
+            output,
+            runtime_bundle,
+            runtime_bundle_evidence["manifest_sha256"],
+            config,
+            backend,
+            token,
+            "baseline",
+        )
         topology = DockerBackendRun(
             repository,
             daemon,
@@ -7981,29 +9712,52 @@ def run_harness(
             config,
             backend,
             token,
+            "protected",
         )
         current: list[dict[str, Any]] = []
         current_overload: list[dict[str, Any]] = []
+        generation_pair: dict[str, Any] | None = None
         try:
-            print(f"==> OpenShield perf: prepare {backend} topology", flush=True)
+            print(
+                f"==> OpenShield perf: prepare {backend} pristine baseline topology",
+                flush=True,
+            )
+            baseline_topology.setup()
+            print(
+                f"==> OpenShield perf: prepare {backend} protected topology",
+                flush=True,
+            )
             topology.setup()
-            if not isinstance(topology.environment_evidence, dict):
-                raise HarnessError("topology did not capture environment evidence")
+            if not isinstance(
+                baseline_topology.environment_evidence, dict
+            ) or not isinstance(topology.environment_evidence, dict):
+                raise HarnessError("paired topologies did not capture environment evidence")
+            baseline_environments.append(baseline_topology.environment_evidence)
             environments.append(topology.environment_evidence)
-            print(f"==> OpenShield perf: {backend} paired baselines", flush=True)
-            for scenario in scenario_plan(config, "baseline"):
-                scenario["backend"] = backend
-                topology.run_scenario(scenario, current)
+            generation_pair = {
+                "backend": backend,
+                "baseline_client_id": baseline_topology.client_id,
+                "protected_client_id": topology.client_id,
+                "baseline_daemon_started": baseline_topology.daemon_started,
+            }
+            generation_pairs.append(generation_pair)
+            # Detect an unsupported backend before emitting a partial AB/BA
+            # matrix.  The separate pristine topology remains daemon-free.
             topology.start_daemon()
-            for policy in ("network_only", "application_tcp", "application_udp"):
-                for scenario in scenario_plan(config, policy):
-                    scenario["backend"] = backend
-                    print(
-                        f"==> OpenShield perf: {backend} {policy} {scenario['mode']} "
-                        f"{scenario['profile']['name']}",
-                        flush=True,
-                    )
-                    topology.run_scenario(scenario, current)
+            for scenario, load_level in paired_load_plan(config, backend):
+                target = (
+                    baseline_topology
+                    if scenario["topology_role"] == "baseline"
+                    else topology
+                )
+                print(
+                    f"==> OpenShield perf: {backend} seq={scenario['execution_sequence']} "
+                    f"{scenario['topology_role']} {scenario['policy']} "
+                    f"{scenario['mode'] or 'none'} {scenario['profile']['name']} "
+                    f"load={load_level:g} baseline={scenario['baseline_sample_id']}",
+                    flush=True,
+                )
+                target.run_load_block(scenario, load_level, current)
             if config["overload"]["enabled"]:
                 for transport in ("tcp", "udp"):
                     profile = next(
@@ -8035,13 +9789,25 @@ def run_harness(
         except (HarnessError, OSError, subprocess.SubprocessError) as error:
             backend_results.append({"name": backend, "status": "failed", "reason": safe_tail(str(error))})
         finally:
+            if generation_pair is not None:
+                generation_pair["baseline_daemon_started"] = (
+                    baseline_topology.daemon_started
+                )
             all_results.extend(current)
             all_overload_results.extend(current_overload)
             topology.cleanup()
+            baseline_topology.cleanup()
     environment_consistency = environment_consistency_evidence(
         environments, list(config["backends"])
     )
     add_baseline_comparisons(all_results, config["criteria"])
+    baseline_pairing = baseline_pairing_evidence(
+        all_results,
+        config,
+        baseline_environments,
+        environments,
+        generation_pairs,
+    )
     # Baseline propagation and server reliability mutate rows after the phase
     # snapshot.  Rewrite raw evidence now so all three report formats describe
     # the same final decisions.
@@ -8064,6 +9830,14 @@ def run_harness(
             if backend_passed(backend_current, config["criteria"])
             and overload_backend_passed(
                 backend_overload, config["overload"]["enabled"]
+            )
+            and next(
+                (
+                    pair.get("valid") is True
+                    for pair in baseline_pairing["environment_pairs"]
+                    if pair.get("backend") == backend_result["name"]
+                ),
+                False,
             )
             else "failed"
         )
@@ -8103,8 +9877,9 @@ def run_harness(
         and executed_overload_valid
         and overload_plan_complete
         and environment_consistency["valid"] is True
+        and baseline_pairing["valid"] is True
     )
-    passed = environment_consistency["valid"] is True and required_backends_pass and all(
+    passed = baseline_pairing["valid"] is True and environment_consistency["valid"] is True and required_backends_pass and all(
         result["safety_pass"] for result in all_results
     ) and all(
         result["safety_pass"]
@@ -8131,6 +9906,7 @@ def run_harness(
         "docker": docker_metadata,
         "environments": environments,
         "environment_consistency": environment_consistency,
+        "baseline_pairing": baseline_pairing,
         "estimated_workload_seconds": config["estimated_workload_seconds"],
         "criteria": config["criteria"],
         "backends": backend_results,
@@ -8235,6 +10011,18 @@ def main() -> int:
                 "schema": "openshield.perf.environment-consistency.v1",
                 "valid": False,
                 "failure_reasons": ["harness terminated before environment comparison"],
+            },
+            "baseline_pairing": {
+                "schema": BASELINE_PAIRING_SCHEMA,
+                "strategy": "nearest_pristine_ab_ba",
+                "valid": False,
+                "failure_reasons": ["harness terminated before baseline pairing"],
+                "baseline_environments": [],
+                "environment_pairs": [],
+                "baseline_sample_count": 0,
+                "comparison_count": 0,
+                "orders": {"ab": 0, "ba": 0},
+                "maximum_gap_seconds": None,
             },
             "estimated_workload_seconds": config["estimated_workload_seconds"],
             "criteria": config["criteria"],

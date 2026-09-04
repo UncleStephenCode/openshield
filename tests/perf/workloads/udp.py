@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import random
 import socket
 import struct
@@ -25,6 +26,7 @@ if __package__ in (None, ""):
         WorkBudget,
         WorkloadStats,
         apply_config_file,
+        announce_control_process,
         base_client_arguments,
         base_server_arguments,
         bounded_int,
@@ -37,6 +39,7 @@ if __package__ in (None, ""):
         safe_error,
         socket_address,
         wait_for_start_gate,
+        wait_for_release_gate,
     )
 else:
     from .common import (
@@ -47,6 +50,7 @@ else:
         WorkBudget,
         WorkloadStats,
         apply_config_file,
+        announce_control_process,
         base_client_arguments,
         base_server_arguments,
         bounded_int,
@@ -59,6 +63,7 @@ else:
         safe_error,
         socket_address,
         wait_for_start_gate,
+        wait_for_release_gate,
     )
 
 
@@ -403,6 +408,20 @@ class UdpWorkloadClient:
         self.config = config
         self.stop = stop or threading.Event()
         self.stats = WorkloadStats(config.seed, config.latency_samples)
+        # These counters are part of overload evidence.  Emit explicit zeroes
+        # so absence can never be confused with a measured clean send path.
+        self.stats.add(
+            data_send_failures=0,
+            data_send_timeouts=0,
+            data_send_enobufs=0,
+            data_send_would_block=0,
+            data_send_other_os_errors=0,
+            barrier_send_failures=0,
+            barrier_send_timeouts=0,
+            barrier_send_enobufs=0,
+            barrier_send_would_block=0,
+            barrier_send_other_os_errors=0,
+        )
         self.budget = WorkBudget(config.operations)
         self.deadline = time.monotonic() + config.duration
         self.limiter = AsyncMultiRateLimiter(
@@ -415,6 +434,29 @@ class UdpWorkloadClient:
         self._family, self._address = socket_address(config.host, config.port)
         if self._family == socket.AF_INET6 and config.mtu < 1280:
             raise ValueError("IPv6 workload MTU must be at least 1280 bytes")
+
+    def arm(self) -> int:
+        """Reset time-based state after the external measurement gate opens."""
+
+        self.deadline = time.monotonic() + self.config.duration
+        self.limiter.arm()
+        return self.stats.arm()
+
+    def _record_send_failure(
+        self, scope: str, error: asyncio.TimeoutError | OSError
+    ) -> None:
+        if scope not in {"data", "barrier"}:
+            raise ValueError("invalid UDP send-failure scope")
+        values = {"errors": 1, f"{scope}_send_failures": 1}
+        if isinstance(error, asyncio.TimeoutError):
+            values[f"{scope}_send_timeouts"] = 1
+        elif error.errno == errno.ENOBUFS:
+            values[f"{scope}_send_enobufs"] = 1
+        elif error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+            values[f"{scope}_send_would_block"] = 1
+        else:
+            values[f"{scope}_send_other_os_errors"] = 1
+        self.stats.add(**values)
 
     def run(self) -> dict:
         asyncio.run(self._run())
@@ -553,20 +595,28 @@ class UdpWorkloadClient:
                 request = request_header + maximum_payload[:request_size]
                 try:
                     await asyncio.wait_for(
-                        loop.sock_sendall(connection, request), timeout=self.config.io_timeout
+                        loop.sock_sendall(connection, request),
+                        timeout=self.config.io_timeout,
                     )
-                    sequence = candidate_sequence
-                    sent = len(request)
-                    self.stats.add(
-                        operations=1,
-                        packets_sent=1,
-                        bytes_sent=sent,
-                        replies_expected=1 if expect_reply else 0,
-                        **{f"request_size_{request_size}_datagrams": 1},
-                        **{f"response_size_{response_size}_datagrams": 1},
-                    )
-                    if not expect_reply:
-                        continue
+                except asyncio.TimeoutError as error:
+                    self._record_send_failure("data", error)
+                    continue
+                except OSError as error:
+                    self._record_send_failure("data", error)
+                    continue
+                sequence = candidate_sequence
+                sent = len(request)
+                self.stats.add(
+                    operations=1,
+                    packets_sent=1,
+                    bytes_sent=sent,
+                    replies_expected=1 if expect_reply else 0,
+                    **{f"request_size_{request_size}_datagrams": 1},
+                    **{f"response_size_{response_size}_datagrams": 1},
+                )
+                if not expect_reply:
+                    continue
+                try:
                     received_bytes = await self._receive_reply(
                         loop,
                         connection,
@@ -606,21 +656,30 @@ class UdpWorkloadClient:
                     loop.sock_sendall(connection, barrier),
                     timeout=self.config.io_timeout,
                 )
+            except asyncio.TimeoutError as error:
+                self._record_send_failure("barrier", error)
+                self.stats.add(barrier_errors=1)
+            except OSError as error:
+                self._record_send_failure("barrier", error)
+                self.stats.add(barrier_errors=1)
+            else:
                 self.stats.add(barriers_sent=1, barrier_bytes_sent=len(barrier))
-                received_bytes = await self._receive_reply(
-                    loop,
-                    connection,
-                    0,
-                    flow_id,
-                    sequence + 1,
-                    barrier_send_ns,
-                )
-                self.stats.add(
-                    barrier_acks_received=1,
-                    barrier_bytes_received=received_bytes,
-                )
-            except (asyncio.TimeoutError, OSError, ValueError, struct.error):
-                self.stats.add(errors=1, barrier_errors=1)
+                try:
+                    received_bytes = await self._receive_reply(
+                        loop,
+                        connection,
+                        0,
+                        flow_id,
+                        sequence + 1,
+                        barrier_send_ns,
+                    )
+                except (asyncio.TimeoutError, OSError, ValueError, struct.error):
+                    self.stats.add(errors=1, barrier_errors=1)
+                else:
+                    self.stats.add(
+                        barrier_acks_received=1,
+                        barrier_bytes_received=received_bytes,
+                    )
         finally:
             connection.close()
             self.stats.add(flows_closed=1)
@@ -825,9 +884,17 @@ def run_server(config: UdpServerConfig) -> int:
 
 def run_client(config: UdpClientConfig, start_gate_stdin: bool = False) -> int:
     stop = threading.Event()
-    install_stop_handlers(stop)
-    wait_for_start_gate(start_gate_stdin, stop, "udp")
+    control_stop = threading.Event()
+    install_stop_handlers(stop, control_stop)
+    identity = announce_control_process(start_gate_stdin, "udp")
     client = UdpWorkloadClient(config, stop)
+    wait_for_start_gate(
+        start_gate_stdin,
+        control_stop,
+        "udp",
+        on_start=client.arm,
+        identity=identity,
+    )
     summary = client.run()
     summary["datagrams_per_second"] = summary["application_ops_per_second"]
     rate_model = client.target_rate_model()
@@ -837,7 +904,8 @@ def run_client(config: UdpClientConfig, start_gate_stdin: bool = False) -> int:
     summary["reply_loss_ratio"] = round(
         max(0, expected - received) / expected, 6
     ) if expected else 0.0
-    emit_json(
+    succeeded = summary.get("packets_sent", 0) > 0 and summary.get("errors", 0) == 0
+    summary_document = emit_json(
         "summary",
         role="client",
         transport="udp",
@@ -874,10 +942,18 @@ def run_client(config: UdpClientConfig, start_gate_stdin: bool = False) -> int:
             "mtu": config.mtu,
             **rate_model,
         },
-        ok=summary.get("packets_sent", 0) > 0 and summary.get("errors", 0) == 0,
+        ok=succeeded,
         metrics=summary,
     )
-    return 0 if summary.get("packets_sent", 0) > 0 else 2
+    exit_code = 0 if summary.get("packets_sent", 0) > 0 else 2
+    wait_for_release_gate(
+        start_gate_stdin,
+        control_stop,
+        "udp",
+        summary_document,
+        exit_code,
+    )
+    return exit_code
 
 
 def main(argv=None) -> int:

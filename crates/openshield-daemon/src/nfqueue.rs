@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::errno::Errno;
+use nix::net::if_::if_indextoname;
 use nix::poll::{PollFd, PollFlags, poll};
 use nix::sys::socket::{
     AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, sendto,
@@ -61,7 +62,6 @@ const CONFIGURATION_POLL_MILLIS: u16 = 100;
 const LEARNING_QUEUE_CAPACITY: usize = 512;
 const LEARNING_BATCH_SIZE: usize = 256;
 const NFNETLINK_FAMILY_UNSPEC: u8 = 0;
-const INTERFACE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub struct QueueRuntime {
@@ -319,15 +319,30 @@ fn decide_packet(
         "queued packet does not carry the kernel pending-mark domain"
     );
 
-    let identity = resolver
-        .resolve(&packet.connection)
-        .context("cannot establish race-checked process identity")?;
     let accepted = match snapshot.mode {
         Mode::BlockAll => false,
-        Mode::Enforcing => snapshot
-            .matching_rule(&packet.connection, &identity)
-            .is_some(),
+        Mode::Enforcing => {
+            let requirements = snapshot
+                .enforcement_capture_requirements(&packet.connection)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no enabled application rule matches the queued network endpoint and socket UID"
+                    )
+                })?;
+            let identity = resolver
+                .resolve_for_enforcement(&packet.connection, requirements)
+                .context("cannot establish race-checked process identity")?;
+            snapshot
+                .matching_rule(&packet.connection, &identity)
+                .is_some()
+        }
         Mode::Learning => {
+            // Learning persists an exact selector, so it must retain the full
+            // command line and cgroup capture even though Enforcing can omit
+            // optional fields which no candidate rule references.
+            let identity = resolver
+                .resolve(&packet.connection)
+                .context("cannot establish race-checked process identity")?;
             let selector = identity
                 .learned_selector()
                 .context("cannot create a stable learned application selector")?;
@@ -686,47 +701,11 @@ fn finish_transport(
 
 fn interface_for_index(index: u32) -> Result<InterfaceName> {
     ensure!(index != 0, "output interface index is zero");
-    let deadline = Instant::now() + INTERFACE_LOOKUP_TIMEOUT;
-    let mut matches = Vec::new();
-    for (count, entry) in std::fs::read_dir("/sys/class/net")
-        .context("cannot enumerate interfaces")?
-        .enumerate()
-    {
-        ensure!(
-            Instant::now() <= deadline,
-            "bounded interface lookup timed out"
-        );
-        ensure!(count < 4_096, "interface enumeration bound exceeded");
-        let entry = entry.context("cannot inspect interface directory entry")?;
-        let value = std::fs::read_to_string(entry.path().join("ifindex"))
-            .context("cannot read interface index")?;
-        ensure!(
-            Instant::now() <= deadline,
-            "bounded interface lookup timed out"
-        );
-        if value
-            .trim()
-            .parse::<u32>()
-            .context("invalid interface index")?
-            == index
-        {
-            let name = entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| anyhow!("interface name is not UTF-8"))?
-                .to_owned();
-            matches.push(InterfaceName::new(name)?);
-        }
-        ensure!(matches.len() <= 1, "interface index is ambiguous");
-    }
-    ensure!(
-        Instant::now() <= deadline,
-        "bounded interface lookup timed out"
-    );
-    matches
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("output interface index does not exist"))
+    let name = if_indextoname(index).context("output interface index does not exist")?;
+    let name = name
+        .into_string()
+        .map_err(|_| anyhow!("interface name is not UTF-8"))?;
+    InterfaceName::new(name).context("output interface name is invalid")
 }
 
 #[derive(Debug)]
@@ -1238,6 +1217,14 @@ mod tests {
                 )?,
             },
         })
+    }
+
+    #[test]
+    fn resolves_interface_name_directly_from_the_kernel_index() -> Result<(), Box<dyn Error>> {
+        let loopback_index = nix::net::if_::if_nametoindex("lo")?;
+        assert_eq!(interface_for_index(loopback_index)?.as_str(), "lo");
+        assert!(interface_for_index(0).is_err());
+        Ok(())
     }
 
     #[test]

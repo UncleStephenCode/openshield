@@ -12,16 +12,41 @@ import re
 import selectors
 import sys
 import time
-from typing import Any, TextIO
+from typing import Any, BinaryIO, Callable
 
 
 QUEUE_NUMBER = 1_337
-CONTROL_SCHEMA = "openshield.perf.metrics.control.v1"
+CONTROL_SCHEMA = "openshield.perf.metrics.control.v2"
+METRICS_SCHEMA = "openshield.perf.metrics.v2"
 U32_MODULUS = 1 << 32
 MAX_DURATION_SECONDS = 3_600.0
 MIN_INTERVAL_SECONDS = 0.02
+MAX_CONTROL_COMMAND_CHARACTERS = 16
+MAX_CONTROL_START_WAIT_SECONDS = 120.0
 INTERFACE_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.:-]{0,14})$")
 MAX_COUNTER_VALUE = (1 << 64) - 1
+
+
+def self_process_identity() -> dict[str, int | str]:
+    """Return identity fields used for exact, PID-reuse-safe cleanup."""
+
+    pid = os.getpid()
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        closing = stat_text.rfind(")")
+        fields = stat_text[closing + 2 :].split() if closing >= 0 else []
+        starttime = int(fields[19], 10)
+        executable = os.readlink(f"/proc/{pid}/exe")
+    except (OSError, UnicodeError, ValueError, IndexError) as error:
+        raise RuntimeError("cannot pin metric collector process identity") from error
+    if starttime <= 0 or not executable.startswith("/"):
+        raise RuntimeError("metric collector process identity is invalid")
+    return {
+        "pid": pid,
+        "starttime": starttime,
+        "executable": executable,
+        "uid": os.getuid(),
+    }
 
 
 def read_int(path: Path) -> int | None:
@@ -347,8 +372,10 @@ def cgroup_cpu_delta(
 
 def snapshot(interface: str) -> dict[str, Any]:
     transport = transport_counters()
+    observed_at_monotonic_ns = time.monotonic_ns()
     return {
-        "monotonic": time.monotonic(),
+        "monotonic": observed_at_monotonic_ns / 1_000_000_000.0,
+        "monotonic_ns": observed_at_monotonic_ns,
         "cgroup_cpu": cgroup_cpu_usage(),
         "interface": interface_counters(interface),
         "softirq": softirq_totals(),
@@ -369,67 +396,90 @@ def snapshot(interface: str) -> dict[str, Any]:
     }
 
 
-def collect(
+def measurement_boundary(
+    pid: int, workload_pid: int, interface: str
+) -> dict[str, Any]:
+    """Capture one boundary object that adjacent windows can share exactly."""
+
+    observation = snapshot(interface)
+    return {
+        "snapshot": observation,
+        "process_cpu_ticks": process_cpu_ticks(pid),
+        "workload_cpu_ticks": process_cpu_ticks(workload_pid),
+        "process_rss_bytes": process_rss_bytes(pid),
+        "workload_rss_bytes": process_rss_bytes(workload_pid),
+    }
+
+
+def _append_sample(values: list[int], value: Any) -> None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        values.append(value)
+
+
+def _new_window_samples(boundary: dict[str, Any]) -> dict[str, list[int]]:
+    samples: dict[str, list[int]] = {
+        "rss": [],
+        "workload_rss": [],
+        "conntrack": [],
+        "queue_depth": [],
+    }
+    _append_boundary_samples(samples, boundary)
+    return samples
+
+
+def _append_boundary_samples(
+    samples: dict[str, list[int]], boundary: dict[str, Any]
+) -> None:
+    observation = boundary["snapshot"]
+    _append_sample(samples["rss"], boundary.get("process_rss_bytes"))
+    _append_sample(
+        samples["workload_rss"], boundary.get("workload_rss_bytes")
+    )
+    _append_sample(samples["conntrack"], observation.get("conntrack_count"))
+    _append_sample(samples["queue_depth"], observation["nfqueue"].get("depth"))
+
+
+def _append_periodic_samples(
+    samples: dict[str, list[int]], pid: int, workload_pid: int
+) -> None:
+    _append_sample(samples["rss"], process_rss_bytes(pid))
+    _append_sample(samples["workload_rss"], process_rss_bytes(workload_pid))
+    _append_sample(
+        samples["conntrack"],
+        read_int(Path("/proc/sys/net/netfilter/nf_conntrack_count")),
+    )
+    _append_sample(samples["queue_depth"], nfqueue_counters()["depth"])
+
+
+def _metrics_document(
     pid: int,
     workload_pid: int,
-    interface: str,
-    duration: float,
-    interval: float,
-    stop_stream: TextIO | None = None,
+    started: dict[str, Any],
+    finished: dict[str, Any],
+    samples: dict[str, list[int]],
+    stop_reason: str,
 ) -> dict[str, Any]:
-    started = snapshot(interface)
-    ticks_before = process_cpu_ticks(pid)
-    workload_ticks_before = process_cpu_ticks(workload_pid)
-    rss_samples: list[int] = []
-    workload_rss_samples: list[int] = []
-    conntrack_samples: list[int] = []
-    queue_depth_samples: list[int] = []
-    deadline = time.monotonic() + duration
-    stop_reason = "duration_limit"
-    stop_selector: selectors.BaseSelector | None = None
-    if stop_stream is not None:
-        stop_selector = selectors.DefaultSelector()
-        stop_selector.register(stop_stream, selectors.EVENT_READ)
-    try:
-        while True:
-            rss = process_rss_bytes(pid)
-            if rss is not None:
-                rss_samples.append(rss)
-            workload_rss = process_rss_bytes(workload_pid)
-            if workload_rss is not None:
-                workload_rss_samples.append(workload_rss)
-            conntrack = read_int(Path("/proc/sys/net/netfilter/nf_conntrack_count"))
-            if conntrack is not None:
-                conntrack_samples.append(conntrack)
-            depth = nfqueue_counters()["depth"]
-            if depth is not None:
-                queue_depth_samples.append(depth)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            wait = min(interval, remaining)
-            if stop_selector is None:
-                time.sleep(wait)
-                continue
-            if not stop_selector.select(wait):
-                continue
-            command = stop_stream.readline(16)
-            if command != "stop\n":
-                raise RuntimeError("synchronized collector expected one stop line")
-            stop_reason = "requested"
-            break
-    finally:
-        if stop_selector is not None:
-            stop_selector.close()
-    finished = snapshot(interface)
-    ticks_after = process_cpu_ticks(pid)
-    workload_ticks_after = process_cpu_ticks(workload_pid)
-    elapsed = max(float(finished["monotonic"] - started["monotonic"]), 1e-9)
+    started_snapshot = started["snapshot"]
+    finished_snapshot = finished["snapshot"]
+    started_ns = started_snapshot["monotonic_ns"]
+    finished_ns = finished_snapshot["monotonic_ns"]
+    if (
+        isinstance(started_ns, bool)
+        or not isinstance(started_ns, int)
+        or isinstance(finished_ns, bool)
+        or not isinstance(finished_ns, int)
+        or started_ns <= 0
+        or finished_ns < started_ns
+    ):
+        raise RuntimeError("metric boundary monotonic timestamps are invalid")
+    elapsed = max((finished_ns - started_ns) / 1_000_000_000.0, 1e-9)
     clock_ticks = os.sysconf("SC_CLK_TCK")
-    cpu_ticks = ordinary_delta(ticks_before, ticks_after)
+    ticks_after = finished.get("process_cpu_ticks")
+    workload_ticks_after = finished.get("workload_cpu_ticks")
+    cpu_ticks = ordinary_delta(started.get("process_cpu_ticks"), ticks_after)
     cpu_seconds = None if cpu_ticks is None else cpu_ticks / clock_ticks
     workload_cpu_ticks = ordinary_delta(
-        workload_ticks_before, workload_ticks_after
+        started.get("workload_cpu_ticks"), workload_ticks_after
     )
     workload_cpu_seconds = (
         None
@@ -437,46 +487,55 @@ def collect(
         else workload_cpu_ticks / clock_ticks
     )
     cgroup = cgroup_cpu_delta(
-        started.get("cgroup_cpu"), finished.get("cgroup_cpu"), elapsed
+        started_snapshot.get("cgroup_cpu"),
+        finished_snapshot.get("cgroup_cpu"),
+        elapsed,
     )
     network = {
-        name: ordinary_delta(started["interface"].get(name), finished["interface"].get(name))
-        for name in started["interface"]
+        name: ordinary_delta(
+            started_snapshot["interface"].get(name),
+            finished_snapshot["interface"].get(name),
+        )
+        for name in started_snapshot["interface"]
     }
-    queue_before = started["nfqueue"]
-    queue_after = finished["nfqueue"]
+    queue_before = started_snapshot["nfqueue"]
+    queue_after = finished_snapshot["nfqueue"]
     queue = {
-        "hits": counter_delta(queue_before.get("sequence"), queue_after.get("sequence")),
+        "hits": counter_delta(
+            queue_before.get("sequence"), queue_after.get("sequence")
+        ),
         "kernel_dropped": ordinary_delta(
             queue_before.get("kernel_dropped"), queue_after.get("kernel_dropped")
         ),
         "user_dropped": ordinary_delta(
             queue_before.get("user_dropped"), queue_after.get("user_dropped")
         ),
-        "depth_peak": max(queue_depth_samples, default=None),
+        "depth_peak": max(samples["queue_depth"], default=None),
         "depth_end": queue_after.get("depth"),
         "copy_mode": queue_after.get("copy_mode"),
         "copy_range": queue_after.get("copy_range"),
     }
     return {
-        "schema": "openshield.perf.metrics.v1",
+        "schema": METRICS_SCHEMA,
+        "started_at_monotonic_ns": started_ns,
+        "finished_at_monotonic_ns": finished_ns,
         "elapsed_seconds": elapsed,
         "stop_reason": stop_reason,
         "daemon": {
             "pid": pid if pid > 0 else None,
-            "alive_end": process_cpu_ticks(pid) is not None if pid > 0 else None,
+            "alive_end": ticks_after is not None if pid > 0 else None,
             "cpu_seconds": cpu_seconds,
             "cpu_percent_one_core": None
             if cpu_seconds is None
             else cpu_seconds * 100.0 / elapsed,
             "rss_bytes_mean": None
-            if not rss_samples
-            else sum(rss_samples) / len(rss_samples),
-            "rss_bytes_peak": max(rss_samples, default=None),
+            if not samples["rss"]
+            else sum(samples["rss"]) / len(samples["rss"]),
+            "rss_bytes_peak": max(samples["rss"], default=None),
         },
         "workload_process": {
             "pid": workload_pid if workload_pid > 0 else None,
-            "alive_end": process_cpu_ticks(workload_pid) is not None
+            "alive_end": workload_ticks_after is not None
             if workload_pid > 0
             else None,
             "cpu_seconds": workload_cpu_seconds,
@@ -484,9 +543,10 @@ def collect(
             if workload_cpu_seconds is None
             else workload_cpu_seconds * 100.0 / elapsed,
             "rss_bytes_mean": None
-            if not workload_rss_samples
-            else sum(workload_rss_samples) / len(workload_rss_samples),
-            "rss_bytes_peak": max(workload_rss_samples, default=None),
+            if not samples["workload_rss"]
+            else sum(samples["workload_rss"])
+            / len(samples["workload_rss"]),
+            "rss_bytes_peak": max(samples["workload_rss"], default=None),
         },
         "cgroup": cgroup,
         "network": {
@@ -505,21 +565,25 @@ def collect(
             else network["tx_bytes"] * 8.0 / elapsed / 1_000_000.0,
         },
         "softirq": {
-            name: ordinary_delta(started["softirq"].get(name), finished["softirq"].get(name))
-            for name in started["softirq"]
+            name: ordinary_delta(
+                started_snapshot["softirq"].get(name),
+                finished_snapshot["softirq"].get(name),
+            )
+            for name in started_snapshot["softirq"]
         },
         "tcp_retransmits": ordinary_delta(
-            started.get("tcp_retransmits"), finished.get("tcp_retransmits")
+            started_snapshot.get("tcp_retransmits"),
+            finished_snapshot.get("tcp_retransmits"),
         ),
         "udp_errors": counter_group_delta(
-            started["udp_errors"], finished["udp_errors"]
+            started_snapshot["udp_errors"], finished_snapshot["udp_errors"]
         ),
         "tcp_listen": counter_group_delta(
-            started["tcp_listen"], finished["tcp_listen"]
+            started_snapshot["tcp_listen"], finished_snapshot["tcp_listen"]
         ),
-        "conntrack_count_start": started.get("conntrack_count"),
-        "conntrack_count_end": finished.get("conntrack_count"),
-        "conntrack_count_peak": max(conntrack_samples, default=None),
+        "conntrack_count_start": started_snapshot.get("conntrack_count"),
+        "conntrack_count_end": finished_snapshot.get("conntrack_count"),
+        "conntrack_count_peak": max(samples["conntrack"], default=None),
         "nfqueue": queue,
         "scope_notes": {
             "softirq": "host-wide kernel counters; compare paired baselines",
@@ -527,6 +591,165 @@ def collect(
             "nfqueue_log_errors": "not included; daemon throttling makes log counts lower bounds",
         },
     }
+
+
+def decode_control_command(
+    line: bytes, allowed_commands: frozenset[str]
+) -> str:
+    """Decode one small, newline-terminated ASCII command with an exact allowlist."""
+
+    if (
+        not line
+        or len(line) > MAX_CONTROL_COMMAND_CHARACTERS
+        or not line.endswith(b"\n")
+        or line.count(b"\n") != 1
+    ):
+        raise RuntimeError("metric control command is malformed or oversized")
+    try:
+        command = line[:-1].decode("ascii", errors="strict")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("metric control command must be ASCII") from error
+    if command not in allowed_commands:
+        raise RuntimeError("metric control command is not allowed in this state")
+    return command
+
+
+class ControlChannel:
+    """Bounded, non-buffering command reader for the synchronized protocol."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._descriptor = stream.fileno()
+        self._buffer = bytearray()
+        self._eof = False
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._descriptor, selectors.EVENT_READ)
+
+    def close(self) -> None:
+        self._selector.close()
+
+    def _buffered_command(
+        self, allowed_commands: frozenset[str]
+    ) -> str | None:
+        newline = self._buffer.find(b"\n")
+        if newline >= 0:
+            end = newline + 1
+            raw = bytes(self._buffer[:end])
+            del self._buffer[:end]
+            return decode_control_command(raw, allowed_commands)
+        if len(self._buffer) >= MAX_CONTROL_COMMAND_CHARACTERS:
+            raise RuntimeError("metric control command is malformed or oversized")
+        if self._eof:
+            if self._buffer:
+                raise RuntimeError("metric control command is not newline terminated")
+            raise RuntimeError("metric control channel closed before a command")
+        return None
+
+    def read_command(
+        self, allowed_commands: frozenset[str], timeout: float | None
+    ) -> str | None:
+        """Return one command, or ``None`` after the bounded polling interval."""
+
+        if timeout is not None and timeout < 0:
+            raise RuntimeError("metric control timeout must be nonnegative")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            command = self._buffered_command(allowed_commands)
+            if command is not None:
+                return command
+            wait = (
+                None
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            if wait == 0.0 or not self._selector.select(wait):
+                return None
+            try:
+                chunk = os.read(
+                    self._descriptor, MAX_CONTROL_COMMAND_CHARACTERS + 1
+                )
+            except BlockingIOError:
+                continue
+            if chunk:
+                self._buffer.extend(chunk)
+            else:
+                self._eof = True
+
+
+def collect(
+    pid: int,
+    workload_pid: int,
+    interface: str,
+    duration: float,
+    interval: float,
+    control_channel: ControlChannel | None = None,
+    split_callback: Callable[[int, dict[str, Any]], None] | None = None,
+    initial_boundary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    started = (
+        measurement_boundary(pid, workload_pid, interface)
+        if initial_boundary is None
+        else initial_boundary
+    )
+    samples = _new_window_samples(started)
+    started_ns = started.get("snapshot", {}).get("monotonic_ns")
+    if (
+        isinstance(started_ns, bool)
+        or not isinstance(started_ns, int)
+        or started_ns <= 0
+    ):
+        raise RuntimeError("initial metric boundary has no valid monotonic timestamp")
+    deadline = started_ns / 1_000_000_000.0 + duration
+    stop_reason = "duration_limit"
+    split_seen = False
+    while True:
+        _append_periodic_samples(samples, pid, workload_pid)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait = min(interval, remaining)
+        if control_channel is None:
+            time.sleep(wait)
+            continue
+        command = control_channel.read_command(
+            frozenset({"split", "stop"}), wait
+        )
+        if command is None:
+            continue
+        if command == "stop":
+            stop_reason = "requested"
+            break
+        if split_seen:
+            raise RuntimeError("synchronized collector permits at most one split")
+        if split_callback is None:
+            raise RuntimeError("synchronized collector has no split handler")
+        boundary = measurement_boundary(pid, workload_pid, interface)
+        _append_boundary_samples(samples, boundary)
+        first_document = _metrics_document(
+            pid,
+            workload_pid,
+            started,
+            boundary,
+            samples,
+            "split_boundary",
+        )
+        boundary_ns = boundary["snapshot"]["monotonic_ns"]
+        split_callback(boundary_ns, first_document)
+        # The exact same object is both the finished state above and the
+        # started state below. No counter read or timestamp can fall into a
+        # hand-off gap between the adjacent measurement windows.
+        started = boundary
+        samples = _new_window_samples(boundary)
+        split_seen = True
+    finished = measurement_boundary(pid, workload_pid, interface)
+    _append_boundary_samples(samples, finished)
+    return _metrics_document(
+        pid,
+        workload_pid,
+        started,
+        finished,
+        samples,
+        stop_reason,
+    )
 
 
 def main() -> int:
@@ -550,31 +773,92 @@ def main() -> int:
         parser.error("invalid interface")
     if arguments.pid < 0 or arguments.workload_pid < 0:
         parser.error("process identifiers must be nonnegative")
+    split_callback: Callable[[int, dict[str, Any]], None] | None = None
+    control_channel: ControlChannel | None = None
+    initial_boundary: dict[str, Any] | None = None
     if arguments.synchronize:
+        control_channel = ControlChannel(sys.stdin.buffer)
         print(
             json.dumps(
-                {"schema": CONTROL_SCHEMA, "event": "ready"},
+                {
+                    "schema": CONTROL_SCHEMA,
+                    "event": "ready",
+                    **self_process_identity(),
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             ),
             flush=True,
         )
-        command = sys.stdin.readline(16)
-        if command != "start\n":
-            parser.error("synchronized collector expected one start line")
-    print(
-        json.dumps(
-            collect(
-                arguments.pid,
-                arguments.workload_pid,
-                arguments.interface,
-                arguments.duration,
-                arguments.interval,
-                sys.stdin if arguments.synchronize else None,
-            ),
-            sort_keys=True,
-            separators=(",", ":"),
+        try:
+            start_command = control_channel.read_command(
+                frozenset({"start"}), MAX_CONTROL_START_WAIT_SECONDS
+            )
+            if start_command is None:
+                raise RuntimeError(
+                    "metric control start command exceeded its bounded deadline"
+                )
+            initial_boundary = measurement_boundary(
+                arguments.pid, arguments.workload_pid, arguments.interface
+            )
+            boundary_monotonic_ns = initial_boundary["snapshot"]["monotonic_ns"]
+            print(
+                json.dumps(
+                    {
+                        "schema": CONTROL_SCHEMA,
+                        "event": "start",
+                        "boundary_monotonic_ns": boundary_monotonic_ns,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+        except RuntimeError as error:
+            control_channel.close()
+            parser.error(str(error))
+
+        def emit_split(
+            boundary_monotonic_ns: int, first_document: dict[str, Any]
+        ) -> None:
+            print(
+                json.dumps(
+                    {
+                        "schema": CONTROL_SCHEMA,
+                        "event": "split",
+                        "boundary_monotonic_ns": boundary_monotonic_ns,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    first_document,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+
+        split_callback = emit_split
+    try:
+        document = collect(
+            arguments.pid,
+            arguments.workload_pid,
+            arguments.interface,
+            arguments.duration,
+            arguments.interval,
+            control_channel,
+            split_callback,
+            initial_boundary,
         )
+    finally:
+        if control_channel is not None:
+            control_channel.close()
+    print(
+        json.dumps(document, sort_keys=True, separators=(",", ":")), flush=True
     )
     return 0
 

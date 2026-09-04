@@ -29,6 +29,7 @@ if __package__ in (None, ""):
         WorkBudget,
         WorkloadStats,
         apply_config_file,
+        announce_control_process,
         base_client_arguments,
         base_server_arguments,
         bounded_mix_converter,
@@ -44,6 +45,7 @@ if __package__ in (None, ""):
         safe_error,
         socket_address,
         wait_for_start_gate,
+        wait_for_release_gate,
     )
 else:
     from .common import (
@@ -57,6 +59,7 @@ else:
         WorkBudget,
         WorkloadStats,
         apply_config_file,
+        announce_control_process,
         base_client_arguments,
         base_server_arguments,
         bounded_mix_converter,
@@ -72,6 +75,7 @@ else:
         safe_error,
         socket_address,
         wait_for_start_gate,
+        wait_for_release_gate,
     )
 
 
@@ -571,6 +575,13 @@ class TcpWorkloadClient:
             self.stats.scheduler_lag_ms,
         )
         self._family, _address = socket_address(config.host, config.port)
+
+    def arm(self) -> int:
+        """Reset time-based state after the external measurement gate opens."""
+
+        self.deadline = time.monotonic() + self.config.duration
+        self.limiter.arm()
+        return self.stats.arm()
 
     def _connection_lifetime_generator(self, worker_id: int) -> random.Random:
         """Return a deterministic RNG isolated from payload/response selection."""
@@ -1146,13 +1157,22 @@ def run_server(config: TcpServerConfig) -> int:
 
 def run_client(config: TcpClientConfig, start_gate_stdin: bool = False) -> int:
     stop = threading.Event()
-    install_stop_handlers(stop)
-    wait_for_start_gate(start_gate_stdin, stop, "tcp")
+    control_stop = threading.Event()
+    install_stop_handlers(stop, control_stop)
+    identity = announce_control_process(start_gate_stdin, "tcp")
     client = TcpWorkloadClient(config, stop)
+    wait_for_start_gate(
+        start_gate_stdin,
+        control_stop,
+        "tcp",
+        on_start=client.arm,
+        identity=identity,
+    )
     summary = client.run()
     summary["request_ops_per_second"] = summary["application_ops_per_second"]
     rate_model = client.target_rate_model()
-    emit_json(
+    succeeded = summary.get("operations", 0) > 0 and summary.get("errors", 0) == 0
+    summary_document = emit_json(
         "summary",
         role="client",
         transport="tcp",
@@ -1193,10 +1213,18 @@ def run_client(config: TcpClientConfig, start_gate_stdin: bool = False) -> int:
             "mss": config.mss,
             **rate_model,
         },
-        ok=summary.get("operations", 0) > 0 and summary.get("errors", 0) == 0,
+        ok=succeeded,
         metrics=summary,
     )
-    return 0 if summary.get("operations", 0) > 0 else 2
+    exit_code = 0 if summary.get("operations", 0) > 0 else 2
+    wait_for_release_gate(
+        start_gate_stdin,
+        control_stop,
+        "tcp",
+        summary_document,
+        exit_code,
+    )
+    return exit_code
 
 
 def main(argv=None) -> int:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import json
 import os
 from pathlib import Path
@@ -440,6 +441,40 @@ class ProtocolUnitTests(unittest.TestCase):
         self.assertEqual(tcp.RESPONSE_HEADER.size, 44)
         self.assertEqual(udp.REQUEST_HEADER.size, 40)
         self.assertEqual(udp.RESPONSE_HEADER.size, 52)
+
+    def test_udp_send_failures_have_explicit_errno_classes(self) -> None:
+        client = udp.UdpWorkloadClient(
+            udp.UdpClientConfig(
+                host="127.0.0.1",
+                port=9,
+                duration=1.0,
+                operations=1,
+                seed=17,
+                pps=0.0,
+                mbps=0.0,
+                io_timeout=0.1,
+                latency_samples=8,
+                flows=1,
+                reply_every=0,
+                request_bytes=16,
+                response_mix=common.WeightedMix.fixed(0),
+                socket_buffer_bytes=64 * 1024,
+            )
+        )
+        client._record_send_failure("data", asyncio.TimeoutError())
+        client._record_send_failure("data", OSError(errno.ENOBUFS, "full"))
+        client._record_send_failure("barrier", OSError(errno.EAGAIN, "wait"))
+        client._record_send_failure("barrier", OSError(errno.EIO, "I/O"))
+        summary = client.stats.summary()
+        self.assertEqual(summary["data_send_failures"], 2)
+        self.assertEqual(summary["data_send_timeouts"], 1)
+        self.assertEqual(summary["data_send_enobufs"], 1)
+        self.assertEqual(summary["data_send_would_block"], 0)
+        self.assertEqual(summary["barrier_send_failures"], 2)
+        self.assertEqual(summary["barrier_send_would_block"], 1)
+        self.assertEqual(summary["barrier_send_other_os_errors"], 1)
+        with self.assertRaisesRegex(ValueError, "scope"):
+            client._record_send_failure("unknown", OSError(errno.EIO, "I/O"))
 
     def test_target_rate_models_convert_wire_caps_to_application_ops(self) -> None:
         tcp_client = tcp.TcpWorkloadClient(
@@ -1180,6 +1215,8 @@ class StandaloneProcessTests(unittest.TestCase):
         for script, server_arguments, payload in cases:
             with self.subTest(script=script.name):
                 server, port = self._start_server(script, server_arguments)
+                process = None
+                metric = None
                 try:
                     with tempfile.TemporaryDirectory() as directory:
                         config_path = Path(directory) / "start-gated-client.json"
@@ -1207,19 +1244,99 @@ class StandaloneProcessTests(unittest.TestCase):
                         assert process.stdin is not None
                         readable, _, _ = select.select([process.stdout], [], [], 3.0)
                         self.assertTrue(readable, "client did not publish start readiness")
+                        spawned = json.loads(process.stdout.readline())
+                        self.assertEqual(spawned["event"], "spawned")
+                        self.assertEqual(spawned["role"], "client")
+                        self.assertEqual(
+                            spawned["control_protocol"],
+                            "stdin_start_finish_release_v2",
+                        )
                         ready = json.loads(process.stdout.readline())
                         self.assertEqual(ready["event"], "ready")
                         self.assertEqual(ready["role"], "client")
-                        self.assertEqual(ready["start_gate"], "stdin_line_v1")
+                        self.assertEqual(
+                            ready["control_protocol"],
+                            "stdin_start_finish_release_v2",
+                        )
+                        for field in ("pid", "starttime", "executable", "uid"):
+                            self.assertEqual(ready[field], spawned[field])
                         self.assertIsNone(process.poll())
+                        metric = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-S",
+                                str(WORKLOAD_DIRECTORY.parent / "metrics.py"),
+                                "--pid",
+                                "0",
+                                "--workload-pid",
+                                str(ready["pid"]),
+                                "--interface",
+                                "lo",
+                                "--duration",
+                                "10",
+                                "--interval",
+                                "0.02",
+                                "--synchronize",
+                            ],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            bufsize=1,
+                        )
+                        assert metric.stdin is not None
+                        assert metric.stdout is not None
+                        metric_ready = json.loads(metric.stdout.readline())
+                        self.assertEqual(metric_ready["event"], "ready")
+                        metric.stdin.write("start\n")
+                        metric.stdin.flush()
+                        metric_started = json.loads(metric.stdout.readline())
+                        self.assertEqual(metric_started["event"], "start")
                         process.stdin.write("start\n")
                         process.stdin.flush()
+                        started = json.loads(process.stdout.readline())
+                        self.assertEqual(started["event"], "started")
+                        self.assertGreater(started["boundary_monotonic_ns"], 0)
+                        summary = json.loads(process.stdout.readline())
+                        finished = json.loads(process.stdout.readline())
+                        self.assertEqual(finished["event"], "finished")
+                        self.assertEqual(finished["hold"], "awaiting_release")
+                        self.assertIsNone(process.poll())
+                        metric.stdin.write("stop\n")
+                        metric.stdin.flush()
+                        metric.stdin.close()
+                        metric.stdin = None
+                        metric_document = json.loads(metric.stdout.readline())
+                        _metric_stdout, metric_stderr = metric.communicate(timeout=5.0)
+                        self.assertEqual(metric.returncode, 0, metric_stderr)
+                        self.assertEqual(
+                            metric_document["workload_process"]["pid"], ready["pid"]
+                        )
+                        self.assertTrue(
+                            metric_document["workload_process"]["alive_end"]
+                        )
+                        self.assertIsNotNone(
+                            metric_document["workload_process"]["cpu_seconds"]
+                        )
+                        self.assertGreater(
+                            metric_document["workload_process"]["rss_bytes_peak"], 0
+                        )
+                        process.stdin.write("release\n")
+                        process.stdin.flush()
+                        released = json.loads(process.stdout.readline())
+                        self.assertEqual(released["event"], "released")
                         stdout, stderr = process.communicate(timeout=5.0)
                         self.assertEqual(process.returncode, 0, stderr)
-                        summary = json.loads(stdout)
+                        self.assertEqual(stdout, "")
                         self.assertEqual(summary["event"], "summary")
                         self.assertTrue(summary["ok"])
                 finally:
+                    for child in (metric, process):
+                        if child is not None and child.poll() is None:
+                            child.kill()
+                            child.communicate(timeout=2.0)
                     self._stop_server(server)
 
 

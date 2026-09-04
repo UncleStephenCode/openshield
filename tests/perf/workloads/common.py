@@ -24,6 +24,9 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequ
 
 
 SCHEMA = "openshield.perf.workload.v1"
+CONTROL_PROTOCOL = "stdin_start_finish_release_v2"
+CONTROL_TIMEOUT_SECONDS = 120.0
+MAX_CONTROL_COMMAND_BYTES = 16
 MAX_DURATION_SECONDS = 3_600.0
 MAX_CONCURRENCY = 512
 # A TCP client can briefly have a replacement connection accepted before the
@@ -349,6 +352,21 @@ class WorkloadStats:
         self._active_integral = 0.0
         self._active_updated = self.wall_started
 
+    def arm(self) -> int:
+        """Start accounting immediately before the controller releases load."""
+
+        with self._lock:
+            if (
+                any(self._counters.values())
+                or self._active_current
+                or self._active_integral
+            ):
+                raise RuntimeError("workload statistics cannot be re-armed after use")
+            self.wall_started = time.monotonic()
+            self.cpu_started = time.process_time()
+            self._active_updated = self.wall_started
+        return time.monotonic_ns()
+
     def add(self, **values: int) -> None:
         with self._lock:
             for name, value in values.items():
@@ -487,6 +505,12 @@ class AsyncMultiRateLimiter:
         self._lag_samples = lag_samples
         self._lock = asyncio.Lock()
 
+    def arm(self) -> None:
+        """Discard pre-start idle time without changing configured rate limits."""
+
+        now = time.monotonic()
+        self._next = {name: now for name in self._rates}
+
     async def acquire(
         self,
         costs: Mapping[str, float],
@@ -543,20 +567,71 @@ class WorkBudget:
             return True
 
 
-def install_stop_handlers(stop: threading.Event) -> None:
+def install_stop_handlers(
+    stop: threading.Event, *additional_stops: threading.Event
+) -> None:
     """Translate SIGINT/SIGTERM into cooperative shutdown in the main process."""
 
     def request_stop(_signum, _frame) -> None:
         stop.set()
+        for additional in additional_stops:
+            additional.set()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
 
-def emit_json(event: str, **fields) -> None:
+def emit_json(event: str, **fields) -> dict:
     document = {"schema": SCHEMA, "event": event}
     document.update(fields)
     print(json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False), flush=True)
+    return document
+
+
+def canonical_document_sha256(document: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def process_identity() -> dict:
+    """Return the minimum immutable identity needed for PID-reuse-safe control."""
+
+    pid = os.getpid()
+    with open(f"/proc/{pid}/stat", "r", encoding="ascii") as stat_file:
+        stat_text = stat_file.read(4096)
+    closing = stat_text.rfind(")")
+    fields = stat_text[closing + 2 :].split() if closing >= 0 else []
+    if len(fields) <= 19:
+        raise RuntimeError("cannot read workload process starttime")
+    starttime = int(fields[19], 10)
+    executable = os.readlink(f"/proc/{pid}/exe")
+    if starttime <= 0 or not executable.startswith("/"):
+        raise RuntimeError("workload process identity is invalid")
+    return {
+        "pid": pid,
+        "starttime": starttime,
+        "executable": executable,
+        "uid": os.getuid(),
+    }
+
+
+def announce_control_process(enabled: bool, transport: str) -> dict | None:
+    """Publish identity before bounded client preparation can begin."""
+
+    if not enabled:
+        return None
+    identity = process_identity()
+    emit_json(
+        "spawned",
+        role="client",
+        transport=transport,
+        control_protocol=CONTROL_PROTOCOL,
+        boundary_monotonic_ns=time.monotonic_ns(),
+        **identity,
+    )
+    return identity
 
 
 def base_client_arguments(parser: argparse.ArgumentParser) -> None:
@@ -613,38 +688,122 @@ def base_client_arguments(parser: argparse.ArgumentParser) -> None:
 
 def wait_for_start_gate(
     enabled: bool,
-    stop: threading.Event,
+    control_stop: threading.Event,
     transport: str,
-    timeout: float = 30.0,
-) -> None:
-    """Synchronize a validated client with a bounded external load controller."""
+    on_start=None,
+    identity: Mapping[str, object] | None = None,
+    timeout: float = CONTROL_TIMEOUT_SECONDS,
+) -> dict | None:
+    """Synchronize a prepared client with a bounded external load controller."""
 
     if not enabled:
-        return
+        if on_start is not None:
+            on_start()
+        return None
+    identity = dict(identity) if identity is not None else process_identity()
     emit_json(
         "ready",
         role="client",
         transport=transport,
-        pid=os.getpid(),
-        start_gate="stdin_line_v1",
+        control_protocol=CONTROL_PROTOCOL,
+        **identity,
     )
     selector = selectors.DefaultSelector()
-    selector.register(sys.stdin, selectors.EVENT_READ)
+    input_fd = sys.stdin.fileno()
+    selector.register(input_fd, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout
+    buffered = bytearray()
     try:
-        while not stop.is_set():
+        while not control_stop.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("client start gate timed out")
             if not selector.select(min(0.2, remaining)):
                 continue
-            command = sys.stdin.readline(16)
-            if command != "start\n":
+            chunk = os.read(input_fd, MAX_CONTROL_COMMAND_BYTES + 1)
+            if not chunk:
+                raise RuntimeError("client start gate closed before start")
+            buffered.extend(chunk)
+            if len(buffered) > MAX_CONTROL_COMMAND_BYTES:
+                raise RuntimeError("client start gate command exceeded its bound")
+            if b"\n" not in buffered:
+                continue
+            if bytes(buffered) != b"start\n":
                 raise RuntimeError("client start gate expected one exact start line")
-            return
+            if on_start is not None:
+                on_start()
+            started = {
+                **identity,
+                "role": "client",
+                "transport": transport,
+                "control_protocol": CONTROL_PROTOCOL,
+                "boundary_monotonic_ns": time.monotonic_ns(),
+            }
+            emit_json("started", **started)
+            return {"schema": SCHEMA, "event": "started", **started}
     finally:
         selector.close()
     raise RuntimeError("client start gate was interrupted")
+
+
+def wait_for_release_gate(
+    enabled: bool,
+    control_stop: threading.Event,
+    transport: str,
+    summary_document: Mapping[str, object],
+    exit_code: int,
+    timeout: float = CONTROL_TIMEOUT_SECONDS,
+) -> dict | None:
+    """Publish terminal evidence and keep `/proc` accounting live until release."""
+
+    if not enabled:
+        return None
+    identity = process_identity()
+    finished = {
+        **identity,
+        "role": "client",
+        "transport": transport,
+        "control_protocol": CONTROL_PROTOCOL,
+        "boundary_monotonic_ns": time.monotonic_ns(),
+        "summary_sha256": canonical_document_sha256(summary_document),
+        "exit_code": exit_code,
+        "hold": "awaiting_release",
+    }
+    emit_json("finished", **finished)
+    selector = selectors.DefaultSelector()
+    input_fd = sys.stdin.fileno()
+    selector.register(input_fd, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    buffered = bytearray()
+    try:
+        while not control_stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("client release gate timed out")
+            if not selector.select(min(0.2, remaining)):
+                continue
+            chunk = os.read(input_fd, MAX_CONTROL_COMMAND_BYTES + 1)
+            if not chunk:
+                raise RuntimeError("client release gate closed before release")
+            buffered.extend(chunk)
+            if len(buffered) > MAX_CONTROL_COMMAND_BYTES:
+                raise RuntimeError("client release gate command exceeded its bound")
+            if b"\n" not in buffered:
+                continue
+            if bytes(buffered) != b"release\n":
+                raise RuntimeError("client release gate expected one exact release line")
+            released = {
+                **identity,
+                "role": "client",
+                "transport": transport,
+                "control_protocol": CONTROL_PROTOCOL,
+                "boundary_monotonic_ns": time.monotonic_ns(),
+            }
+            emit_json("released", **released)
+            return {"schema": SCHEMA, "event": "released", **released}
+    finally:
+        selector.close()
+    raise RuntimeError("client release gate was interrupted")
 
 
 def base_server_arguments(parser: argparse.ArgumentParser) -> None:

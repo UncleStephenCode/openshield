@@ -5,8 +5,8 @@ umask 077
 export LC_ALL=C.UTF-8
 export PYTHONDONTWRITEBYTECODE=1
 
-readonly MAX_TIMEOUT_SECONDS=900
-readonly MAX_JSON_BYTES=$((8 * 1024 * 1024))
+readonly MAX_TIMEOUT_SECONDS=1200
+readonly MAX_JSON_BYTES=$((12 * 1024 * 1024))
 readonly MAX_CSV_BYTES=$((16 * 1024 * 1024))
 readonly MAX_MARKDOWN_BYTES=$((512 * 1024))
 readonly MAX_LOG_BYTES=$((16 * 1024 * 1024))
@@ -194,7 +194,7 @@ run_token=$(python3 -I -B -S -c 'import secrets; print(secrets.token_hex(16))') 
 readonly run_token
 
 timeout_seconds=${PERF_TIMEOUT_SECONDS:-$MAX_TIMEOUT_SECONDS}
-[[ "$timeout_seconds" =~ ^[1-9][0-9]{1,2}$ ]] \
+[[ "$timeout_seconds" =~ ^[1-9][0-9]{1,3}$ ]] \
     || fail 'PERF_TIMEOUT_SECONDS must be a decimal integer without leading zeroes'
 (( timeout_seconds >= 30 && timeout_seconds <= MAX_TIMEOUT_SECONDS )) \
     || fail "PERF_TIMEOUT_SECONDS must be between 30 and $MAX_TIMEOUT_SECONDS"
@@ -223,6 +223,11 @@ set +e
                 printf 'performance CI smoke: bounded failure summary: '
                 jq -c '
                     def short: if type == "string" then .[0:2048] else . end;
+                    def reasons:
+                        if type == "array"
+                        then [.[0:16][] | short]
+                        else []
+                        end;
                     {
                         schema,
                         valid,
@@ -233,20 +238,54 @@ set +e
                             status,
                             reason: ((.reason // null) | short)
                         }] | .[0:8]),
-                        failed_results: ([.results[]?
-                            | select(.valid != true or .passed != true)
+                        environment_consistency: {
+                            valid: (.environment_consistency.valid // null),
+                            failure_reasons: (
+                                (.environment_consistency.failure_reasons // [])
+                                | reasons
+                            )
+                        },
+                        baseline_pairing: {
+                            valid: (.baseline_pairing.valid // null),
+                            strategy: (.baseline_pairing.strategy // null),
+                            failure_reasons: (
+                                (.baseline_pairing.failure_reasons // [])
+                                | reasons
+                            ),
+                            baseline_sample_count: (
+                                .baseline_pairing.baseline_sample_count // null
+                            ),
+                            comparison_count: (
+                                .baseline_pairing.comparison_count // null
+                            ),
+                            orders: (.baseline_pairing.orders // null),
+                            maximum_gap_seconds: (
+                                .baseline_pairing.maximum_gap_seconds // null
+                            )
+                        },
+                        invalid_results: ([.results[]?
+                            | select(.valid != true)
                             | {
                                 backend,
                                 policy,
                                 mode,
                                 profile,
                                 phase,
+                                baseline_sample_id,
+                                comparison_order,
+                                execution_sequence,
+                                topology_role,
                                 valid,
                                 passed,
-                                unreliable_reasons,
-                                failure_reasons,
-                                safety_failure_reasons,
-                                relative_performance_failure_reasons
+                                unreliable_reasons: (
+                                    (.unreliable_reasons // []) | reasons
+                                ),
+                                failure_reasons: (
+                                    (.failure_reasons // []) | reasons
+                                ),
+                                safety_failure_reasons: (
+                                    (.safety_failure_reasons // []) | reasons
+                                )
                             }
                         ] | .[0:20]),
                         failed_overload: ([.overload_results[]?
@@ -256,12 +295,61 @@ set +e
                                 transport,
                                 valid,
                                 passed,
-                                saturation,
-                                validity_failure_reasons,
-                                safety_failure_reasons,
-                                recovery_failure_reasons
+                                saturation: {
+                                    proven: (.saturation.proven // null),
+                                    minimum_nfqueue_drops: (
+                                        .saturation.minimum_nfqueue_drops // null
+                                    ),
+                                    stall_drop_delta: (
+                                        .saturation.stall_drop_delta // null
+                                    ),
+                                    nfqueue_depth_peak: (
+                                        .saturation.nfqueue_depth_peak // null
+                                    )
+                                },
+                                resource_validity,
+                                validity_failure_reasons: (
+                                    (.validity_failure_reasons // []) | reasons
+                                ),
+                                safety_failure_reasons: (
+                                    (.safety_failure_reasons // []) | reasons
+                                ),
+                                recovery_failure_reasons: (
+                                    (.recovery_failure_reasons // []) | reasons
+                                )
                             }
-                        ] | .[0:8])
+                        ] | .[0:8]),
+                        relative_failure_counts: (
+                            [.results[]?
+                                | .relative_performance_failure_reasons[]?]
+                            | sort
+                            | group_by(.)
+                            | map({reason: .[0], count: length})
+                        ),
+                        failed_results: ([.results[]?
+                            | select(.valid == true and .passed != true)
+                            | {
+                                backend,
+                                policy,
+                                mode,
+                                profile,
+                                phase,
+                                baseline_sample_id,
+                                comparison_order,
+                                execution_sequence,
+                                topology_role,
+                                failure_reasons: (
+                                    (.failure_reasons // []) | reasons
+                                ),
+                                safety_failure_reasons: (
+                                    (.safety_failure_reasons // []) | reasons
+                                ),
+                                relative_performance_failure_reasons: (
+                                    (.relative_performance_failure_reasons // [])
+                                    | reasons
+                                )
+                            }
+                        ] | .[0:12])
                     }
                 ' "$report_json" || printf '%s\n' 'report.json is malformed'
             else
@@ -334,9 +422,59 @@ case "$allow_unsupported_iptables" in
 esac
 
 jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
+    def nonnegative_integer:
+        type == "number" and . >= 0 and floor == .;
+    def zero_network_errors:
+        ([
+            .network.rx_dropped,
+            .network.tx_dropped,
+            .network.rx_errors,
+            .network.tx_errors
+        ] | all(.[]; nonnegative_integer and . == 0));
+    def zero_udp_errors:
+        ([
+            .udp_errors.in_errors,
+            .udp_errors.rcvbuf_errors,
+            .udp_errors.sndbuf_errors
+        ] | all(.[]; nonnegative_integer and . == 0));
+    def zero_tcp_listen_errors:
+        ([
+            .tcp_listen.listen_drops,
+            .tcp_listen.listen_overflows
+        ] | all(.[]; nonnegative_integer and . == 0));
+    def ordered_positive_timestamps:
+        . as $values
+        | (all(.[]; nonnegative_integer and . > 0))
+        and all(range(0; length - 1);
+            . as $index | $values[$index] <= $values[$index + 1]);
+    def u32_counter_delta($before; $after):
+        if (($before | nonnegative_integer and . < 4294967296)
+            and ($after | nonnegative_integer and . < 4294967296))
+        then (if $after >= $before
+              then $after - $before
+              else 4294967296 - $before + $after
+              end)
+        else null
+        end;
+    def metric_start:
+        type == "object"
+        and keys == ["boundary_monotonic_ns", "event", "schema"]
+        and .schema == "openshield.perf.metrics.control.v2"
+        and .event == "start"
+        and (.boundary_monotonic_ns | nonnegative_integer and . > 0);
+    def pinned_process($uid):
+        (.pid | nonnegative_integer and . > 0)
+        and (.starttime | nonnegative_integer and . > 0)
+        and (.uid | nonnegative_integer and . == $uid)
+        and (.executable | type == "string" and startswith("/") and length <= 4096);
+    def same_process($left; $right):
+        $left.pid == $right.pid
+        and $left.starttime == $right.starttime
+        and $left.executable == $right.executable
+        and $left.uid == $right.uid;
     . as $report
     | type == "object"
-    and .schema == "openshield.perf.report.v1"
+    and .schema == "openshield.perf.report.v2"
     and .valid == true
     and .passed == true
     and .criteria == .configuration.criteria
@@ -394,6 +532,43 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         | type == "array" and length == 0)
     and .environment_consistency.package_delta.full_manifest_equality_required
         == false
+    and (.baseline_pairing | type == "object")
+    and .baseline_pairing.schema
+        == "openshield.perf.baseline-pairing.v1"
+    and .baseline_pairing.strategy == "nearest_pristine_ab_ba"
+    and .baseline_pairing.valid == true
+    and (.baseline_pairing.failure_reasons
+        | type == "array" and length == 0)
+    and (.baseline_pairing.baseline_environments
+        | type == "array" and length == 2)
+    and (([.baseline_pairing.baseline_environments[].backend] | sort)
+        == ["iptables", "nftables"])
+    and all(.baseline_pairing.baseline_environments[];
+        . as $baseline_environment
+        | any($report.environments[]; . == $baseline_environment))
+    and (.baseline_pairing.environment_pairs
+        | type == "array" and length == 2)
+    and (([.baseline_pairing.environment_pairs[].backend] | sort)
+        == ["iptables", "nftables"])
+    and all(.baseline_pairing.environment_pairs[];
+        .valid == true
+        and (.failure_reasons | type == "array" and length == 0)
+        and (.baseline_client_id
+            | type == "string" and test("^[0-9a-f]{64}$"))
+        and (.protected_client_id
+            | type == "string" and test("^[0-9a-f]{64}$"))
+        and .baseline_client_id != .protected_client_id
+        and .baseline_daemon_started == false)
+    and (.baseline_pairing.baseline_sample_count
+        | nonnegative_integer and . > 0)
+    and (.baseline_pairing.comparison_count
+        | nonnegative_integer and . > 0)
+    and (.baseline_pairing.orders | type == "object")
+    and (.baseline_pairing.orders | keys) == ["ab", "ba"]
+    and (.baseline_pairing.orders.ab | nonnegative_integer and . > 0)
+    and (.baseline_pairing.orders.ba | nonnegative_integer and . > 0)
+    and (.baseline_pairing.maximum_gap_seconds
+        | type == "number" and . >= 0)
     and (.backends | type == "array")
     and (([.backends[].name] | sort) == ["iptables", "nftables"])
     and all(.backends[];
@@ -410,8 +585,33 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and (.overload_results | type == "array")
     and all(.overload_results[];
         . as $overload
+        | .resource_validity.controlled_udp_send_backpressure as $backpressure
+        | .pressure_workload.metrics as $pressure
+        | .metric_starts as $metric_starts
+        | ([
+            $metric_starts.dut.boundary_monotonic_ns,
+            $metric_starts.peer.boundary_monotonic_ns,
+            $metric_starts.canary.boundary_monotonic_ns,
+            .saturation.snapshot_before_stop.observed_at_monotonic_ns,
+            .saturation.stopped_at_monotonic_ns,
+            .saturation.snapshot_at_barrier.observed_at_monotonic_ns
+        ] + ([.identity_probe_during_stall.attempts[]? | [
+            .liveness_before.started_at_monotonic_ns,
+            .liveness_before.completed_at_monotonic_ns,
+            .nfqueue_before.observed_at_monotonic_ns,
+            .started_at_monotonic_ns,
+            .completed_at_monotonic_ns,
+            .nfqueue_after.observed_at_monotonic_ns,
+            .liveness_after.started_at_monotonic_ns,
+            .liveness_after.completed_at_monotonic_ns
+        ]] | add // []) + [
+            .saturation.pressure_reaped_at_monotonic_ns,
+            .saturation.snapshot_before_continue.observed_at_monotonic_ns,
+            .saturation.continued_at_monotonic_ns,
+            .saturation.metric_boundary_monotonic_ns
+        ]) as $overload_timeline
         | type == "object"
-        and .schema == "openshield.perf.overload.v1"
+        and .schema == "openshield.perf.overload.v2"
         and (.backend == "iptables" or .backend == "nftables")
         and (.transport == "tcp" or .transport == "udp")
         and .mode == "enforcing"
@@ -420,19 +620,237 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         and .safety_pass == true
         and .resource_validity.valid == true
         and (.resource_validity.failure_reasons | type == "array" and length == 0)
+        and ($backpressure | type == "object")
+        and ($backpressure.applicable == ($overload.transport == "udp"))
+        and ($backpressure.dut_sndbuf_errors
+            == $overload.dut_metrics.udp_errors.sndbuf_errors)
+        and ($backpressure.dut_sndbuf_errors | nonnegative_integer)
+        and ($backpressure.stall_kernel_drop_delta
+            == $overload.saturation.stall_drop_delta.kernel_dropped)
+        and ($backpressure.stall_kernel_drop_delta | nonnegative_integer)
+        and ($backpressure.scope | type == "string" and length > 0)
+        and (if $overload.transport == "udp"
+             then (
+                 ([
+                     $pressure.data_send_failures,
+                     $pressure.data_send_timeouts,
+                     $pressure.data_send_enobufs,
+                     $pressure.data_send_would_block,
+                     $pressure.data_send_other_os_errors,
+                     $pressure.barrier_send_failures,
+                     $pressure.barrier_send_timeouts,
+                     $pressure.barrier_send_enobufs,
+                     $pressure.barrier_send_would_block,
+                     $pressure.barrier_send_other_os_errors
+                 ] | all(.[]; nonnegative_integer))
+                 and $backpressure.workload_send_counters == {
+                     data_send_failures: $pressure.data_send_failures,
+                     data_send_timeouts: $pressure.data_send_timeouts,
+                     data_send_enobufs: $pressure.data_send_enobufs,
+                     data_send_would_block: $pressure.data_send_would_block,
+                     data_send_other_os_errors: $pressure.data_send_other_os_errors,
+                     barrier_send_failures: $pressure.barrier_send_failures,
+                     barrier_send_timeouts: $pressure.barrier_send_timeouts,
+                     barrier_send_enobufs: $pressure.barrier_send_enobufs,
+                     barrier_send_would_block: $pressure.barrier_send_would_block,
+                     barrier_send_other_os_errors: $pressure.barrier_send_other_os_errors
+                 }
+                 and $pressure.data_send_failures == (
+                     $pressure.data_send_timeouts
+                     + $pressure.data_send_enobufs
+                     + $pressure.data_send_would_block
+                     + $pressure.data_send_other_os_errors)
+                 and $pressure.barrier_send_failures == (
+                     $pressure.barrier_send_timeouts
+                     + $pressure.barrier_send_enobufs
+                     + $pressure.barrier_send_would_block
+                     + $pressure.barrier_send_other_os_errors)
+                 and $pressure.data_send_other_os_errors == 0
+                 and $pressure.barrier_send_other_os_errors == 0
+                 and $backpressure.total_send_failures == (
+                     $pressure.data_send_failures
+                     + $pressure.barrier_send_failures)
+                 and $backpressure.total_send_failures
+                     == $backpressure.dut_sndbuf_errors
+                 and $backpressure.total_send_failures
+                     <= $backpressure.stall_kernel_drop_delta
+                 and $backpressure.classification_exact == true
+                 and $backpressure.only_backpressure_classes == true
+                 and $backpressure.exact_kernel_workload_match == true
+                 and $backpressure.within_direct_drop_bound == true
+                 and ($backpressure.exception_eligible
+                     == ($backpressure.dut_sndbuf_errors > 0))
+                 and ($backpressure.exception_applied
+                     == ($backpressure.dut_sndbuf_errors > 0))
+                 and (if $backpressure.dut_sndbuf_errors > 0
+                      then $backpressure.stall_kernel_drop_delta
+                          >= $overload.saturation.minimum_nfqueue_drops
+                      else true
+                      end)
+             )
+             else (
+                 $backpressure.dut_sndbuf_errors == 0
+                 and
+                 ($backpressure.workload_send_counters
+                     | type == "object" and all(.[]; . == null))
+                 and $backpressure.total_send_failures == null
+                 and $backpressure.classification_exact == false
+                 and $backpressure.only_backpressure_classes == false
+                 and $backpressure.exact_kernel_workload_match == false
+                 and $backpressure.within_direct_drop_bound == false
+                 and $backpressure.exception_eligible == false
+                 and $backpressure.exception_applied == false
+             )
+             end)
+        and ($metric_starts | type == "object")
+        and ($metric_starts | keys) == ["canary", "dut", "peer"]
+        and ($metric_starts.dut | metric_start)
+        and ($metric_starts.peer | metric_start)
+        and ($metric_starts.canary | metric_start)
+        and (.metric_collectors | type == "object")
+        and (.metric_collectors | keys) == ["canary", "dut", "peer"]
+        and (.metric_collectors.dut | pinned_process(0))
+        and (.metric_collectors.peer | pinned_process(0))
+        and (.metric_collectors.canary | pinned_process(0))
+        and .dut_metrics.schema == "openshield.perf.metrics.v2"
+        and .dut_metrics.stop_reason == "split_boundary"
+        and (.dut_metrics.elapsed_seconds | type == "number" and . > 0)
+        and .dut_metrics.started_at_monotonic_ns
+            == $metric_starts.dut.boundary_monotonic_ns
+        and (.dut_metric_boundary | type == "object")
+        and (.dut_metric_boundary | keys)
+            == ["boundary_monotonic_ns", "event", "schema"]
+        and .dut_metric_boundary.schema
+            == "openshield.perf.metrics.control.v2"
+        and .dut_metric_boundary.event == "split"
+        and (.dut_metric_boundary.boundary_monotonic_ns
+            | nonnegative_integer and . > 0)
+        and .dut_metrics.finished_at_monotonic_ns
+            == .dut_metric_boundary.boundary_monotonic_ns
+        and .post_resume_dut_metrics.schema == "openshield.perf.metrics.v2"
+        and .post_resume_dut_metrics.stop_reason == "requested"
+        and (.post_resume_dut_metrics.elapsed_seconds
+            | type == "number" and . > 0)
+        and .post_resume_dut_metrics.started_at_monotonic_ns
+            == .dut_metric_boundary.boundary_monotonic_ns
+        and .peer_metrics.schema == "openshield.perf.metrics.v2"
+        and .peer_metrics.started_at_monotonic_ns
+            == $metric_starts.peer.boundary_monotonic_ns
+        and .canary_metrics.schema == "openshield.perf.metrics.v2"
+        and .canary_metrics.started_at_monotonic_ns
+            == $metric_starts.canary.boundary_monotonic_ns
+        and .saturation.metric_boundary_monotonic_ns
+            == .dut_metric_boundary.boundary_monotonic_ns
+        and ($overload_timeline | ordered_positive_timestamps)
+        and (.saturation.stopped_at_monotonic_ns
+            | nonnegative_integer and . > 0)
+        and (.saturation.pressure_reaped_at_monotonic_ns
+            | nonnegative_integer and . > 0)
+        and (.saturation.continued_at_monotonic_ns
+            | nonnegative_integer and . > 0)
+        and (.dut_metrics | zero_network_errors)
+        and (.dut_metrics | zero_tcp_listen_errors)
+        and ([
+            .dut_metrics.udp_errors.in_errors,
+            .dut_metrics.udp_errors.rcvbuf_errors
+        ] | all(.[]; nonnegative_integer and . == 0))
+        and all([
+            .post_resume_dut_metrics,
+            .peer_metrics,
+            .canary_metrics
+        ][]; zero_network_errors and zero_udp_errors and zero_tcp_listen_errors)
+        and ([
+            .post_resume_dut_metrics.nfqueue.kernel_dropped,
+            .post_resume_dut_metrics.nfqueue.user_dropped,
+            .post_resume_dut_metrics.nfqueue.depth_end,
+            .post_resume_dut_metrics.tcp_retransmits
+        ] | all(.[]; nonnegative_integer and . == 0))
+        and .post_resume_dut_metrics.daemon.alive_end == true
+        and .post_resume_dut_metrics.daemon.pid == .daemon_identity.pid
         and .pressure_start_gate.schema == "openshield.perf.workload.v1"
         and .pressure_start_gate.event == "ready"
         and .pressure_start_gate.role == "client"
         and .pressure_start_gate.transport == .transport
-        and .pressure_start_gate.start_gate == "stdin_line_v1"
-        and (.pressure_start_gate.pid | type == "number" and . >= 1)
+        and .pressure_start_gate.control_protocol
+            == "stdin_start_finish_release_v2"
+        and (.pressure_start_gate | pinned_process(65532))
+        and (.pressure_start_gate.spawned | pinned_process(65532))
+        and same_process(.pressure_start_gate; .pressure_start_gate.spawned)
+        and .pressure_started.schema == "openshield.perf.workload.v1"
+        and .pressure_started.event == "started"
+        and .pressure_started.transport == .transport
+        and .pressure_started.control_protocol
+            == "stdin_start_finish_release_v2"
+        and same_process(.pressure_start_gate; .pressure_started)
+        and .pressure_finished.schema == "openshield.perf.workload.v1"
+        and .pressure_finished.event == "finished"
+        and .pressure_finished.transport == .transport
+        and .pressure_finished.control_protocol
+            == "stdin_start_finish_release_v2"
+        and .pressure_finished.hold == "awaiting_release"
+        and (.pressure_finished.summary_sha256
+            | type == "string" and test("^[0-9a-f]{64}$"))
+        and .pressure_finished.exit_code == .pressure_exit_code
+        and same_process(.pressure_start_gate; .pressure_finished)
+        and .pressure_released.schema == "openshield.perf.workload.v1"
+        and .pressure_released.event == "released"
+        and .pressure_released.transport == .transport
+        and .pressure_released.control_protocol
+            == "stdin_start_finish_release_v2"
+        and same_process(.pressure_start_gate; .pressure_released)
+        and .metric_starts.dut.boundary_monotonic_ns
+            <= .pressure_started.boundary_monotonic_ns
+        and .metric_starts.peer.boundary_monotonic_ns
+            <= .pressure_started.boundary_monotonic_ns
+        and .metric_starts.canary.boundary_monotonic_ns
+            <= .pressure_started.boundary_monotonic_ns
+        and .pressure_started.boundary_monotonic_ns
+            <= .pressure_finished.boundary_monotonic_ns
+        and .pressure_finished.boundary_monotonic_ns
+            <= .pressure_released.boundary_monotonic_ns
+        and .pressure_released.boundary_monotonic_ns
+            <= .saturation.pressure_reaped_at_monotonic_ns
+        and .pressure_workload.schema == "openshield.perf.workload.v1"
+        and .pressure_workload.event == "summary"
+        and .pressure_workload.role == "client"
+        and .pressure_workload.transport == .transport
+        and (.pressure_workload.metrics | type == "object")
+        and (.pressure_exit_code
+            | nonnegative_integer and . <= 255)
         and .network_liveness_preflight.passed == true
         and .saturation.proven == true
         and .saturation.timestamps_ordered == true
         and (.saturation.minimum_nfqueue_drops | type == "number" and . >= 1)
         and (.config.minimum_nfqueue_drops == .saturation.minimum_nfqueue_drops)
+        and .saturation.threshold_drop_delta.kernel_dropped
+            == u32_counter_delta(
+                .saturation.snapshot_before_stop.kernel_dropped;
+                .saturation.snapshot_at_barrier.kernel_dropped)
+        and .saturation.threshold_drop_delta.user_dropped
+            == u32_counter_delta(
+                .saturation.snapshot_before_stop.user_dropped;
+                .saturation.snapshot_at_barrier.user_dropped)
+        and .saturation.threshold_drop_delta.total == (
+            .saturation.threshold_drop_delta.kernel_dropped
+            + .saturation.threshold_drop_delta.user_dropped)
+        and (.saturation.threshold_drop_delta.total | nonnegative_integer)
+        and (.saturation.threshold_drop_delta.total
+            >= .saturation.minimum_nfqueue_drops)
+        and .saturation.stall_drop_delta.kernel_dropped
+            == u32_counter_delta(
+                .saturation.snapshot_before_stop.kernel_dropped;
+                .saturation.snapshot_before_continue.kernel_dropped)
+        and .saturation.stall_drop_delta.user_dropped
+            == u32_counter_delta(
+                .saturation.snapshot_before_stop.user_dropped;
+                .saturation.snapshot_before_continue.user_dropped)
+        and .saturation.stall_drop_delta.total == (
+            .saturation.stall_drop_delta.kernel_dropped
+            + .saturation.stall_drop_delta.user_dropped)
         and (.saturation.stall_drop_delta.total | type == "number")
         and (.saturation.stall_drop_delta.total >= .saturation.minimum_nfqueue_drops)
+        and (.saturation.stall_drop_delta.total
+            >= .saturation.threshold_drop_delta.total)
         and .identity_probe_during_stall.blocked_all == true
         and .identity_probe_during_stall.fail_open == false
         and .identity_probe_during_stall.liveness_passed == true
@@ -536,6 +954,129 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
             or .phase_role == "ramp"
             or .phase_role == "steady"
             or .phase_role == "burst")
+        and .workload_start_gate.schema == "openshield.perf.workload.v1"
+        and .workload_start_gate.event == "ready"
+        and .workload_start_gate.role == "client"
+        and .workload_start_gate.transport == .transport
+        and .workload_start_gate.control_protocol
+            == "stdin_start_finish_release_v2"
+        and (.workload_start_gate | pinned_process(65532))
+        and (.workload_start_gate | keys) == [
+            "control_protocol", "event", "executable", "pid", "role",
+            "schema", "spawned", "starttime", "transport", "uid"
+        ]
+        and .workload_start_gate.spawned.schema
+            == "openshield.perf.workload.v1"
+        and .workload_start_gate.spawned.event == "spawned"
+        and .workload_start_gate.spawned.role == "client"
+        and .workload_start_gate.spawned.transport == .transport
+        and .workload_start_gate.spawned.control_protocol
+            == "stdin_start_finish_release_v2"
+        and (.workload_start_gate.spawned | pinned_process(65532))
+        and (.workload_start_gate.spawned | keys) == [
+            "boundary_monotonic_ns", "control_protocol", "event", "executable",
+            "pid", "role", "schema", "starttime", "transport", "uid"
+        ]
+        and same_process(.workload_start_gate; .workload_start_gate.spawned)
+        and .workload_started.schema == "openshield.perf.workload.v1"
+        and .workload_started.event == "started"
+        and .workload_started.role == "client"
+        and .workload_started.transport == .transport
+        and .workload_started.control_protocol
+            == "stdin_start_finish_release_v2"
+        and (.workload_started | pinned_process(65532))
+        and (.workload_started | keys) == [
+            "boundary_monotonic_ns", "control_protocol", "event", "executable",
+            "pid", "role", "schema", "starttime", "transport", "uid"
+        ]
+        and same_process(.workload_start_gate; .workload_started)
+        and .workload_finished.schema == "openshield.perf.workload.v1"
+        and .workload_finished.event == "finished"
+        and .workload_finished.role == "client"
+        and .workload_finished.transport == .transport
+        and .workload_finished.control_protocol
+            == "stdin_start_finish_release_v2"
+        and .workload_finished.hold == "awaiting_release"
+        and (.workload_finished.summary_sha256
+            | type == "string" and test("^[0-9a-f]{64}$"))
+        and (.workload_finished.exit_code | nonnegative_integer and . <= 255)
+        and .workload_finished.exit_code == 0
+        and (.workload_finished | pinned_process(65532))
+        and (.workload_finished | keys) == [
+            "boundary_monotonic_ns", "control_protocol", "event", "executable",
+            "exit_code", "hold", "pid", "role", "schema", "starttime",
+            "summary_sha256", "transport", "uid"
+        ]
+        and same_process(.workload_start_gate; .workload_finished)
+        and .workload_released.schema == "openshield.perf.workload.v1"
+        and .workload_released.event == "released"
+        and .workload_released.role == "client"
+        and .workload_released.transport == .transport
+        and .workload_released.control_protocol
+            == "stdin_start_finish_release_v2"
+        and (.workload_released | pinned_process(65532))
+        and (.workload_released | keys) == [
+            "boundary_monotonic_ns", "control_protocol", "event", "executable",
+            "pid", "role", "schema", "starttime", "transport", "uid"
+        ]
+        and same_process(.workload_start_gate; .workload_released)
+        and (.metric_starts | type == "object")
+        and (.metric_starts | keys) == ["dut", "peer"]
+        and (.metric_starts.dut | metric_start)
+        and (.metric_starts.peer | metric_start)
+        and (.metric_collectors | type == "object")
+        and (.metric_collectors | keys) == ["dut", "peer"]
+        and (.metric_collectors.dut | pinned_process(0))
+        and (.metric_collectors.peer | pinned_process(0))
+        and .dut_metrics.started_at_monotonic_ns
+            == .metric_starts.dut.boundary_monotonic_ns
+        and .peer_metrics.started_at_monotonic_ns
+            == .metric_starts.peer.boundary_monotonic_ns
+        and .metric_starts.dut.boundary_monotonic_ns
+            <= .workload_started.boundary_monotonic_ns
+        and .metric_starts.peer.boundary_monotonic_ns
+            <= .workload_started.boundary_monotonic_ns
+        and .workload_started.boundary_monotonic_ns
+            <= .workload_finished.boundary_monotonic_ns
+        and .workload_finished.boundary_monotonic_ns
+            <= .dut_metrics.finished_at_monotonic_ns
+        and .workload_finished.boundary_monotonic_ns
+            <= .peer_metrics.finished_at_monotonic_ns
+        and .dut_metrics.finished_at_monotonic_ns
+            <= .workload_released.boundary_monotonic_ns
+        and .peer_metrics.finished_at_monotonic_ns
+            <= .workload_released.boundary_monotonic_ns
+        and (if .direction == "outbound"
+             then .dut_metrics.workload_process.pid == .workload_start_gate.pid
+                  and .dut_metrics.workload_process.alive_end == true
+                  and (.dut_metrics.workload_process.cpu_seconds
+                      | type == "number" and . >= 0)
+                  and (.dut_metrics.workload_process.rss_bytes_peak
+                      | type == "number" and . > 0)
+             else .peer_metrics.workload_process.pid == .workload_start_gate.pid
+                  and .peer_metrics.workload_process.alive_end == true
+                  and (.peer_metrics.workload_process.cpu_seconds
+                      | type == "number" and . >= 0)
+                  and (.peer_metrics.workload_process.rss_bytes_peak
+                      | type == "number" and . > 0)
+             end)
+        and (.baseline_sample_id
+            | type == "string" and test("^b[0-9]{5}$"))
+        and (.execution_sequence | nonnegative_integer)
+        and (.block_started_monotonic_ns
+            | nonnegative_integer and . > 0)
+        and (.block_finished_monotonic_ns
+            | nonnegative_integer and . > 0)
+        and .block_finished_monotonic_ns > .block_started_monotonic_ns
+        and (if .policy == "baseline"
+             then .topology_role == "baseline"
+                 and .comparison_order == null
+                 and .comparison_gap_seconds == null
+             else .topology_role == "protected"
+                 and (.comparison_order == "ab" or .comparison_order == "ba")
+                 and (.comparison_gap_seconds
+                     | type == "number" and . >= 0)
+             end)
         and .valid == true
         and .passed == true
         and .safety_pass == true
@@ -644,6 +1185,7 @@ if ! python3 -I -B -S - "$config" "$report_json" "$repository_root" <<'PY'
 from collections import Counter
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -888,6 +1430,54 @@ for environment in report["environments"]:
         print("performance CI smoke: RPM inventory digest mismatch", file=sys.stderr)
         raise SystemExit(1)
 
+pairing = report["baseline_pairing"]
+protected_environment_by_backend = {
+    environment["backend"]: environment for environment in report["environments"]
+}
+baseline_environment_by_backend = {
+    environment["backend"]: environment
+    for environment in pairing["baseline_environments"]
+}
+if (
+    set(protected_environment_by_backend) != set(config["backends"])
+    or len(protected_environment_by_backend) != len(report["environments"])
+    or set(baseline_environment_by_backend) != set(config["backends"])
+    or len(baseline_environment_by_backend)
+    != len(pairing["baseline_environments"])
+):
+    print(
+        "performance CI smoke: baseline/protected environment coverage mismatch",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+for backend in config["backends"]:
+    if baseline_environment_by_backend[backend] != protected_environment_by_backend[backend]:
+        print(
+            f"performance CI smoke: pristine and protected environments differ: {backend}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+environment_pairs = pairing["environment_pairs"]
+if (
+    len(environment_pairs) != len(config["backends"])
+    or [item["backend"] for item in environment_pairs] != config["backends"]
+):
+    print("performance CI smoke: environment pair plan mismatch", file=sys.stderr)
+    raise SystemExit(1)
+for item in environment_pairs:
+    if (
+        item["valid"] is not True
+        or item["failure_reasons"]
+        or item["baseline_daemon_started"] is not False
+        or item["baseline_client_id"] == item["protected_client_id"]
+    ):
+        print(
+            f"performance CI smoke: unsafe environment pair: {item['backend']}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
 phases = [("warmup", "warmup", config["phases"]["warmup"]["scale"], None)]
 phases.extend(
     (f"ramp_{index}", "ramp", scale, None)
@@ -900,20 +1490,86 @@ phases.extend(
 phases.append(("burst", "burst", config["phases"]["burst"]["scale"], None))
 
 
-def scenarios(profile, policies):
-    for policy in policies:
-        if policy == "baseline":
-            yield policy, None, None
-        elif policy == "network_only":
-            for mode in config["modes"]:
-                yield policy, mode, None
-        else:
-            yield policy, "enforcing", None
-            for variant in config["learning_variants"]:
-                yield policy, "learning", variant
+def protected_scenarios(profile):
+    policies = profile["policy_cases"]
+    if "network_only" in policies:
+        for mode in config["modes"]:
+            yield "network_only", mode, None
+    application_policy = f"application_{profile['transport']}"
+    if application_policy in policies:
+        yield application_policy, "enforcing", None
+        for variant in config["learning_variants"]:
+            yield application_policy, "learning", variant
 
 
-key_fields = (
+def expected_backend_blocks(backend):
+    sequence = 0
+    sample_index = 0
+    expected_blocks = []
+    for profile_index, profile in enumerate(config["profiles"]):
+        scenarios = list(protected_scenarios(profile))
+        for load_index, load_level in enumerate(config["load_levels"]):
+            if not scenarios:
+                continue
+            sample_slots = []
+            for _ in range(len(scenarios) // 2 + 1):
+                sample_slots.append((backend, sample_index))
+                sample_index += 1
+            expected_blocks.append(
+                {
+                    "sequence": sequence,
+                    "sample_slot": sample_slots[0],
+                    "topology_role": "baseline",
+                    "policy": "baseline",
+                    "mode": None,
+                    "learning_variant": None,
+                    "comparison_order": None,
+                    "profile": profile,
+                    "load_level": load_level,
+                }
+            )
+            sequence += 1
+            for index, (policy, mode, variant) in enumerate(scenarios):
+                sample_slot = sample_slots[(index + 1) // 2]
+                expected_blocks.append(
+                    {
+                        "sequence": sequence,
+                        "sample_slot": sample_slot,
+                        "topology_role": "protected",
+                        "policy": policy,
+                        "mode": mode,
+                        "learning_variant": variant,
+                        "comparison_order": "ab" if index % 2 == 0 else "ba",
+                        "profile": profile,
+                        "load_level": load_level,
+                    }
+                )
+                sequence += 1
+                if index % 2 == 1:
+                    expected_blocks.append(
+                        {
+                            "sequence": sequence,
+                            "sample_slot": sample_slot,
+                            "topology_role": "baseline",
+                            "policy": "baseline",
+                            "mode": None,
+                            "learning_variant": None,
+                            "comparison_order": None,
+                            "profile": profile,
+                            "load_level": load_level,
+                        }
+                    )
+                    sequence += 1
+    return expected_blocks
+
+
+def reject(message):
+    print(f"performance CI smoke: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+phase_counter = Counter(phases)
+block_constant_fields = (
     "backend",
     "policy",
     "mode",
@@ -922,57 +1578,327 @@ key_fields = (
     "direction",
     "transport",
     "load_level",
-    "phase",
-    "phase_role",
-    "phase_scale",
-    "repetition",
+    "baseline_sample_id",
+    "comparison_order",
+    "execution_sequence",
+    "topology_role",
+    "block_started_monotonic_ns",
+    "block_finished_monotonic_ns",
+    "comparison_gap_seconds",
 )
-expected = Counter()
-for backend in config["backends"]:
-    unsupported = status_by_backend[backend] == "unsupported"
-    for profile in config["profiles"]:
-        policies = ["baseline"] if unsupported else profile["policy_cases"]
-        for policy, mode, variant in scenarios(profile, policies):
-            for load_level in config["load_levels"]:
-                for phase, role, scale, repetition in phases:
-                    expected[
-                        (
-                            backend,
-                            policy,
-                            mode,
-                            variant,
-                            profile["name"],
-                            profile["direction"],
-                            profile["transport"],
-                            load_level,
-                            phase,
-                            role,
-                            scale,
-                            repetition,
-                        )
-                    ] += 1
+sample_slot_to_id = {}
+sample_id_to_slot = {}
+sample_references = Counter()
+sample_orders = {}
+observed_gaps = []
+observed_comparison_count = 0
+observed_order_counts = Counter()
+expected_row_count = 0
 
-try:
-    actual = Counter(tuple(result[field] for field in key_fields) for result in report["results"])
-except (KeyError, TypeError) as error:
-    print(f"performance CI smoke: incomplete result identity: {error}", file=sys.stderr)
-    raise SystemExit(1)
 
-if actual != expected:
-    missing = list((expected - actual).elements())[:5]
-    unexpected = list((actual - expected).elements())[:5]
-    print(
-        "performance CI smoke: result plan mismatch: "
-        f"expected={sum(expected.values())}, actual={sum(actual.values())}, "
-        f"missing={sum((expected - actual).values())}, "
-        f"unexpected={sum((actual - expected).values())}",
-        file=sys.stderr,
+def process_identity(document):
+    return tuple(
+        document.get(field)
+        for field in ("pid", "starttime", "executable", "uid")
     )
-    for item in missing:
-        print(f"performance CI smoke: missing result key: {item!r}", file=sys.stderr)
-    for item in unexpected:
-        print(f"performance CI smoke: unexpected result key: {item!r}", file=sys.stderr)
-    raise SystemExit(1)
+
+
+def canonical_digest(document):
+    return hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_workload_lifecycle(row, prefix="workload"):
+    ready_key = f"{prefix}_start_gate" if prefix != "workload" else "workload_start_gate"
+    started_key = f"{prefix}_started" if prefix != "workload" else "workload_started"
+    finished_key = f"{prefix}_finished" if prefix != "workload" else "workload_finished"
+    released_key = f"{prefix}_released" if prefix != "workload" else "workload_released"
+    summary_key = f"{prefix}_workload" if prefix != "workload" else "workload"
+    try:
+        ready = row[ready_key]
+        spawned = ready["spawned"]
+        started = row[started_key]
+        finished = row[finished_key]
+        released = row[released_key]
+        summary = row[summary_key]
+        identity = process_identity(ready)
+        timestamps = [
+            spawned["boundary_monotonic_ns"],
+            started["boundary_monotonic_ns"],
+            finished["boundary_monotonic_ns"],
+            released["boundary_monotonic_ns"],
+        ]
+    except (KeyError, TypeError) as error:
+        reject(f"{prefix} lifecycle evidence is incomplete: {error}")
+    if any(
+        process_identity(document) != identity
+        for document in (spawned, started, finished, released)
+    ):
+        reject(f"{prefix} lifecycle changed pinned process identity")
+    if any(
+        document.get("control_protocol") != "stdin_start_finish_release_v2"
+        for document in (spawned, ready, started, finished, released)
+    ):
+        reject(f"{prefix} lifecycle protocol is not authenticated")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in timestamps
+    ) or timestamps != sorted(timestamps):
+        reject(f"{prefix} lifecycle timestamps are not ordered")
+    if finished.get("summary_sha256") != canonical_digest(summary):
+        reject(f"{prefix} finished event does not authenticate its summary")
+
+
+for result in report["results"]:
+    validate_workload_lifecycle(result)
+for overload in report["overload_results"]:
+    validate_workload_lifecycle(overload, "pressure")
+
+for backend in config["backends"]:
+    backend_rows = [
+        result for result in report["results"] if result.get("backend") == backend
+    ]
+    if status_by_backend[backend] == "unsupported":
+        if backend_rows:
+            reject(f"unsupported backend emitted normal results: {backend}")
+        continue
+    if status_by_backend[backend] != "passed":
+        reject(f"non-passing backend appears in a passing report: {backend}")
+
+    expected_blocks = expected_backend_blocks(backend)
+    expected_row_count += len(expected_blocks) * len(phases)
+    rows_by_sequence = {}
+    observed_block_order = []
+    previous_sequence = None
+    closed_sequences = set()
+    try:
+        for row in backend_rows:
+            sequence = row["execution_sequence"]
+            if sequence != previous_sequence:
+                if sequence in closed_sequences:
+                    reject(
+                        f"result block is not contiguous: {backend} sequence {sequence}"
+                    )
+                if previous_sequence is not None:
+                    closed_sequences.add(previous_sequence)
+                observed_block_order.append(sequence)
+                previous_sequence = sequence
+            rows_by_sequence.setdefault(sequence, []).append(row)
+    except (KeyError, TypeError) as error:
+        reject(f"incomplete AB/BA result identity: {error}")
+
+    expected_sequences = list(range(len(expected_blocks)))
+    if observed_block_order != expected_sequences or sorted(rows_by_sequence) != expected_sequences:
+        reject(
+            f"execution sequence mismatch for {backend}: "
+            f"expected={expected_sequences!r}, observed={observed_block_order!r}"
+        )
+
+    for expected_block, sequence in zip(
+        expected_blocks, expected_sequences, strict=True
+    ):
+        rows = rows_by_sequence[sequence]
+        if len(rows) != len(phases):
+            reject(
+                f"wrong phase count for {backend} sequence {sequence}: {len(rows)}"
+            )
+        first = rows[0]
+        for row in rows[1:]:
+            if any(row.get(field) != first.get(field) for field in block_constant_fields):
+                reject(f"block metadata differs between phases: {backend} sequence {sequence}")
+        actual_phases = Counter(
+            (
+                row.get("phase"),
+                row.get("phase_role"),
+                row.get("phase_scale"),
+                row.get("repetition"),
+            )
+            for row in rows
+        )
+        if actual_phases != phase_counter:
+            reject(f"phase plan mismatch: {backend} sequence {sequence}")
+
+        profile = expected_block["profile"]
+        expected_identity = {
+            "backend": backend,
+            "policy": expected_block["policy"],
+            "mode": expected_block["mode"],
+            "learning_variant": expected_block["learning_variant"],
+            "profile": profile["name"],
+            "direction": profile["direction"],
+            "transport": profile["transport"],
+            "load_level": expected_block["load_level"],
+            "comparison_order": expected_block["comparison_order"],
+            "execution_sequence": sequence,
+            "topology_role": expected_block["topology_role"],
+        }
+        if any(first.get(field) != value for field, value in expected_identity.items()):
+            reject(
+                f"AB/BA block identity mismatch: {backend} sequence {sequence}"
+            )
+        started = first.get("block_started_monotonic_ns")
+        finished = first.get("block_finished_monotonic_ns")
+        if (
+            not isinstance(started, int)
+            or isinstance(started, bool)
+            or not isinstance(finished, int)
+            or isinstance(finished, bool)
+            or started <= 0
+            or finished <= started
+        ):
+            reject(f"invalid block interval: {backend} sequence {sequence}")
+        sample_id = first.get("baseline_sample_id")
+        if not isinstance(sample_id, str) or re.fullmatch(r"b[0-9]{5}", sample_id) is None:
+            reject(f"invalid baseline sample id: {backend} sequence {sequence}")
+        qualified_sample_id = (backend, sample_id)
+        sample_slot = expected_block["sample_slot"]
+        expected_sample_id = (backend, f"b{sample_slot[1]:05d}")
+        if qualified_sample_id != expected_sample_id:
+            reject(
+                f"non-canonical baseline sample id: {backend} sequence {sequence}"
+            )
+        if expected_block["topology_role"] == "baseline":
+            if first.get("comparison_gap_seconds") is not None:
+                reject(f"baseline carries a comparison gap: {backend} sequence {sequence}")
+            prior_id = sample_slot_to_id.setdefault(sample_slot, qualified_sample_id)
+            prior_slot = sample_id_to_slot.setdefault(qualified_sample_id, sample_slot)
+            if prior_id != qualified_sample_id or prior_slot != sample_slot:
+                reject(f"baseline sample id is ambiguous: {backend}/{sample_id}")
+        else:
+            gap = first.get("comparison_gap_seconds")
+            if (
+                not isinstance(gap, (int, float))
+                or isinstance(gap, bool)
+                or not math.isfinite(gap)
+                or gap < 0
+            ):
+                reject(f"invalid comparison gap: {backend} sequence {sequence}")
+            observed_gaps.append(float(gap))
+            observed_comparison_count += 1
+            observed_order_counts[first["comparison_order"]] += 1
+            sample_references[sample_slot] += 1
+            sample_orders.setdefault(sample_slot, set()).add(first["comparison_order"])
+
+    for expected_block in expected_blocks:
+        sequence = expected_block["sequence"]
+        if expected_block["topology_role"] != "protected":
+            continue
+        protected = rows_by_sequence[sequence][0]
+        sample_slot = expected_block["sample_slot"]
+        qualified_sample_id = (backend, protected["baseline_sample_id"])
+        if sample_slot_to_id.get(sample_slot) != qualified_sample_id:
+            reject(f"protected block references wrong baseline: {backend} sequence {sequence}")
+        baseline_sequence = sequence - 1 if protected["comparison_order"] == "ab" else sequence + 1
+        if baseline_sequence not in rows_by_sequence:
+            reject(f"comparison has no adjacent baseline: {backend} sequence {sequence}")
+        baseline = rows_by_sequence[baseline_sequence][0]
+        if baseline["topology_role"] != "baseline" or baseline["baseline_sample_id"] != protected["baseline_sample_id"]:
+            reject(f"comparison baseline is not adjacent: {backend} sequence {sequence}")
+        if protected["comparison_order"] == "ab":
+            gap_ns = (
+                protected["block_started_monotonic_ns"]
+                - baseline["block_finished_monotonic_ns"]
+            )
+        else:
+            gap_ns = (
+                baseline["block_started_monotonic_ns"]
+                - protected["block_finished_monotonic_ns"]
+            )
+        if gap_ns < 0 or not math.isclose(
+            protected["comparison_gap_seconds"],
+            gap_ns / 1_000_000_000.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            reject(f"comparison gap does not match timestamps: {backend} sequence {sequence}")
+        baseline_rows_by_phase = {row["phase"]: row for row in rows_by_sequence[baseline_sequence]}
+        for protected_row in rows_by_sequence[sequence]:
+            baseline_row = baseline_rows_by_phase[protected_row["phase"]]
+            baseline_derived = baseline_row["derived"]
+            gated_phase = protected_row["phase_role"] in {"steady", "burst"}
+            expected_baseline_evidence = {
+                "sample_id": baseline_row["baseline_sample_id"],
+                "comparison_order": protected_row["comparison_order"],
+                "execution_sequence": baseline_row["execution_sequence"],
+                "comparison_gap_seconds": protected_row["comparison_gap_seconds"],
+                "valid": baseline_row["valid"],
+                "capacity_pass": baseline_row["capacity_pass"],
+                "safety_pass": baseline_row["safety_pass"],
+                "eligible": baseline_row["valid"] is True
+                and (
+                    not gated_phase
+                    or (
+                        baseline_row["capacity_pass"] is True
+                        and baseline_row["safety_pass"] is True
+                    )
+                ),
+                "actual_application_ops_per_second": baseline_derived[
+                    "actual_application_ops_per_second"
+                ],
+                "actual_application_mbps": baseline_derived[
+                    "actual_application_mbps"
+                ],
+                "aggregate_dut_pps": baseline_derived["aggregate_dut_pps"],
+                "cgroup_cpu_percent_one_core": baseline_derived[
+                    "cgroup_cpu_percent_one_core"
+                ],
+                "latency_p50_ms": baseline_derived["latency_p50_ms"],
+                "latency_p95_ms": baseline_derived["latency_p95_ms"],
+                "latency_p99_ms": baseline_derived["latency_p99_ms"],
+                "connect_latency_p50_ms": baseline_derived[
+                    "connect_latency_p50_ms"
+                ],
+                "connect_latency_p95_ms": baseline_derived[
+                    "connect_latency_p95_ms"
+                ],
+                "connect_latency_p99_ms": baseline_derived[
+                    "connect_latency_p99_ms"
+                ],
+            }
+            if protected_row.get("baseline") != expected_baseline_evidence:
+                reject(
+                    f"embedded baseline evidence mismatch: {backend} "
+                    f"sequence {sequence} phase {protected_row['phase']}"
+                )
+
+for sample_slot, qualified_sample_id in sample_slot_to_id.items():
+    reference_count = sample_references[sample_slot]
+    orders = sample_orders.get(sample_slot, set())
+    if reference_count not in (1, 2):
+        reject(f"baseline sample has invalid use count: {qualified_sample_id!r}")
+    if reference_count == 2 and orders != {"ab", "ba"}:
+        reject(f"twice-used baseline lacks one AB and one BA comparison: {qualified_sample_id!r}")
+
+if len(report["results"]) != expected_row_count:
+    reject(
+        f"result plan mismatch: expected={expected_row_count}, "
+        f"actual={len(report['results'])}"
+    )
+if all(status == "passed" for status in status_by_backend.values()) and expected_row_count != 384:
+    reject(f"ci-smoke AB/BA row contract drifted from 384 to {expected_row_count}")
+if pairing["baseline_sample_count"] != len(sample_slot_to_id):
+    reject("baseline_pairing baseline_sample_count mismatch")
+if pairing["comparison_count"] != observed_comparison_count:
+    reject("baseline_pairing comparison_count mismatch")
+if pairing["orders"] != {
+    "ab": observed_order_counts["ab"],
+    "ba": observed_order_counts["ba"],
+}:
+    reject("baseline_pairing order counts mismatch")
+maximum_gap = max(observed_gaps, default=0.0)
+if not math.isclose(
+    pairing["maximum_gap_seconds"],
+    maximum_gap,
+    rel_tol=0.0,
+    abs_tol=1e-9,
+):
+    reject("baseline_pairing maximum_gap_seconds mismatch")
 
 if config.get("overload", {}).get("enabled"):
     expected_overload = {
@@ -1001,7 +1927,7 @@ then
     fail 'report.json does not cover the exact configured result plan'
 fi
 
-readonly EXPECTED_CSV_HEADER='backend,policy,mode,learning_variant,profile,direction,transport,load_level,phase,phase_role,phase_scale,valid,passed,safety_pass,capacity_pass,relative_performance_pass,unreliable_reasons,failure_reasons,safety_failure_reasons,relative_performance_failure_reasons,target_ops_per_second,actual_application_ops_per_second,actual_application_mbps,target_attainment_ratio,actual_cps,active_flows_peak,latency_p50_ms,latency_p95_ms,latency_p99_ms,connect_latency_p50_ms,connect_latency_p95_ms,connect_latency_p99_ms,error_ratio,udp_reply_loss_ratio,udp_scenario_accounting_valid,udp_scenario_packets_sent,udp_scenario_packets_received,udp_scenario_packet_loss,udp_scenario_packet_loss_ratio,udp_scenario_unexpected_packets,udp_scenario_packet_matched,udp_barriers_expected,udp_barriers_sent,udp_server_barriers_received,udp_server_barrier_acks_sent,udp_barrier_acks_received,udp_barrier_errors,udp_barriers_matched,tcp_retransmits,tcp_retransmits_per_tx_packet,dut_rx_pps,dut_tx_pps,dut_rx_mbps,dut_tx_mbps,aggregate_dut_pps,daemon_cpu_percent_one_core,cgroup_cpu_percent_one_core,daemon_rss_bytes_peak,softirq_net_rx,softirq_net_tx,conntrack_count_peak,nfqueue_hits,nfqueue_depth_peak,nfqueue_kernel_dropped,nfqueue_user_dropped,nfqueue_runtime_counters_valid,nfqueue_queue_overflow_delta,nfqueue_attribution_timeout_delta,nfqueue_terminal_queue_error_delta,nfqueue_denied_delta,nfqueue_hits_per_connection,nfqueue_hits_per_datagram,identity_probe_fail_open,quarantine_occurred,application_ops_reduction_percent,throughput_reduction_percent,aggregate_dut_pps_reduction_percent,latency_p50_increase_percent,latency_p95_increase_percent,latency_p99_increase_percent,connect_latency_p50_increase_percent,connect_latency_p95_increase_percent,connect_latency_p99_increase_percent,cgroup_cpu_increase_percent'
+readonly EXPECTED_CSV_HEADER='backend,policy,mode,learning_variant,profile,direction,transport,load_level,phase,phase_role,phase_scale,baseline_sample_id,comparison_order,execution_sequence,topology_role,block_started_monotonic_ns,block_finished_monotonic_ns,comparison_gap_seconds,valid,passed,safety_pass,capacity_pass,relative_performance_pass,unreliable_reasons,failure_reasons,safety_failure_reasons,relative_performance_failure_reasons,target_ops_per_second,actual_application_ops_per_second,actual_application_mbps,target_attainment_ratio,actual_cps,active_flows_peak,latency_p50_ms,latency_p95_ms,latency_p99_ms,connect_latency_p50_ms,connect_latency_p95_ms,connect_latency_p99_ms,error_ratio,udp_reply_loss_ratio,udp_scenario_accounting_valid,udp_scenario_packets_sent,udp_scenario_packets_received,udp_scenario_packet_loss,udp_scenario_packet_loss_ratio,udp_scenario_unexpected_packets,udp_scenario_packet_matched,udp_barriers_expected,udp_barriers_sent,udp_server_barriers_received,udp_server_barrier_acks_sent,udp_barrier_acks_received,udp_barrier_errors,udp_barriers_matched,tcp_retransmits,tcp_retransmits_per_tx_packet,dut_rx_pps,dut_tx_pps,dut_rx_mbps,dut_tx_mbps,aggregate_dut_pps,daemon_cpu_percent_one_core,cgroup_cpu_percent_one_core,daemon_rss_bytes_peak,softirq_net_rx,softirq_net_tx,conntrack_count_peak,nfqueue_hits,nfqueue_depth_peak,nfqueue_kernel_dropped,nfqueue_user_dropped,nfqueue_runtime_counters_valid,nfqueue_queue_overflow_delta,nfqueue_attribution_timeout_delta,nfqueue_terminal_queue_error_delta,nfqueue_denied_delta,nfqueue_hits_per_connection,nfqueue_hits_per_datagram,identity_probe_fail_open,quarantine_occurred,application_ops_reduction_percent,throughput_reduction_percent,aggregate_dut_pps_reduction_percent,latency_p50_increase_percent,latency_p95_increase_percent,latency_p99_increase_percent,connect_latency_p50_increase_percent,connect_latency_p95_increase_percent,connect_latency_p99_increase_percent,cgroup_cpu_increase_percent'
 IFS= read -r csv_header < "$report_csv" \
     || fail 'report.csv does not contain a header'
 csv_header=${csv_header%$'\r'}

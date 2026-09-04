@@ -12,7 +12,7 @@
     "dut": "opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045",
     "peer": "python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285"
   },
-  "max_total_workload_seconds": 300,
+  "max_total_workload_seconds": 370,
   "load_levels": [1.0],
   "phases": {
     "warmup": {"duration_seconds": 0.3, "scale": 0.25},

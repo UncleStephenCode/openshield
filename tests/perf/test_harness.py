@@ -10,10 +10,12 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -588,8 +590,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_checked_in_profiles_have_bounded_exact_plans(self) -> None:
         expected = {
-            "ci-smoke.json": (278.6, 276, False),
-            "production-like.json": (47_747.0, 2_880, True),
+            "ci-smoke.json": (363.2, 384, False),
+            "production-like.json": (63_587.0, 3_840, True),
         }
         for name, (seconds, rows, capacity_certification) in expected.items():
             with self.subTest(name=name):
@@ -599,21 +601,181 @@ class ConfigTests(unittest.TestCase):
                 phases = len(runner.phase_plan(document))
                 scenarios = sum(
                     1
-                    for _backend in document["backends"]
-                    for policy in (
-                        "baseline",
-                        "network_only",
-                        "application_tcp",
-                        "application_udp",
-                    )
-                    for _scenario in runner.scenario_plan(document, policy)
-                    for _load in document["load_levels"]
+                    for backend in document["backends"]
+                    for _scenario in runner.paired_load_plan(document, backend)
                 )
                 self.assertAlmostEqual(document["estimated_workload_seconds"], seconds)
                 self.assertEqual(scenarios * phases, rows)
                 self.assertIs(
                     document["capacity_certification"], capacity_certification
                 )
+
+    def test_ci_smoke_uses_a_fixed_nearest_pristine_ab_ba_schedule(self) -> None:
+        document = runner.validate_config(
+            runner.load_json_object(PERF_ROOT / "config" / "ci-smoke.json")
+        )
+        plan = list(runner.paired_load_plan(document, "nftables"))
+        self.assertEqual(len(plan), 32)
+        self.assertEqual(
+            [scenario["execution_sequence"] for scenario, _load in plan],
+            list(range(32)),
+        )
+        self.assertEqual(
+            [
+                (
+                    scenario["topology_role"],
+                    scenario["policy"],
+                    scenario["mode"],
+                    scenario["baseline_sample_id"],
+                    scenario["comparison_order"],
+                )
+                for scenario, _load in plan[:4]
+            ],
+            [
+                ("baseline", "baseline", None, "b00000", None),
+                ("protected", "network_only", "enforcing", "b00000", "ab"),
+                ("protected", "network_only", "learning", "b00001", "ba"),
+                ("baseline", "baseline", None, "b00001", None),
+            ],
+        )
+        baselines = [item for item in plan if item[0]["topology_role"] == "baseline"]
+        protected = [item for item in plan if item[0]["topology_role"] == "protected"]
+        self.assertEqual((len(baselines), len(protected)), (14, 18))
+        self.assertEqual(
+            [item[0]["comparison_order"] for item in protected].count("ab"), 9
+        )
+        self.assertEqual(
+            [item[0]["comparison_order"] for item in protected].count("ba"), 9
+        )
+
+    def test_baseline_topology_cannot_start_daemon_or_run_protected_policy(self) -> None:
+        topology = object.__new__(runner.DockerBackendRun)
+        topology.topology_role = "baseline"
+        with self.assertRaisesRegex(runner.HarnessError, "must never start"):
+            topology.start_daemon()
+        with self.assertRaisesRegex(runner.HarnessError, "topology role"):
+            topology.prepare_policy({"policy": "network_only"})
+
+        topology.topology_role = "protected"
+        with self.assertRaisesRegex(runner.HarnessError, "topology role"):
+            topology.prepare_policy({"policy": "baseline"})
+
+    def test_baseline_pairing_evidence_authenticates_plan_and_environment(self) -> None:
+        document = runner.validate_config(
+            runner.load_json_object(PERF_ROOT / "config" / "ci-smoke.json")
+        )
+        document["backends"] = ["nftables"]
+        document["profiles"] = document["profiles"][:1]
+        plan = list(runner.paired_load_plan(document, "nftables"))
+        blocks = []
+        for scenario, load_level in plan:
+            sequence = scenario["execution_sequence"]
+            blocks.append(
+                {
+                    "scenario": scenario,
+                    "load_level": load_level,
+                    "started": sequence * 1_000 + 100,
+                    "finished": sequence * 1_000 + 600,
+                }
+            )
+        results = []
+        for block in blocks:
+            scenario = block["scenario"]
+            gap = None
+            if scenario["comparison_order"] == "ab":
+                baseline = blocks[scenario["execution_sequence"] - 1]
+                gap = (block["started"] - baseline["finished"]) / 1_000_000_000
+            elif scenario["comparison_order"] == "ba":
+                baseline = blocks[scenario["execution_sequence"] + 1]
+                gap = (baseline["started"] - block["finished"]) / 1_000_000_000
+            for phase in runner.phase_plan(document):
+                results.append(
+                    {
+                        "backend": "nftables",
+                        "profile": scenario["profile"]["name"],
+                        "policy": scenario["policy"],
+                        "mode": scenario["mode"],
+                        "learning_variant": scenario.get("learning_variant"),
+                        "load_level": block["load_level"],
+                        "baseline_sample_id": scenario["baseline_sample_id"],
+                        "comparison_order": scenario["comparison_order"],
+                        "execution_sequence": scenario["execution_sequence"],
+                        "topology_role": scenario["topology_role"],
+                        "block_started_monotonic_ns": block["started"],
+                        "block_finished_monotonic_ns": block["finished"],
+                        "comparison_gap_seconds": gap,
+                        "phase": phase["name"],
+                    }
+                )
+        environment = {"backend": "nftables", "manifest": "same"}
+        generation = {
+            "backend": "nftables",
+            "baseline_client_id": "1" * 64,
+            "protected_client_id": "2" * 64,
+            "baseline_daemon_started": False,
+        }
+        evidence = runner.baseline_pairing_evidence(
+            results,
+            document,
+            [environment],
+            [dict(environment)],
+            [generation],
+        )
+        self.assertTrue(evidence["valid"])
+        self.assertEqual(evidence["schema"], runner.BASELINE_PAIRING_SCHEMA)
+        self.assertEqual(evidence["baseline_sample_count"], 2)
+        self.assertEqual(evidence["comparison_count"], 2)
+        self.assertEqual(evidence["orders"], {"ab": 1, "ba": 1})
+
+        changed_environment = {**environment, "manifest": "different"}
+        rejected = runner.baseline_pairing_evidence(
+            results,
+            document,
+            [environment],
+            [changed_environment],
+            [generation],
+        )
+        self.assertFalse(rejected["valid"])
+        self.assertIn(
+            "nftables: baseline and protected environments differ",
+            rejected["failure_reasons"],
+        )
+
+        reordered = json.loads(json.dumps(results))
+        phase_count = len(runner.phase_plan(document))
+        reordered[: 2 * phase_count] = (
+            reordered[phase_count : 2 * phase_count]
+            + reordered[:phase_count]
+        )
+        rejected = runner.baseline_pairing_evidence(
+            reordered,
+            document,
+            [environment],
+            [dict(environment)],
+            [generation],
+        )
+        self.assertFalse(rejected["valid"])
+        self.assertIn(
+            "nftables: execution sequence is incomplete or non-canonical",
+            rejected["failure_reasons"],
+        )
+
+        wrong_gap = json.loads(json.dumps(results))
+        for row in wrong_gap:
+            if row["execution_sequence"] == 1:
+                row["comparison_gap_seconds"] += 0.001
+        rejected = runner.baseline_pairing_evidence(
+            wrong_gap,
+            document,
+            [environment],
+            [dict(environment)],
+            [generation],
+        )
+        self.assertFalse(rejected["valid"])
+        self.assertIn(
+            "nftables: protected block 1 gap differs from timestamps",
+            rejected["failure_reasons"],
+        )
 
     def test_capacity_certification_is_an_explicit_boolean(self) -> None:
         document = runner.load_json_object(
@@ -707,7 +869,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_ci_wrapper_cleanup_is_scoped_to_the_exact_run_label(self) -> None:
         source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
-        self.assertIn("readonly MAX_TIMEOUT_SECONDS=900", source)
+        self.assertIn("readonly MAX_TIMEOUT_SECONDS=1200", source)
         self.assertIn("readonly RUN_LABEL_KEY='org.openshield.perf.run'", source)
         self.assertIn('--run-token "$run_token"', source)
         self.assertIn(
@@ -810,6 +972,10 @@ class ConfigTests(unittest.TestCase):
     def test_ci_wrapper_failure_summary_preserves_relative_gate_reasons(self) -> None:
         source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
         summary = source[source.index("bounded failure summary") :]
+        self.assertIn("invalid_results", summary)
+        self.assertIn("environment_consistency", summary)
+        self.assertIn("resource_validity", summary)
+        self.assertIn("relative_failure_counts", summary)
         self.assertIn("relative_performance_failure_reasons", summary)
 
     def test_ci_wrapper_requires_exact_udp_accounting_and_drain_barriers(self) -> None:
@@ -824,14 +990,44 @@ class ConfigTests(unittest.TestCase):
 
     def test_control_plane_snapshots_are_outside_normal_measurement_window(self) -> None:
         source = inspect.getsource(runner.DockerBackendRun.run_phase)
-        start = source.index("self.start_metric(dut_metric)")
+        start = source.index("self.start_metrics_together")
         client = source.index("client_process = subprocess.Popen")
-        stop = source.index("self.stop_metric(dut_metric)")
-        self.assertLess(source.index("log_before ="), start)
-        self.assertLess(source.index("identity_before ="), start)
-        self.assertLess(source.index("status_before ="), start)
-        self.assertLess(start, client)
-        self.assertLess(client, stop)
+        ready = source.index("workload_start_gate = self.await_workload_ready")
+        release = source.index("workload_started = self.start_workload")
+        finished = source.index("workload, workload_finished")
+        stop = source.index("collected = self.finish_metric_collectors")
+        reap = source.index("workload_released = self.release_workload")
+        self.assertLess(client, ready)
+        self.assertLess(source.index("log_before ="), client)
+        self.assertLess(source.index("identity_before ="), client)
+        self.assertLess(source.index("status_before ="), client)
+        self.assertLess(ready, start)
+        self.assertLess(start, release)
+        self.assertLess(release, finished)
+        self.assertLess(finished, stop)
+        self.assertLess(stop, reap)
+        self.assertIn("start_gated=True", source)
+        self.assertIn('else client_pid', source)
+
+    def test_controller_prestart_budget_is_below_every_inner_wait(self) -> None:
+        self.assertLess(
+            runner.CONTROLLER_PRESTART_BOUND_SECONDS,
+            runner.INNER_CONTROL_WAIT_SECONDS,
+        )
+        self.assertLess(
+            runner.CONTROLLER_FINISH_RELEASE_BOUND_SECONDS,
+            runner.INNER_CONTROL_WAIT_SECONDS,
+        )
+        phase_source = inspect.getsource(runner.DockerBackendRun.run_phase)
+        self.assertIn("finish_release_deadline", phase_source)
+        self.assertIn("finish-to-release interval exceeded its bound", phase_source)
+        common_source = (PERF_ROOT / "workloads" / "common.py").read_text(
+            encoding="utf-8"
+        )
+        metrics_source = (PERF_ROOT / "metrics.py").read_text(encoding="utf-8")
+        self.assertIn("CONTROL_TIMEOUT_SECONDS = 120.0", common_source)
+        self.assertIn("MAX_CONTROL_START_WAIT_SECONDS = 120.0", metrics_source)
+        self.assertEqual(runner.INNER_CONTROL_WAIT_SECONDS, 120.0)
 
 
 def synthetic_result(policy: str, transport: str = "tcp") -> dict:
@@ -887,6 +1083,13 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
         "phase_role": "steady",
         "phase_scale": 1.0,
         "repetition": 1,
+        "baseline_sample_id": "b00000",
+        "comparison_order": None if policy == "baseline" else "ab",
+        "execution_sequence": 0 if policy == "baseline" else 1,
+        "topology_role": "baseline" if policy == "baseline" else "protected",
+        "block_started_monotonic_ns": 100 if policy == "baseline" else 300,
+        "block_finished_monotonic_ns": 200 if policy == "baseline" else 400,
+        "comparison_gap_seconds": None,
         "offered": {
             "response_mix": "128:1",
             "request_bytes": 64,
@@ -1627,6 +1830,45 @@ class EvaluationTests(unittest.TestCase):
                     ),
                 )
 
+    def test_relative_gate_keeps_the_strict_ten_percent_boundary(self) -> None:
+        for throughput, expected_pass in ((10.8, True), (10.799_988, False)):
+            with self.subTest(throughput=throughput):
+                baseline = synthetic_result("baseline")
+                measured = synthetic_result("network_only")
+                measured["workload"]["metrics"]["application_mbps"] = throughput
+                runner.evaluate_result(baseline, self.criteria)
+                runner.evaluate_result(measured, self.criteria)
+                runner.add_baseline_comparisons(
+                    [baseline, measured], self.criteria
+                )
+                self.assertIs(
+                    measured["relative_performance_pass"], expected_pass
+                )
+
+    def test_paired_baseline_must_be_unique_and_temporally_adjacent(self) -> None:
+        baseline = synthetic_result("baseline")
+        duplicate = json.loads(json.dumps(baseline))
+        measured = synthetic_result("network_only")
+        for result in (baseline, duplicate, measured):
+            runner.evaluate_result(result, self.criteria)
+        runner.add_baseline_comparisons(
+            [baseline, duplicate, measured], self.criteria
+        )
+        self.assertIn("paired baseline is ambiguous", measured["unreliable_reasons"])
+        self.assertFalse(measured["valid"])
+
+        baseline = synthetic_result("baseline")
+        measured = synthetic_result("network_only")
+        measured["execution_sequence"] = 2
+        for result in (baseline, measured):
+            runner.evaluate_result(result, self.criteria)
+        runner.add_baseline_comparisons([baseline, measured], self.criteria)
+        self.assertIn(
+            "paired baseline is not the predetermined adjacent sample",
+            measured["unreliable_reasons"],
+        )
+        self.assertFalse(measured["valid"])
+
     def test_relative_gate_applies_to_equivalent_burst_workload(self) -> None:
         criteria = dict(self.criteria)
         criteria["require_burst_capacity"] = True
@@ -2073,6 +2315,27 @@ class MetricAndOutputTests(unittest.TestCase):
         )
         self.assertEqual(command[0:3], ["docker", "exec", "--interactive"])
         self.assertEqual(command[-1], "--start-gate-stdin")
+        normal_phase = inspect.getsource(runner.DockerBackendRun.run_phase)
+        self.assertIn("workload_start_gate", normal_phase)
+        self.assertIn("start_metrics_together", normal_phase)
+        self.assertIn("workload_finished", normal_phase)
+        self.assertIn("finish_metric_collectors", normal_phase)
+        self.assertIn("release_workload", normal_phase)
+        wrapper = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            '.workload_start_gate.control_protocol\n'
+            '            == "stdin_start_finish_release_v2"',
+            wrapper,
+        )
+        self.assertIn(
+            ".dut_metrics.started_at_monotonic_ns\n"
+            "            == .metric_starts.dut.boundary_monotonic_ns",
+            wrapper,
+        )
+        self.assertIn(
+            ".dut_metrics.workload_process.pid == .workload_start_gate.pid",
+            wrapper,
+        )
 
     def test_overload_resource_gates_reject_endpoint_drops_and_cpu_saturation(self) -> None:
         metrics = synthetic_result("network_only")["peer_metrics"]
@@ -2091,6 +2354,206 @@ class MetricAndOutputTests(unittest.TestCase):
         )
         self.assertIn("peer network rx_dropped was nonzero", reasons)
         self.assertIn("peer daemon CPU saturated", reasons)
+
+        metrics["network"]["rx_dropped"] = 0
+        metrics["udp_errors"]["sndbuf_errors"] = 1
+        metrics["tcp_listen"]["listen_overflows"] = 1
+        for transport in ("tcp", "udp"):
+            with self.subTest(transport=transport):
+                cross_transport = runner.overload_metric_validity_reasons(
+                    metrics,
+                    label="peer",
+                    transport=transport,
+                )
+                self.assertIn("peer UDP sndbuf_errors was nonzero", cross_transport)
+                self.assertIn(
+                    "peer TCP listen_overflows was nonzero", cross_transport
+                )
+
+    def test_controlled_udp_nfqueue_backpressure_exception_is_narrow(self) -> None:
+        metrics = synthetic_result("network_only", "udp")["dut_metrics"]
+        metrics["stop_reason"] = "requested"
+        metrics["udp_errors"]["sndbuf_errors"] = 2
+
+        ordinary = runner.overload_metric_validity_reasons(
+            metrics,
+            label="overload DUT",
+            transport="udp",
+        )
+        self.assertIn("overload DUT UDP sndbuf_errors was nonzero", ordinary)
+
+        controlled = runner.overload_metric_validity_reasons(
+            metrics,
+            label="overload DUT",
+            transport="udp",
+            allow_controlled_udp_send_backpressure=True,
+        )
+        self.assertNotIn(
+            "overload DUT UDP sndbuf_errors was nonzero", controlled
+        )
+
+        metrics["udp_errors"]["rcvbuf_errors"] = 1
+        controlled = runner.overload_metric_validity_reasons(
+            metrics,
+            label="overload DUT",
+            transport="udp",
+            allow_controlled_udp_send_backpressure=True,
+        )
+        self.assertIn("overload DUT UDP rcvbuf_errors was nonzero", controlled)
+
+    def test_clean_overload_recovery_rejects_late_queue_and_daemon_failures(self) -> None:
+        metrics = synthetic_result("application_tcp")["dut_metrics"]
+        metrics["stop_reason"] = "requested"
+        metrics["daemon"] = {
+            "pid": 47,
+            "alive_end": True,
+            "cpu_percent_one_core": 1.0,
+        }
+        metrics["nfqueue"].update(
+            {"kernel_dropped": 0, "user_dropped": 0, "depth_end": 0}
+        )
+        metrics["tcp_retransmits"] = 0
+        self.assertEqual(
+            runner.overload_metric_validity_reasons(
+                metrics,
+                label="recovery",
+                transport="tcp",
+                require_clean_dut_recovery=True,
+                expected_daemon_pid=47,
+            ),
+            [],
+        )
+
+        mutations = {
+            "kernel drop": lambda item: item["nfqueue"].update(
+                {"kernel_dropped": 1}
+            ),
+            "user drop": lambda item: item["nfqueue"].update(
+                {"user_dropped": 1}
+            ),
+            "queued packet": lambda item: item["nfqueue"].update(
+                {"depth_end": 1}
+            ),
+            "retransmit": lambda item: item.update({"tcp_retransmits": 1}),
+            "daemon exit": lambda item: item["daemon"].update(
+                {"alive_end": False}
+            ),
+            "daemon replacement": lambda item: item["daemon"].update(
+                {"pid": 48}
+            ),
+        }
+        for description, mutate in mutations.items():
+            with self.subTest(description=description):
+                changed = json.loads(json.dumps(metrics))
+                mutate(changed)
+                reasons = runner.overload_metric_validity_reasons(
+                    changed,
+                    label="recovery",
+                    transport="tcp",
+                    require_clean_dut_recovery=True,
+                    expected_daemon_pid=47,
+                )
+                self.assertTrue(reasons)
+
+    def test_udp_send_backpressure_requires_direct_kernel_drop_proof(self) -> None:
+        proven_delta = {"kernel_dropped": 4, "user_dropped": 0, "total": 4}
+        counters = {
+            "data_send_failures": 1,
+            "data_send_timeouts": 1,
+            "data_send_enobufs": 0,
+            "data_send_would_block": 0,
+            "data_send_other_os_errors": 0,
+            "barrier_send_failures": 1,
+            "barrier_send_timeouts": 0,
+            "barrier_send_enobufs": 1,
+            "barrier_send_would_block": 0,
+            "barrier_send_other_os_errors": 0,
+        }
+        pressure = {"metrics": counters}
+        evidence = runner.controlled_udp_send_backpressure_evidence(
+            "udp", True, proven_delta, 1, pressure, 2
+        )
+        self.assertTrue(evidence["exception_eligible"])
+        self.assertTrue(evidence["exception_applied"])
+        self.assertTrue(evidence["classification_exact"])
+        self.assertTrue(evidence["exact_kernel_workload_match"])
+
+        cases = (
+            ("tcp", True, proven_delta, pressure, 2),
+            ("udp", False, proven_delta, pressure, 2),
+            (
+                "udp",
+                True,
+                {"kernel_dropped": 0, "user_dropped": 4, "total": 4},
+                pressure,
+                2,
+            ),
+            (
+                "udp",
+                True,
+                {"kernel_dropped": None, "user_dropped": None, "total": None},
+                pressure,
+                2,
+            ),
+            ("udp", True, proven_delta, pressure, 3),
+            (
+                "udp",
+                True,
+                proven_delta,
+                {
+                    "metrics": {
+                        **counters,
+                        "data_send_other_os_errors": 1,
+                    }
+                },
+                2,
+            ),
+        )
+        for transport, saturation, delta, summary, sndbuf in cases:
+            with self.subTest(
+                transport=transport,
+                saturation=saturation,
+                sndbuf=sndbuf,
+            ):
+                rejected = runner.controlled_udp_send_backpressure_evidence(
+                    transport, saturation, delta, 1, summary, sndbuf
+                )
+                self.assertFalse(rejected["exception_eligible"])
+
+    def test_ci_wrapper_authenticates_controlled_udp_backpressure_evidence(self) -> None:
+        source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
+        for contract in (
+            ".resource_validity.controlled_udp_send_backpressure",
+            "$backpressure.dut_sndbuf_errors",
+            "$overload.dut_metrics.udp_errors.sndbuf_errors",
+            "$backpressure.stall_kernel_drop_delta",
+            "$overload.saturation.stall_drop_delta.kernel_dropped",
+            "$backpressure.exception_eligible",
+            "$backpressure.exception_applied",
+            "$backpressure.workload_send_counters",
+            "$backpressure.total_send_failures",
+            "$pressure.data_send_enobufs",
+            "$pressure.barrier_send_timeouts",
+            ".saturation.pressure_reaped_at_monotonic_ns",
+            ".saturation.threshold_drop_delta",
+            ".dut_metric_boundary.boundary_monotonic_ns",
+            '== "openshield.perf.metrics.control.v2"',
+            '.dut_metrics.stop_reason == "split_boundary"',
+            ".post_resume_dut_metrics.stop_reason",
+            ".metric_starts",
+            "$metric_starts.dut",
+            '== "openshield.perf.metrics.v2"',
+            ".post_resume_dut_metrics.nfqueue.kernel_dropped",
+            ".post_resume_dut_metrics.nfqueue.user_dropped",
+            ".post_resume_dut_metrics.nfqueue.depth_end",
+            ".post_resume_dut_metrics.tcp_retransmits",
+            ".post_resume_dut_metrics.daemon.alive_end",
+            "ordered_positive_timestamps",
+            "u32_counter_delta",
+            "zero_udp_errors",
+            "zero_tcp_listen_errors",
+        ):
+            self.assertIn(contract, source)
 
     def test_post_resume_recovery_waits_for_direct_nfqueue_drain(self) -> None:
         topology = object.__new__(runner.DockerBackendRun)
@@ -2272,15 +2735,79 @@ class MetricAndOutputTests(unittest.TestCase):
             }
         ]
         before_continue = {"observed_at_monotonic_ns": 80}
+        metric_starts = tuple(
+            {
+                "schema": runner.METRICS_CONTROL_SCHEMA,
+                "event": "start",
+                "boundary_monotonic_ns": timestamp,
+            }
+            for timestamp in (1, 2, 3)
+        )
         self.assertTrue(
             runner.overload_evidence_timestamps_ordered(
-                before, 20, saturated, probes, before_continue, 90
+                metric_starts,
+                before,
+                20,
+                saturated,
+                probes,
+                75,
+                before_continue,
+                90,
+                100,
             )
         )
-        probes[0]["completed_at_monotonic_ns"] = 100
         self.assertFalse(
             runner.overload_evidence_timestamps_ordered(
-                before, 20, saturated, probes, before_continue, 90
+                metric_starts,
+                before,
+                20,
+                saturated,
+                probes,
+                95,
+                before_continue,
+                90,
+                100,
+            )
+        )
+        self.assertFalse(
+            runner.overload_evidence_timestamps_ordered(
+                metric_starts,
+                before,
+                20,
+                saturated,
+                probes,
+                75,
+                before_continue,
+                90,
+                85,
+            )
+        )
+        probes[0]["completed_at_monotonic_ns"] = 110
+        self.assertFalse(
+            runner.overload_evidence_timestamps_ordered(
+                metric_starts,
+                before,
+                20,
+                saturated,
+                probes,
+                75,
+                before_continue,
+                90,
+                100,
+            )
+        )
+        late_start = (*metric_starts[:2], {**metric_starts[2], "boundary_monotonic_ns": 11})
+        self.assertFalse(
+            runner.overload_evidence_timestamps_ordered(
+                late_start,
+                before,
+                20,
+                saturated,
+                [],
+                75,
+                before_continue,
+                90,
+                100,
             )
         )
 
@@ -2356,6 +2883,13 @@ class MetricAndOutputTests(unittest.TestCase):
         runner.add_baseline_comparisons([baseline, measured], criteria)
         row = runner.csv_row(measured)
         for field in (
+            "baseline_sample_id",
+            "comparison_order",
+            "execution_sequence",
+            "topology_role",
+            "block_started_monotonic_ns",
+            "block_finished_monotonic_ns",
+            "comparison_gap_seconds",
             "actual_application_mbps",
             "aggregate_dut_pps",
             "cgroup_cpu_percent_one_core",
@@ -2372,6 +2906,24 @@ class MetricAndOutputTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn(field, runner.CSV_FIELDS)
                 self.assertIsNotNone(row[field])
+
+    def test_raw_result_paths_separate_pristine_and_protected_topologies(self) -> None:
+        baseline = synthetic_result("baseline")
+        protected = synthetic_result("network_only")
+        root = Path("/tmp/openshield-perf-test")
+        baseline_path = runner.raw_result_path(root, baseline)
+        protected_path = runner.raw_result_path(root, protected)
+        self.assertEqual(
+            baseline_path.relative_to(root).parts[:3],
+            ("raw", "nftables", "baseline"),
+        )
+        self.assertEqual(
+            protected_path.relative_to(root).parts[:3],
+            ("raw", "nftables", "protected"),
+        )
+        protected["topology_role"] = "../unsafe"
+        with self.assertRaisesRegex(runner.HarnessError, "unsafe raw-evidence"):
+            runner.raw_result_path(root, protected)
 
     def test_csv_exposes_authoritative_nfqueue_counter_deltas(self) -> None:
         criteria = runner.validate_config(
@@ -2422,6 +2974,236 @@ class MetricAndOutputTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["123", "15"])
         self.assertEqual(summary["event"], "summary")
         process.communicate.assert_called_once()
+
+    def test_protocol_reader_never_blocks_on_a_partial_or_noncanonical_line(self) -> None:
+        partial = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                "import sys,time;sys.stdout.write('{');sys.stdout.flush();time.sleep(.5)",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(runner.HarnessError, "bounded deadline"):
+                runner.DockerBackendRun.read_canonical_protocol_document(
+                    partial,
+                    timeout=0.05,
+                    label="test protocol",
+                    buffer_attribute="_test_buffer",
+                )
+            self.assertLess(time.monotonic() - started, 0.3)
+        finally:
+            partial.kill()
+            partial.communicate(timeout=1)
+
+        noncanonical = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                "print('{\"event\": \"ready\"}', flush=True)",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            with self.assertRaisesRegex(runner.HarnessError, "not canonical JSON"):
+                runner.DockerBackendRun.read_canonical_protocol_document(
+                    noncanonical,
+                    timeout=1,
+                    label="test protocol",
+                    buffer_attribute="_test_buffer",
+                )
+        finally:
+            noncanonical.communicate(timeout=1)
+
+    def test_pinned_process_identity_mismatch_is_never_signaled(self) -> None:
+        topology = object.__new__(runner.DockerBackendRun)
+        topology.docker = mock.Mock(
+            return_value=subprocess.CompletedProcess(
+                ["docker", "exec"],
+                42,
+                stdout=b'{"state":"identity_mismatch"}\n',
+                stderr=b"",
+            )
+        )
+        identity = {
+            "pid": 123,
+            "starttime": 456,
+            "executable": "/usr/bin/python3",
+            "uid": runner.WORKLOAD_UID,
+        }
+        with self.assertRaisesRegex(runner.HarnessError, "refusing to signal"):
+            topology.signal_pinned_inner_process(
+                "dut", identity, int(signal.SIGTERM), label="workload"
+            )
+        command = topology.docker.call_args.args[0]
+        self.assertIn("os.pidfd_open", command[7])
+        self.assertIn("pidfd_send_signal", command[7])
+        self.assertEqual(command[-5:], ["123", "456", "/usr/bin/python3", str(runner.WORKLOAD_UID), "15"])
+
+    def test_collector_cleanup_attempts_both_when_first_stop_breaks(self) -> None:
+        topology = object.__new__(runner.DockerBackendRun)
+        topology.stop_metric = mock.Mock(
+            side_effect=[BrokenPipeError("first stop failed"), None]
+        )
+        topology.cancel_pinned_attached_process = mock.Mock(return_value="")
+        first = mock.Mock()
+        second = mock.Mock()
+        second.communicate.return_value = (
+            json.dumps({"schema": runner.METRICS_SCHEMA}) + "\n",
+            None,
+        )
+        identity = {
+            "pid": 1,
+            "starttime": 2,
+            "executable": "/usr/bin/python3",
+            "uid": 0,
+        }
+        with self.assertRaisesRegex(runner.HarnessError, "first stop failed"):
+            topology.finish_metric_collectors(
+                (
+                    ("dut", first, "dut-container", identity),
+                    ("peer", second, "peer-container", identity),
+                )
+        )
+        self.assertEqual(topology.stop_metric.call_count, 2)
+        topology.cancel_pinned_attached_process.assert_called_once_with(
+            first, "dut-container", identity, label="dut"
+        )
+        second.communicate.assert_called_once_with(timeout=10)
+
+    def test_collector_cleanup_reaps_second_when_first_communicate_fails(self) -> None:
+        topology = object.__new__(runner.DockerBackendRun)
+        topology.stop_metric = mock.Mock()
+        topology.cancel_pinned_attached_process = mock.Mock(return_value="")
+        first = mock.Mock()
+        first.communicate.side_effect = OSError("first communicate failed")
+        second = mock.Mock()
+        second.communicate.return_value = (
+            json.dumps({"schema": runner.METRICS_SCHEMA}) + "\n",
+            None,
+        )
+        identity = {
+            "pid": 1,
+            "starttime": 2,
+            "executable": "/usr/bin/python3",
+            "uid": 0,
+        }
+        with self.assertRaisesRegex(runner.HarnessError, "first communicate failed"):
+            topology.finish_metric_collectors(
+                (
+                    ("dut", first, "dut-container", identity),
+                    ("peer", second, "peer-container", identity),
+                )
+            )
+        self.assertEqual(topology.stop_metric.call_count, 2)
+        topology.cancel_pinned_attached_process.assert_called_once_with(
+            first, "dut-container", identity, label="dut"
+        )
+        second.communicate.assert_called_once_with(timeout=10)
+
+    def test_pinned_cleanup_escalates_exactly_and_reaps_attached_cli(self) -> None:
+        topology = object.__new__(runner.DockerBackendRun)
+        topology.signal_pinned_inner_process = mock.Mock(
+            return_value={"state": "signaled"}
+        )
+        process = mock.Mock()
+        process.poll.side_effect = [None, 0]
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["docker", "exec"], 3),
+            ("", None),
+        ]
+        identity = {
+            "pid": 123,
+            "starttime": 456,
+            "executable": "/usr/bin/python3",
+            "uid": runner.WORKLOAD_UID,
+        }
+        self.assertEqual(
+            topology.cancel_pinned_attached_process(
+                process, "dut", identity, label="workload"
+            ),
+            "",
+        )
+        self.assertEqual(
+            topology.signal_pinned_inner_process.call_args_list,
+            [
+                mock.call("dut", identity, int(signal.SIGTERM), label="workload"),
+                mock.call("dut", identity, int(signal.SIGKILL), label="workload"),
+            ],
+        )
+        self.assertEqual(process.communicate.call_count, 2)
+        process.kill.assert_not_called()
+
+    def test_finished_protocol_authenticates_summary_and_holds_process(self) -> None:
+        identity = {
+            "pid": 123,
+            "starttime": 456,
+            "executable": "/usr/bin/python3",
+            "uid": runner.WORKLOAD_UID,
+        }
+        summary = {
+            "schema": runner.WORKLOAD_SCHEMA,
+            "event": "summary",
+            "role": "client",
+            "transport": "tcp",
+            "metrics": {"operations": 1},
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                summary, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        ).hexdigest()
+        finished = {
+            "schema": runner.WORKLOAD_SCHEMA,
+            "event": "finished",
+            "role": "client",
+            "transport": "tcp",
+            "control_protocol": runner.WORKLOAD_CONTROL_PROTOCOL,
+            "boundary_monotonic_ns": 789,
+            "summary_sha256": digest,
+            "exit_code": 0,
+            "hold": "awaiting_release",
+            **identity,
+        }
+        lines = [
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in (summary, finished)
+        ]
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                "import sys,time;print(sys.argv[1],flush=True);print(sys.argv[2],flush=True);time.sleep(5)",
+                *lines,
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            observed_summary, observed_finished = (
+                runner.DockerBackendRun.await_workload_finished(
+                    process, "tcp", identity, timeout=1
+                )
+            )
+            self.assertEqual(observed_summary, summary)
+            self.assertEqual(observed_finished, finished)
+            self.assertIsNone(process.poll())
+        finally:
+            process.kill()
+            process.communicate(timeout=1)
 
     def test_daemon_identity_rejects_wrong_executable_and_signal_is_pinned(self) -> None:
         topology = object.__new__(runner.DockerBackendRun)

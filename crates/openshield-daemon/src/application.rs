@@ -1,14 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, poll};
+use nix::sys::socket::{
+    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, getsockname,
+    recvfrom, sendto, socket,
+};
 use openshield_core::{
     ApplicationIdentity, ApplicationPath, CgroupPath, CommandArgument, ExecutableFileId,
     InterfaceName, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_LINE_BYTES, Rule, RuleSpec, Snapshot,
@@ -22,13 +30,28 @@ const MAX_STATUS_BYTES: usize = 256 * 1024;
 const MAX_STAT_BYTES: usize = 64 * 1024;
 const MAX_CGROUP_BYTES: usize = 256 * 1024;
 const PROC_SCAN_DEADLINE: Duration = Duration::from_millis(250);
+const NETLINK_HEADER_BYTES: usize = 16;
+const INET_DIAG_REQUEST_BYTES: usize = 56;
+const INET_DIAG_MESSAGE_BYTES: usize = 72;
+const SOCK_DIAG_REQUEST_BYTES: usize = NETLINK_HEADER_BYTES + INET_DIAG_REQUEST_BYTES;
+const SOCK_DIAG_RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_SOCK_DIAG_RESPONSE_BYTES: usize = MAX_SOCKET_TABLE_BYTES;
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
+const NLM_F_REQUEST: u16 = 0x01;
+const NLM_F_MULTI: u16 = 0x02;
+const NLM_F_DUMP_INTR: u16 = 0x10;
+const NLM_F_DUMP: u16 = 0x100 | 0x200;
+const NLMSG_ERROR: u16 = 0x02;
+const NLMSG_DONE: u16 = 0x03;
+const NLMSG_OVERRUN: u16 = 0x04;
+const INET_DIAG_NOCOOKIE: u32 = u32::MAX;
 
 #[derive(Debug)]
 struct ProcfsAttributionTimeout;
 
 impl std::fmt::Display for ProcfsAttributionTimeout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("bounded procfs scan timed out")
+        formatter.write_str("bounded application attribution timed out")
     }
 }
 
@@ -63,8 +86,9 @@ impl OutboundConnection {
         );
         match self.protocol {
             TransportProtocol::Tcp | TransportProtocol::Udp => ensure!(
-                self.source_port.is_some() && self.destination_port.is_some(),
-                "transport connection has no ports"
+                self.source_port.is_some_and(|port| port != 0)
+                    && self.destination_port.is_some_and(|port| port != 0),
+                "transport connection has missing or reserved ports"
             ),
             TransportProtocol::Icmp => ensure!(
                 self.source_address.is_ipv4()
@@ -237,6 +261,37 @@ impl ApplicationDecisionPolicy {
             .find(|rule| application_rule_matches(rule, connection, identity))
     }
 
+    /// Returns the optional process fields required by application rules whose
+    /// kernel-provided network tuple and socket UID can still match.
+    ///
+    /// This is deliberately a deny-only prefilter: absence of a candidate lets
+    /// the NFQUEUE path reject the packet without scanning procfs, while the
+    /// presence of a candidate never authorizes it. Executable identity and all
+    /// requested optional fields are still captured and race-checked before the
+    /// immutable policy is evaluated.
+    #[must_use]
+    pub(crate) fn enforcement_capture_requirements(
+        &self,
+        connection: &OutboundConnection,
+    ) -> Option<IdentityCaptureRequirements> {
+        let mut requirements = IdentityCaptureRequirements::minimal();
+        let mut candidate_found = false;
+        for rule in &self.snapshot.rules {
+            if !application_rule_network_and_uid_matches(rule, connection) {
+                continue;
+            }
+            let Some(selector) = rule.spec.application.as_ref() else {
+                // The predicate above already rejects this case. Keep the
+                // decision fail-closed if an internal invariant is broken.
+                continue;
+            };
+            candidate_found = true;
+            requirements.command_line |= selector.command_line.is_some();
+            requirements.cgroups |= selector.cgroup.is_some();
+        }
+        candidate_found.then_some(requirements)
+    }
+
     #[must_use]
     pub fn rule_count(&self) -> usize {
         self.snapshot.rules.len()
@@ -245,6 +300,31 @@ impl ApplicationDecisionPolicy {
     #[cfg(test)]
     fn candidate_count(&self, file: ExecutableFileId) -> usize {
         self.rules_by_executable.get(&file).map_or(0, Vec::len)
+    }
+}
+
+/// Optional process fields needed after the mandatory executable/socket
+/// identity has been established. The type is crate-private so external callers
+/// cannot request selective capture; the public resolver retains full capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IdentityCaptureRequirements {
+    command_line: bool,
+    cgroups: bool,
+}
+
+impl IdentityCaptureRequirements {
+    const fn minimal() -> Self {
+        Self {
+            command_line: false,
+            cgroups: false,
+        }
+    }
+
+    const fn full() -> Self {
+        Self {
+            command_line: true,
+            cgroups: true,
+        }
     }
 }
 
@@ -261,13 +341,17 @@ fn application_rule_matches(
     connection: &OutboundConnection,
     identity: &ApplicationIdentity,
 ) -> bool {
-    rule.spec.enabled
-        && rule.spec.direction == openshield_core::Direction::Outbound
+    application_rule_network_and_uid_matches(rule, connection)
         && rule
             .spec
             .application
             .as_ref()
             .is_some_and(|selector| selector.matches(identity))
+}
+
+fn application_rule_network_and_uid_matches(rule: &Rule, connection: &OutboundConnection) -> bool {
+    rule.spec.enabled
+        && rule.spec.direction == openshield_core::Direction::Outbound
         && (rule.spec.protocol == TransportProtocol::Any
             || rule.spec.protocol == connection.protocol)
         && rule
@@ -284,11 +368,21 @@ fn application_rule_matches(
             .interface
             .as_ref()
             .is_none_or(|interface| interface == &connection.output_interface)
+        && rule.spec.application.as_ref().is_some_and(|selector| {
+            selector
+                .uid
+                .is_none_or(|expected| expected == connection.socket_uid)
+        })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ProcfsResolver {
     root: PathBuf,
+    sock_diag: RefCell<Option<SockDiagSocket>>,
+    /// Synthetic procfs roots cannot answer netlink queries. Keeping this
+    /// switch test-only makes a production TCP/UDP downgrade unrepresentable.
+    #[cfg(test)]
+    use_procfs_socket_lookup: bool,
     /// The daemon creates all of its threads with the standard Rust thread
     /// runtime, which shares one descriptor table. Its own TGID can therefore
     /// be checked through `/proc/<tgid>/fd` before and after the external-owner
@@ -328,6 +422,9 @@ impl ProcfsResolver {
     pub fn new() -> Self {
         Self {
             root: PathBuf::from("/proc"),
+            sock_diag: RefCell::new(None),
+            #[cfg(test)]
+            use_procfs_socket_lookup: false,
             daemon_process_id: Some(std::process::id()),
         }
     }
@@ -337,6 +434,8 @@ impl ProcfsResolver {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            sock_diag: RefCell::new(None),
+            use_procfs_socket_lookup: true,
             daemon_process_id: None,
         }
     }
@@ -346,11 +445,29 @@ impl ProcfsResolver {
     pub(crate) fn at_with_daemon_process(root: impl Into<PathBuf>, daemon_process_id: u32) -> Self {
         Self {
             root: root.into(),
+            sock_diag: RefCell::new(None),
+            use_procfs_socket_lookup: true,
             daemon_process_id: Some(daemon_process_id),
         }
     }
 
     pub fn resolve(&self, connection: &OutboundConnection) -> Result<ApplicationIdentity> {
+        self.resolve_with_requirements(connection, IdentityCaptureRequirements::full())
+    }
+
+    pub(crate) fn resolve_for_enforcement(
+        &self,
+        connection: &OutboundConnection,
+        requirements: IdentityCaptureRequirements,
+    ) -> Result<ApplicationIdentity> {
+        self.resolve_with_requirements(connection, requirements)
+    }
+
+    fn resolve_with_requirements(
+        &self,
+        connection: &OutboundConnection,
+        requirements: IdentityCaptureRequirements,
+    ) -> Result<ApplicationIdentity> {
         connection.validate()?;
         let deadline = Instant::now() + PROC_SCAN_DEADLINE;
         let inode = self.resolve_socket_inode(connection, deadline)?;
@@ -370,6 +487,7 @@ impl ProcfsResolver {
                     inode,
                     connection.socket_uid,
                     deadline,
+                    requirements,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -390,6 +508,54 @@ impl ProcfsResolver {
         connection: &OutboundConnection,
         deadline: Instant,
     ) -> Result<u64> {
+        #[cfg(test)]
+        if self.use_procfs_socket_lookup {
+            return self.resolve_socket_inode_from_procfs(connection, deadline);
+        }
+        if matches!(
+            connection.protocol,
+            TransportProtocol::Tcp | TransportProtocol::Udp
+        ) {
+            // There is intentionally no procfs fallback here. A SOCK_DIAG
+            // error, incomplete dump, or ambiguous response denies this
+            // packet instead of changing attribution semantics at runtime.
+            return self
+                .resolve_socket_inode_with_sock_diag(connection, deadline)
+                .context("cannot resolve socket inode through NETLINK_SOCK_DIAG");
+        }
+        self.resolve_socket_inode_from_procfs(connection, deadline)
+    }
+
+    fn resolve_socket_inode_with_sock_diag(
+        &self,
+        connection: &OutboundConnection,
+        deadline: Instant,
+    ) -> Result<u64> {
+        let mut diagnostic = self
+            .sock_diag
+            .try_borrow_mut()
+            .map_err(|_| anyhow!("NETLINK_SOCK_DIAG resolver is already in use"))?;
+        if diagnostic.is_none() {
+            *diagnostic = Some(SockDiagSocket::open(deadline)?);
+        }
+        let result = diagnostic
+            .as_mut()
+            .ok_or_else(|| anyhow!("NETLINK_SOCK_DIAG resolver did not initialize"))?
+            .query(connection, deadline);
+        if result.is_err() {
+            // A timed-out or malformed multipart response can leave unread
+            // datagrams behind. Close the socket on every failed query so a
+            // later packet can never consume stale data under a new sequence.
+            diagnostic.take();
+        }
+        result
+    }
+
+    fn resolve_socket_inode_from_procfs(
+        &self,
+        connection: &OutboundConnection,
+        deadline: Instant,
+    ) -> Result<u64> {
         let table_name = match (connection.protocol, connection.source_address) {
             (TransportProtocol::Tcp, IpAddr::V4(_)) => "tcp",
             (TransportProtocol::Tcp, IpAddr::V6(_)) => "tcp6",
@@ -406,7 +572,8 @@ impl ProcfsResolver {
         )
         .with_context(|| format!("cannot read /proc/self/net/{table_name}"))?;
         let text = std::str::from_utf8(&table).context("socket table is not UTF-8 ASCII")?;
-        let mut candidates = BTreeSet::new();
+        let mut candidate_inode = None;
+        let mut ambiguous = false;
         for (index, line) in text.lines().skip(1).enumerate() {
             ensure_within_deadline(deadline)?;
             ensure!(
@@ -417,18 +584,19 @@ impl ProcfsResolver {
                 && candidate.uid == connection.socket_uid
                 && candidate.matches(connection)
             {
-                candidates.insert(candidate.inode);
+                match candidate_inode {
+                    None => candidate_inode = Some(candidate.inode),
+                    Some(inode) if inode == candidate.inode => {}
+                    Some(_) => ambiguous = true,
+                }
             }
         }
         ensure!(
-            candidates.len() == 1,
+            candidate_inode.is_some() && !ambiguous,
             "socket attribution is missing or ambiguous"
         );
         ensure_within_deadline(deadline)?;
-        candidates
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("socket attribution disappeared"))
+        candidate_inode.ok_or_else(|| anyhow!("socket attribution disappeared"))
     }
 
     fn resolve_unique_process_tasks(
@@ -545,6 +713,7 @@ impl ProcfsResolver {
         inode: u64,
         expected_uid: u32,
         deadline: Instant,
+        requirements: IdentityCaptureRequirements,
     ) -> Result<ApplicationIdentity> {
         let socket_target = format!("socket:[{inode}]");
         let fd_path = verified_socket_fd(process, fd_path, &socket_target, deadline)?;
@@ -570,8 +739,16 @@ impl ProcfsResolver {
         let executable_file = executable_file_id(&executable_metadata)
             .context("cannot identify pinned process executable version")?;
 
-        let command_line = read_command_line(process, deadline)?;
-        let cgroups = read_cgroups(process, deadline)?;
+        let command_line = if requirements.command_line {
+            read_command_line(process, deadline)?
+        } else {
+            Vec::new()
+        };
+        let cgroups = if requirements.cgroups {
+            read_cgroups(process, deadline)?
+        } else {
+            Vec::new()
+        };
 
         ensure_within_deadline(deadline)?;
         let executable_link_after =
@@ -584,8 +761,16 @@ impl ProcfsResolver {
         let executable_file_after = executable_file_id(&executable_after_metadata)
             .context("cannot re-identify pinned process executable version")?;
         ensure_within_deadline(deadline)?;
-        let command_line_after = read_command_line(process, deadline)?;
-        let cgroups_after = read_cgroups(process, deadline)?;
+        let command_line_after = if requirements.command_line {
+            read_command_line(process, deadline)?
+        } else {
+            Vec::new()
+        };
+        let cgroups_after = if requirements.cgroups {
+            read_cgroups(process, deadline)?
+        } else {
+            Vec::new()
+        };
         let start_after = read_start_time(process, deadline)?;
         let uid_after = read_process_fs_uid(process, deadline)?;
         ensure!(
@@ -874,6 +1059,459 @@ fn read_task_state(task: &Path, deadline: Instant) -> Result<u8> {
         .ok_or_else(|| anyhow!("task stat state disappeared"))
 }
 
+#[derive(Debug, Default)]
+struct SockDiagCandidates {
+    inode: Option<u64>,
+    ambiguous: bool,
+    response_bytes: usize,
+    message_count: usize,
+}
+
+impl SockDiagCandidates {
+    fn account_datagram(&mut self, bytes: usize) -> Result<()> {
+        self.response_bytes = self
+            .response_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow!("SOCK_DIAG response byte count overflowed"))?;
+        ensure!(
+            self.response_bytes <= MAX_SOCK_DIAG_RESPONSE_BYTES,
+            "SOCK_DIAG response byte bound exceeded"
+        );
+        Ok(())
+    }
+
+    fn account_message(&mut self) -> Result<()> {
+        self.message_count = self
+            .message_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("SOCK_DIAG response message count overflowed"))?;
+        ensure!(
+            self.message_count <= MAX_PROC_ENTRIES,
+            "SOCK_DIAG response message bound exceeded"
+        );
+        Ok(())
+    }
+
+    fn observe(&mut self, candidate: SocketCandidate, connection: &OutboundConnection) {
+        if candidate.uid != connection.socket_uid || !candidate.matches(connection) {
+            return;
+        }
+        match self.inode {
+            None => self.inode = Some(candidate.inode),
+            Some(inode) if inode == candidate.inode => {}
+            Some(_) => self.ambiguous = true,
+        }
+    }
+
+    fn finish(self) -> Result<u64> {
+        ensure!(
+            self.inode.is_some() && !self.ambiguous,
+            "socket attribution is missing or ambiguous"
+        );
+        self.inode
+            .ok_or_else(|| anyhow!("socket attribution disappeared"))
+    }
+}
+
+#[derive(Debug)]
+struct SockDiagSocket {
+    socket: OwnedFd,
+    local_port_id: u32,
+    sequence: u32,
+    receive_buffer: Box<[u8]>,
+}
+
+impl SockDiagSocket {
+    fn open(deadline: Instant) -> Result<Self> {
+        ensure_within_deadline(deadline)?;
+        let socket = socket(
+            AddressFamily::Netlink,
+            SockType::Raw,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            SockProtocol::NetlinkSockDiag,
+        )
+        .context("cannot create NETLINK_SOCK_DIAG socket")?;
+        bind(socket.as_raw_fd(), &NetlinkAddr::new(0, 0))
+            .context("cannot bind NETLINK_SOCK_DIAG socket")?;
+        let local_address: NetlinkAddr =
+            getsockname(socket.as_raw_fd()).context("cannot inspect NETLINK_SOCK_DIAG socket")?;
+        ensure!(
+            local_address.pid() != 0 && local_address.groups() == 0,
+            "NETLINK_SOCK_DIAG socket has an invalid local address"
+        );
+        ensure_within_deadline(deadline)?;
+        Ok(Self {
+            socket,
+            local_port_id: local_address.pid(),
+            sequence: 0,
+            receive_buffer: vec![0_u8; SOCK_DIAG_RECEIVE_BUFFER_BYTES].into_boxed_slice(),
+        })
+    }
+
+    fn next_sequence(&mut self) -> Result<u32> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("NETLINK_SOCK_DIAG sequence space was exhausted"))?;
+        Ok(self.sequence)
+    }
+
+    fn query(&mut self, connection: &OutboundConnection, deadline: Instant) -> Result<u64> {
+        connection.validate()?;
+        ensure!(
+            matches!(
+                connection.protocol,
+                TransportProtocol::Tcp | TransportProtocol::Udp
+            ),
+            "SOCK_DIAG attribution only supports TCP and UDP"
+        );
+        ensure_within_deadline(deadline)?;
+
+        let sequence = self.next_sequence()?;
+        let request = build_sock_diag_request(connection, sequence, self.local_port_id)?;
+        ensure_within_deadline(deadline)?;
+        let sent = sendto(
+            self.socket.as_raw_fd(),
+            &request,
+            &NetlinkAddr::new(0, 0),
+            MsgFlags::empty(),
+        )
+        .context("cannot send NETLINK_SOCK_DIAG request")?;
+        ensure!(sent == request.len(), "SOCK_DIAG request was truncated");
+
+        let mut candidates = SockDiagCandidates::default();
+        loop {
+            let timeout = attribution_poll_timeout(deadline)?;
+            let mut descriptors = [PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
+            let ready = match poll(&mut descriptors, timeout) {
+                Ok(ready) => ready,
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error).context("cannot poll NETLINK_SOCK_DIAG response"),
+            };
+            if ready == 0 {
+                ensure_within_deadline(deadline)?;
+                continue;
+            }
+            let events = descriptors[0].revents().unwrap_or_else(PollFlags::empty);
+            ensure!(
+                !events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL),
+                "NETLINK_SOCK_DIAG socket failed while receiving a response"
+            );
+            if !events.contains(PollFlags::POLLIN) {
+                continue;
+            }
+
+            let received =
+                match recvfrom::<NetlinkAddr>(self.socket.as_raw_fd(), &mut self.receive_buffer) {
+                    Ok(received) => received,
+                    Err(Errno::EINTR | Errno::EAGAIN) => continue,
+                    // ENOBUFS means that at least one response was lost.
+                    // Continuing could turn an ambiguous socket set into one
+                    // apparently unique inode, so every other error is terminal.
+                    Err(error) => {
+                        return Err(error).context("cannot receive NETLINK_SOCK_DIAG response");
+                    }
+                };
+            let (received_bytes, sender) = received;
+            // recvfrom(2) does not expose MSG_TRUNC. Treat a completely filled
+            // fixed buffer as potentially truncated; this may conservatively
+            // deny an exact-size datagram but cannot hide a missing candidate.
+            ensure!(
+                received_bytes < self.receive_buffer.len(),
+                "NETLINK_SOCK_DIAG datagram reached its truncation boundary"
+            );
+            let sender =
+                sender.ok_or_else(|| anyhow!("SOCK_DIAG response has no sender address"))?;
+            ensure!(
+                sender.pid() == 0 && sender.groups() == 0,
+                "SOCK_DIAG response did not originate from the kernel"
+            );
+            ensure!(received_bytes != 0, "SOCK_DIAG returned an empty datagram");
+            candidates.account_datagram(received_bytes)?;
+            ensure_within_deadline(deadline)?;
+            if process_sock_diag_datagram(
+                &self.receive_buffer[..received_bytes],
+                sequence,
+                self.local_port_id,
+                connection,
+                &mut candidates,
+            )? {
+                ensure_within_deadline(deadline)?;
+                return candidates.finish();
+            }
+            ensure!(
+                !candidates.ambiguous,
+                "socket attribution is missing or ambiguous"
+            );
+        }
+    }
+}
+
+fn attribution_poll_timeout(deadline: Instant) -> Result<u16> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(ProcfsAttributionTimeout)?;
+    if remaining.is_zero() {
+        return Err(ProcfsAttributionTimeout.into());
+    }
+    let milliseconds = remaining.as_millis().clamp(1, u128::from(u16::MAX));
+    u16::try_from(milliseconds).context("attribution poll timeout is out of range")
+}
+
+fn build_sock_diag_request(
+    connection: &OutboundConnection,
+    sequence: u32,
+    local_port_id: u32,
+) -> Result<[u8; SOCK_DIAG_REQUEST_BYTES]> {
+    let source_port = connection
+        .source_port
+        .ok_or_else(|| anyhow!("SOCK_DIAG connection has no source port"))?;
+    let destination_port = connection
+        .destination_port
+        .ok_or_else(|| anyhow!("SOCK_DIAG connection has no destination port"))?;
+    let family = if connection.source_address.is_ipv4() {
+        u8::try_from(libc::AF_INET).context("AF_INET does not fit in the SOCK_DIAG request")?
+    } else {
+        u8::try_from(libc::AF_INET6).context("AF_INET6 does not fit in the SOCK_DIAG request")?
+    };
+    ensure!(
+        connection.source_address.is_ipv4() == connection.destination_address.is_ipv4(),
+        "SOCK_DIAG connection address families differ"
+    );
+    let protocol = match connection.protocol {
+        TransportProtocol::Tcp => u8::try_from(libc::IPPROTO_TCP)
+            .context("TCP protocol does not fit in the SOCK_DIAG request")?,
+        TransportProtocol::Udp => u8::try_from(libc::IPPROTO_UDP)
+            .context("UDP protocol does not fit in the SOCK_DIAG request")?,
+        _ => bail!("SOCK_DIAG request only supports TCP and UDP"),
+    };
+
+    let mut request = [0_u8; SOCK_DIAG_REQUEST_BYTES];
+    request[0..4].copy_from_slice(
+        &u32::try_from(SOCK_DIAG_REQUEST_BYTES)
+            .context("SOCK_DIAG request length does not fit in u32")?
+            .to_ne_bytes(),
+    );
+    request[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    request[12..16].copy_from_slice(&local_port_id.to_ne_bytes());
+    request[16] = family;
+    request[17] = protocol;
+    request[20..24].copy_from_slice(&u32::MAX.to_ne_bytes());
+    request[24..26].copy_from_slice(&source_port.to_be_bytes());
+    // A connected UDP socket carries the packet's destination port, while an
+    // unconnected sender has idiag_dport zero. Leaving the UDP request field
+    // zero asks the kernel for every socket on this local port; strict tuple
+    // verification below retains only the exact or wildcard candidates and is
+    // what makes SO_REUSEPORT ambiguity visible instead of selecting one peer.
+    let diagnostic_destination_port = match connection.protocol {
+        TransportProtocol::Tcp => destination_port,
+        TransportProtocol::Udp => 0,
+        _ => bail!("SOCK_DIAG destination filter only supports TCP and UDP"),
+    };
+    request[26..28].copy_from_slice(&diagnostic_destination_port.to_be_bytes());
+    encode_sock_diag_address(&mut request[28..44], connection.source_address)?;
+    encode_sock_diag_address(&mut request[44..60], connection.destination_address)?;
+    request[64..68].copy_from_slice(&INET_DIAG_NOCOOKIE.to_ne_bytes());
+    request[68..72].copy_from_slice(&INET_DIAG_NOCOOKIE.to_ne_bytes());
+    Ok(request)
+}
+
+fn encode_sock_diag_address(target: &mut [u8], address: IpAddr) -> Result<()> {
+    ensure!(
+        target.len() == 16,
+        "SOCK_DIAG address field has an invalid size"
+    );
+    target.fill(0);
+    match address {
+        IpAddr::V4(address) => target[..4].copy_from_slice(&address.octets()),
+        IpAddr::V6(address) => target.copy_from_slice(&address.octets()),
+    }
+    Ok(())
+}
+
+fn process_sock_diag_datagram(
+    bytes: &[u8],
+    expected_sequence: u32,
+    expected_port_id: u32,
+    connection: &OutboundConnection,
+    candidates: &mut SockDiagCandidates,
+) -> Result<bool> {
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let remaining = bytes
+            .get(offset..)
+            .ok_or_else(|| anyhow!("SOCK_DIAG netlink offset is invalid"))?;
+        ensure!(
+            remaining.len() >= NETLINK_HEADER_BYTES,
+            "SOCK_DIAG netlink header is truncated"
+        );
+        let length = read_ne_u32(&remaining[0..4], "SOCK_DIAG netlink message length")?;
+        let length = usize::try_from(length).context("SOCK_DIAG message length is out of range")?;
+        ensure!(
+            length >= NETLINK_HEADER_BYTES && length <= remaining.len(),
+            "SOCK_DIAG netlink message length is invalid"
+        );
+        let aligned_length = align_netlink_message(length)?;
+        let consumed = if aligned_length <= remaining.len() {
+            aligned_length
+        } else if length == remaining.len() {
+            // Linux may omit only the terminal message's trailing alignment.
+            length
+        } else {
+            bail!("SOCK_DIAG netlink message alignment is invalid");
+        };
+        let message_type = read_ne_u16(&remaining[4..6], "SOCK_DIAG message type")?;
+        let flags = read_ne_u16(&remaining[6..8], "SOCK_DIAG message flags")?;
+        let sequence = read_ne_u32(&remaining[8..12], "SOCK_DIAG message sequence")?;
+        let port_id = read_ne_u32(&remaining[12..16], "SOCK_DIAG message port ID")?;
+        ensure!(
+            sequence == expected_sequence,
+            "SOCK_DIAG response sequence does not match the request"
+        );
+        ensure!(
+            port_id == expected_port_id,
+            "SOCK_DIAG response port ID does not match the bound socket"
+        );
+        ensure!(
+            flags & NLM_F_DUMP_INTR == 0,
+            "SOCK_DIAG dump was interrupted and may be incomplete"
+        );
+        candidates.account_message()?;
+        let payload = &remaining[NETLINK_HEADER_BYTES..length];
+        match message_type {
+            SOCK_DIAG_BY_FAMILY => {
+                ensure!(
+                    flags & NLM_F_MULTI != 0,
+                    "SOCK_DIAG dump response is not multipart"
+                );
+                let candidate = parse_sock_diag_candidate(payload, connection)?;
+                candidates.observe(candidate, connection);
+            }
+            NLMSG_DONE => {
+                ensure!(
+                    consumed == remaining.len(),
+                    "SOCK_DIAG completion is not the final netlink message"
+                );
+                if !payload.is_empty() {
+                    ensure!(
+                        payload.len() >= 4,
+                        "SOCK_DIAG completion status is truncated"
+                    );
+                    let status = read_ne_i32(&payload[..4], "SOCK_DIAG completion status")?;
+                    ensure!(
+                        status == 0,
+                        "kernel terminated SOCK_DIAG dump with status {status}"
+                    );
+                }
+                return Ok(true);
+            }
+            NLMSG_ERROR => {
+                ensure!(payload.len() >= 4, "SOCK_DIAG netlink error is truncated");
+                let error = read_ne_i32(&payload[..4], "SOCK_DIAG netlink error")?;
+                ensure!(
+                    error < 0,
+                    "SOCK_DIAG returned an unexpected successful acknowledgement"
+                );
+                bail!(
+                    "kernel rejected SOCK_DIAG request with errno {}",
+                    error.unsigned_abs()
+                );
+            }
+            NLMSG_OVERRUN => bail!("kernel reported a SOCK_DIAG response overrun"),
+            _ => bail!("SOCK_DIAG returned an unexpected netlink message type"),
+        }
+        offset = offset
+            .checked_add(consumed)
+            .ok_or_else(|| anyhow!("SOCK_DIAG netlink offset overflowed"))?;
+    }
+    Ok(false)
+}
+
+fn parse_sock_diag_candidate(
+    payload: &[u8],
+    connection: &OutboundConnection,
+) -> Result<SocketCandidate> {
+    ensure!(
+        payload.len() >= INET_DIAG_MESSAGE_BYTES,
+        "inet_diag_msg payload is truncated"
+    );
+    let expected_family = if connection.source_address.is_ipv4() {
+        u8::try_from(libc::AF_INET).context("AF_INET is out of range")?
+    } else {
+        u8::try_from(libc::AF_INET6).context("AF_INET6 is out of range")?
+    };
+    ensure!(
+        payload[0] == expected_family,
+        "SOCK_DIAG response address family does not match the request"
+    );
+    let local_address = parse_sock_diag_address(payload[0], &payload[8..24])?;
+    let remote_address = parse_sock_diag_address(payload[0], &payload[24..40])?;
+    Ok(SocketCandidate {
+        local_address,
+        local_port: read_be_u16(&payload[4..6], "SOCK_DIAG local port")?,
+        remote_address,
+        remote_port: read_be_u16(&payload[6..8], "SOCK_DIAG remote port")?,
+        uid: read_ne_u32(&payload[64..68], "SOCK_DIAG socket UID")?,
+        inode: u64::from(read_ne_u32(&payload[68..72], "SOCK_DIAG socket inode")?),
+    })
+}
+
+fn parse_sock_diag_address(family: u8, bytes: &[u8]) -> Result<IpAddr> {
+    let octets: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("SOCK_DIAG address field has an invalid size"))?;
+    if i32::from(family) == libc::AF_INET {
+        ensure!(
+            octets[4..].iter().all(|byte| *byte == 0),
+            "SOCK_DIAG IPv4 address has nonzero extension bytes"
+        );
+        Ok(IpAddr::V4(Ipv4Addr::new(
+            octets[0], octets[1], octets[2], octets[3],
+        )))
+    } else if i32::from(family) == libc::AF_INET6 {
+        Ok(IpAddr::V6(Ipv6Addr::from(octets)))
+    } else {
+        bail!("SOCK_DIAG response has an unsupported address family")
+    }
+}
+
+fn align_netlink_message(length: usize) -> Result<usize> {
+    length
+        .checked_add(3)
+        .map(|value| value & !3)
+        .ok_or_else(|| anyhow!("SOCK_DIAG netlink alignment overflowed"))
+}
+
+fn read_ne_u16(bytes: &[u8], field: &str) -> Result<u16> {
+    let bytes: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("{field} is truncated"))?;
+    Ok(u16::from_ne_bytes(bytes))
+}
+
+fn read_be_u16(bytes: &[u8], field: &str) -> Result<u16> {
+    let bytes: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("{field} is truncated"))?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn read_ne_u32(bytes: &[u8], field: &str) -> Result<u32> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("{field} is truncated"))?;
+    Ok(u32::from_ne_bytes(bytes))
+}
+
+fn read_ne_i32(bytes: &[u8], field: &str) -> Result<i32> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("{field} is truncated"))?;
+    Ok(i32::from_ne_bytes(bytes))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SocketCandidate {
     local_address: IpAddr,
@@ -900,14 +1538,42 @@ impl SocketCandidate {
 }
 
 fn parse_socket_line(line: &str) -> Result<Option<SocketCandidate>> {
-    let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-    if fields.len() < 10 {
+    let mut fields = line.split_ascii_whitespace();
+    let Some(_slot) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(local_endpoint) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(remote_endpoint) = fields.next() else {
+        return Ok(None);
+    };
+    for _ in 0..4 {
+        if fields.next().is_none() {
+            return Ok(None);
+        }
+    }
+    let Some(uid) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(_timeout) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(inode) = fields.next() else {
+        return Ok(None);
+    };
+
+    // TIME_WAIT and other ownerless procfs rows commonly carry inode zero.
+    // They can never participate in attribution, so reject them before doing
+    // the comparatively expensive address parsing while still scanning every
+    // row to preserve ambiguity detection for real socket owners.
+    let inode = inode.parse::<u64>().context("invalid socket inode")?;
+    if inode == 0 {
         return Ok(None);
     }
-    let (local_address, local_port) = parse_proc_endpoint(fields[1])?;
-    let (remote_address, remote_port) = parse_proc_endpoint(fields[2])?;
-    let uid = fields[7].parse::<u32>().context("invalid socket uid")?;
-    let inode = fields[9].parse::<u64>().context("invalid socket inode")?;
+    let uid = uid.parse::<u32>().context("invalid socket uid")?;
+    let (local_address, local_port) = parse_proc_endpoint(local_endpoint)?;
+    let (remote_address, remote_port) = parse_proc_endpoint(remote_endpoint)?;
     Ok(Some(SocketCandidate {
         local_address,
         local_port,
@@ -1133,10 +1799,22 @@ fn ensure_within_deadline(deadline: Instant) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::io::{IoSlice, IoSliceMut, Write as _};
+    use std::net::{SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+    use std::os::fd::RawFd;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::Command;
 
+    use nix::cmsg_space;
+    use nix::sys::socket::{
+        ControlMessage, ControlMessageOwned, SockaddrIn, UnixAddr, recvmsg, sendmsg, setsockopt,
+        sockopt,
+    };
+    use nix::unistd::geteuid;
     use openshield_core::{
-        ApplicationSelector, Direction, Mode, PortRange, RuleName, RuleOrigin, RuleSpec, State,
+        ApplicationSelector, CommandLineMatch, CommandLineSelector, Direction, Mode, PortRange,
+        RuleName, RuleOrigin, RuleSpec, State,
     };
 
     use super::*;
@@ -1211,6 +1889,110 @@ mod tests {
         Ok(())
     }
 
+    fn loopback_connection(
+        protocol: TransportProtocol,
+        source_address: IpAddr,
+        source_port: u16,
+        destination_address: IpAddr,
+        destination_port: u16,
+        uid: u32,
+    ) -> Result<OutboundConnection> {
+        Ok(OutboundConnection {
+            source_address,
+            source_port: Some(source_port),
+            destination_address,
+            destination_port: Some(destination_port),
+            protocol,
+            output_interface: InterfaceName::new("lo")?,
+            socket_uid: uid,
+        })
+    }
+
+    fn synthetic_sock_diag_payload(
+        connection: &OutboundConnection,
+        local_address: IpAddr,
+        remote_address: IpAddr,
+        remote_port: u16,
+        uid: u32,
+        inode: u32,
+    ) -> Result<Vec<u8>> {
+        let mut payload = vec![0_u8; INET_DIAG_MESSAGE_BYTES];
+        payload[0] = if local_address.is_ipv4() {
+            u8::try_from(libc::AF_INET)?
+        } else {
+            u8::try_from(libc::AF_INET6)?
+        };
+        let source_port = connection
+            .source_port
+            .ok_or_else(|| anyhow!("test connection has no source port"))?;
+        payload[4..6].copy_from_slice(&source_port.to_be_bytes());
+        payload[6..8].copy_from_slice(&remote_port.to_be_bytes());
+        encode_sock_diag_address(&mut payload[8..24], local_address)?;
+        encode_sock_diag_address(&mut payload[24..40], remote_address)?;
+        payload[64..68].copy_from_slice(&uid.to_ne_bytes());
+        payload[68..72].copy_from_slice(&inode.to_ne_bytes());
+        Ok(payload)
+    }
+
+    fn synthetic_netlink_message(
+        message_type: u16,
+        flags: u16,
+        sequence: u32,
+        port_id: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let length = NETLINK_HEADER_BYTES
+            .checked_add(payload.len())
+            .ok_or_else(|| anyhow!("test netlink length overflowed"))?;
+        let aligned = align_netlink_message(length)?;
+        let mut message = vec![0_u8; aligned];
+        message[0..4].copy_from_slice(&u32::try_from(length)?.to_ne_bytes());
+        message[4..6].copy_from_slice(&message_type.to_ne_bytes());
+        message[6..8].copy_from_slice(&flags.to_ne_bytes());
+        message[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        message[12..16].copy_from_slice(&port_id.to_ne_bytes());
+        message[16..length].copy_from_slice(payload);
+        Ok(message)
+    }
+
+    fn synthetic_sock_diag_dump(
+        connection: &OutboundConnection,
+        candidates: &[(IpAddr, IpAddr, u16, u32, u32)],
+        sequence: u32,
+        port_id: u32,
+    ) -> Result<Vec<u8>> {
+        let mut dump = Vec::new();
+        for (local, remote, remote_port, uid, inode) in candidates {
+            let payload = synthetic_sock_diag_payload(
+                connection,
+                *local,
+                *remote,
+                *remote_port,
+                *uid,
+                *inode,
+            )?;
+            dump.extend_from_slice(&synthetic_netlink_message(
+                SOCK_DIAG_BY_FAMILY,
+                NLM_F_MULTI,
+                sequence,
+                port_id,
+                &payload,
+            )?);
+        }
+        dump.extend_from_slice(&synthetic_netlink_message(
+            NLMSG_DONE,
+            NLM_F_MULTI,
+            sequence,
+            port_id,
+            &0_i32.to_ne_bytes(),
+        )?);
+        Ok(dump)
+    }
+
+    fn live_socket_inode(file_descriptor: i32) -> Result<u64> {
+        Ok(fs::metadata(format!("/proc/self/fd/{file_descriptor}"))?.ino())
+    }
+
     #[test]
     fn parses_proc_ipv4_and_ipv6_endpoints() -> Result<(), Box<dyn Error>> {
         assert_eq!(
@@ -1221,6 +2003,671 @@ mod tests {
             parse_proc_endpoint("B80D0120000000000000000001000000:0035")?,
             ("2001:db8::1".parse()?, 53)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ownerless_socket_rows_skip_expensive_endpoint_parsing() -> Result<(), Box<dyn Error>> {
+        let ownerless = "0: invalid-local invalid-remote 06 00000000:00000000 \
+                         00:00000000 00000000 1000 0 0";
+        assert_eq!(parse_socket_line(ownerless)?, None);
+
+        let owned = "0: invalid-local invalid-remote 01 00000000:00000000 \
+                     00:00000000 00000000 1000 0 77";
+        assert!(parse_socket_line(owned).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn socket_inode_resolution_deduplicates_one_inode_and_rejects_another()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let net = directory.path().join("self/net");
+        fs::create_dir_all(&net)?;
+        let header = "sl local_address rem_address st tx_queue tr retrnsmt uid timeout inode\n";
+        let first = "0: 0100007F:3039 0100007F:D431 01 00000000:00000000 \
+                     00:00000000 00000000 1000 0 77\n";
+        let duplicate = "1: 0100007F:3039 0100007F:D431 01 00000000:00000000 \
+                         00:00000000 00000000 1000 0 77\n";
+        let conflicting = "2: 0100007F:3039 0100007F:D431 01 00000000:00000000 \
+                           00:00000000 00000000 1000 0 78\n";
+        let table = net.join("udp");
+        fs::write(&table, format!("{header}{first}{duplicate}"))?;
+
+        let resolver = ProcfsResolver::at(directory.path());
+        let connection = OutboundConnection {
+            source_address: "127.0.0.1".parse()?,
+            source_port: Some(12_345),
+            destination_address: "127.0.0.1".parse()?,
+            destination_port: Some(54_321),
+            protocol: TransportProtocol::Udp,
+            output_interface: InterfaceName::new("lo")?,
+            socket_uid: 1_000,
+        };
+        assert_eq!(
+            resolver.resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(1))?,
+            77
+        );
+
+        fs::write(&table, format!("{header}{first}{duplicate}{conflicting}"))?;
+        let Err(error) =
+            resolver.resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(1))
+        else {
+            return Err("two distinct matching inodes were resolved".into());
+        };
+        assert!(error.to_string().contains("missing or ambiguous"));
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_request_encodes_tcp_tuple_and_udp_ambiguity_filter() -> Result<(), Box<dyn Error>>
+    {
+        let tcp = loopback_connection(
+            TransportProtocol::Tcp,
+            "192.0.2.10".parse()?,
+            40_000,
+            "198.51.100.20".parse()?,
+            443,
+            1_000,
+        )?;
+        let request = build_sock_diag_request(&tcp, 77, 88)?;
+        assert_eq!(request.len(), SOCK_DIAG_REQUEST_BYTES);
+        assert_eq!(read_ne_u32(&request[0..4], "length")?, 72);
+        assert_eq!(read_ne_u16(&request[4..6], "type")?, SOCK_DIAG_BY_FAMILY);
+        assert_eq!(
+            read_ne_u16(&request[6..8], "flags")?,
+            NLM_F_REQUEST | NLM_F_DUMP
+        );
+        assert_eq!(read_ne_u32(&request[8..12], "sequence")?, 77);
+        assert_eq!(read_ne_u32(&request[12..16], "port ID")?, 88);
+        assert_eq!(i32::from(request[16]), libc::AF_INET);
+        assert_eq!(i32::from(request[17]), libc::IPPROTO_TCP);
+        assert_eq!(read_ne_u32(&request[20..24], "states")?, u32::MAX);
+        assert_eq!(read_be_u16(&request[24..26], "source port")?, 40_000);
+        assert_eq!(read_be_u16(&request[26..28], "destination port")?, 443);
+        assert_eq!(
+            &request[28..44],
+            &[192, 0, 2, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            &request[44..60],
+            &[198, 51, 100, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(read_ne_u32(&request[64..68], "cookie")?, u32::MAX);
+        assert_eq!(read_ne_u32(&request[68..72], "cookie")?, u32::MAX);
+
+        let mut udp = tcp;
+        udp.protocol = TransportProtocol::Udp;
+        let request = build_sock_diag_request(&udp, 1, 2)?;
+        assert_eq!(i32::from(request[17]), libc::IPPROTO_UDP);
+        assert_eq!(
+            read_be_u16(&request[26..28], "UDP destination filter")?,
+            0,
+            "UDP dump must include connected and unconnected reuseport sockets"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_candidate_parser_checks_family_and_ipv4_extension() -> Result<(), Box<dyn Error>> {
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            "198.51.100.7".parse()?,
+            53,
+            1_000,
+        )?;
+        let payload = synthetic_sock_diag_payload(
+            &connection,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+            1_000,
+            77,
+        )?;
+        let candidate = parse_sock_diag_candidate(&payload, &connection)?;
+        assert!(candidate.local_address.is_unspecified());
+        assert!(candidate.remote_address.is_unspecified());
+        assert_eq!(candidate.local_port, 12_345);
+        assert_eq!(candidate.uid, 1_000);
+        assert_eq!(candidate.inode, 77);
+        assert!(candidate.matches(&connection));
+
+        let mut wrong_family = payload.clone();
+        wrong_family[0] = u8::try_from(libc::AF_INET6)?;
+        assert!(parse_sock_diag_candidate(&wrong_family, &connection).is_err());
+        let mut extended_ipv4 = payload;
+        extended_ipv4[12] = 1;
+        assert!(parse_sock_diag_candidate(&extended_ipv4, &connection).is_err());
+        assert!(parse_sock_diag_candidate(&[0_u8; 71], &connection).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_request_and_response_preserve_ipv6_tuple() -> Result<(), Box<dyn Error>> {
+        let source_address: Ipv6Addr = "2001:db8::10".parse()?;
+        let destination_address: Ipv6Addr = "2001:db8::20".parse()?;
+        let source = IpAddr::V6(source_address);
+        let destination = IpAddr::V6(destination_address);
+        let connection = loopback_connection(
+            TransportProtocol::Tcp,
+            source,
+            40_000,
+            destination,
+            443,
+            1_000,
+        )?;
+        let request = build_sock_diag_request(&connection, 7, 8)?;
+        assert_eq!(i32::from(request[16]), libc::AF_INET6);
+        assert_eq!(&request[28..44], &source_address.octets());
+        assert_eq!(&request[44..60], &destination_address.octets());
+
+        let payload =
+            synthetic_sock_diag_payload(&connection, source, destination, 443, 1_000, 77)?;
+        let candidate = parse_sock_diag_candidate(&payload, &connection)?;
+        assert_eq!(candidate.local_address, source);
+        assert_eq!(candidate.remote_address, destination);
+        assert!(candidate.matches(&connection));
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_dump_deduplicates_inode_and_rejects_reuseport_ambiguity()
+    -> Result<(), Box<dyn Error>> {
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            "198.51.100.7".parse()?,
+            53,
+            1_000,
+        )?;
+        let wildcard = (
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+            1_000,
+            77,
+        );
+        let duplicate = [wildcard, wildcard];
+        let dump = synthetic_sock_diag_dump(&connection, &duplicate, 5, 9)?;
+        let mut candidates = SockDiagCandidates::default();
+        candidates.account_datagram(dump.len())?;
+        assert!(process_sock_diag_datagram(
+            &dump,
+            5,
+            9,
+            &connection,
+            &mut candidates
+        )?);
+        assert_eq!(candidates.finish()?, 77);
+
+        let conflicting = [wildcard, (wildcard.0, wildcard.1, 0, 1_000, 78)];
+        let dump = synthetic_sock_diag_dump(&connection, &conflicting, 5, 9)?;
+        let mut candidates = SockDiagCandidates::default();
+        candidates.account_datagram(dump.len())?;
+        assert!(process_sock_diag_datagram(
+            &dump,
+            5,
+            9,
+            &connection,
+            &mut candidates
+        )?);
+        let error = candidates
+            .finish()
+            .err()
+            .ok_or("ambiguous SOCK_DIAG dump unexpectedly resolved")?;
+        assert!(error.to_string().contains("missing or ambiguous"));
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_dump_filters_full_tuple_uid_and_ownerless_rows() -> Result<(), Box<dyn Error>> {
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            "198.51.100.7".parse()?,
+            53,
+            1_000,
+        )?;
+        let unrelated = [
+            (
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "198.51.100.8".parse()?,
+                53,
+                1_000,
+                70,
+            ),
+            (
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "198.51.100.7".parse()?,
+                53,
+                1_001,
+                71,
+            ),
+            (
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+                1_000,
+                0,
+            ),
+        ];
+        let dump = synthetic_sock_diag_dump(&connection, &unrelated, 5, 9)?;
+        let mut candidates = SockDiagCandidates::default();
+        candidates.account_datagram(dump.len())?;
+        assert!(process_sock_diag_datagram(
+            &dump,
+            5,
+            9,
+            &connection,
+            &mut candidates
+        )?);
+        assert!(candidates.finish().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_netlink_envelope_fails_closed() -> Result<(), Box<dyn Error>> {
+        let connection = loopback_connection(
+            TransportProtocol::Tcp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            443,
+            1_000,
+        )?;
+        let payload = synthetic_sock_diag_payload(
+            &connection,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            443,
+            1_000,
+            77,
+        )?;
+        let valid = synthetic_netlink_message(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI, 5, 9, &payload)?;
+        for (message, sequence, port_id) in [
+            (valid[..15].to_vec(), 5, 9),
+            (valid.clone(), 6, 9),
+            (valid.clone(), 5, 10),
+            (
+                synthetic_netlink_message(SOCK_DIAG_BY_FAMILY, 0, 5, 9, &payload)?,
+                5,
+                9,
+            ),
+            (synthetic_netlink_message(99, NLM_F_MULTI, 5, 9, &[])?, 5, 9),
+        ] {
+            assert!(
+                process_sock_diag_datagram(
+                    &message,
+                    sequence,
+                    port_id,
+                    &connection,
+                    &mut SockDiagCandidates::default(),
+                )
+                .is_err()
+            );
+        }
+
+        let interrupted = synthetic_netlink_message(
+            NLMSG_DONE,
+            NLM_F_MULTI | NLM_F_DUMP_INTR,
+            5,
+            9,
+            &0_i32.to_ne_bytes(),
+        )?;
+        assert!(
+            process_sock_diag_datagram(
+                &interrupted,
+                5,
+                9,
+                &connection,
+                &mut SockDiagCandidates::default(),
+            )
+            .is_err()
+        );
+        let kernel_error =
+            synthetic_netlink_message(NLMSG_ERROR, 0, 5, 9, &(-libc::EPERM).to_ne_bytes())?;
+        assert!(
+            process_sock_diag_datagram(
+                &kernel_error,
+                5,
+                9,
+                &connection,
+                &mut SockDiagCandidates::default(),
+            )
+            .is_err()
+        );
+        let successful_ack = synthetic_netlink_message(NLMSG_ERROR, 0, 5, 9, &0_i32.to_ne_bytes())?;
+        assert!(
+            process_sock_diag_datagram(
+                &successful_ack,
+                5,
+                9,
+                &connection,
+                &mut SockDiagCandidates::default(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_parser_handles_dense_bounded_batch() -> Result<(), Box<dyn Error>> {
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            "198.51.100.7".parse()?,
+            53,
+            1_000,
+        )?;
+        let wildcard = (
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+            1_000,
+            77,
+        );
+        let rows = vec![wildcard; 512];
+        let dump = synthetic_sock_diag_dump(&connection, &rows, 5, 9)?;
+        assert!(dump.len() < SOCK_DIAG_RECEIVE_BUFFER_BYTES);
+        let mut candidates = SockDiagCandidates::default();
+        candidates.account_datagram(dump.len())?;
+        assert!(process_sock_diag_datagram(
+            &dump,
+            5,
+            9,
+            &connection,
+            &mut candidates
+        )?);
+        assert_eq!(candidates.message_count, 513);
+        assert_eq!(candidates.finish()?, 77);
+        Ok(())
+    }
+
+    #[test]
+    fn sock_diag_response_bounds_fail_closed_before_overflow() {
+        let mut bytes = SockDiagCandidates {
+            response_bytes: MAX_SOCK_DIAG_RESPONSE_BYTES,
+            ..SockDiagCandidates::default()
+        };
+        assert!(bytes.account_datagram(1).is_err());
+
+        let mut messages = SockDiagCandidates {
+            message_count: MAX_PROC_ENTRIES,
+            ..SockDiagCandidates::default()
+        };
+        assert!(messages.account_message().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires AF_INET and NETLINK_SOCK_DIAG access"]
+    fn live_sock_diag_resolves_connected_tcp() -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let destination = listener.local_addr()?;
+        let client = TcpStream::connect(destination)?;
+        let (_server, _) = listener.accept()?;
+        let source = client.local_addr()?;
+        let connection = loopback_connection(
+            TransportProtocol::Tcp,
+            source.ip(),
+            source.port(),
+            destination.ip(),
+            destination.port(),
+            geteuid().as_raw(),
+        )?;
+        let expected = live_socket_inode(client.as_raw_fd())?;
+        let resolver = ProcfsResolver::new();
+        let actual =
+            resolver.resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(2))?;
+        assert_eq!(actual, expected);
+        let (first_descriptor, first_sequence) = {
+            let diagnostic = resolver.sock_diag.borrow();
+            let diagnostic = diagnostic
+                .as_ref()
+                .ok_or("successful SOCK_DIAG query did not retain its socket")?;
+            (diagnostic.socket.as_raw_fd(), diagnostic.sequence)
+        };
+        let repeated =
+            resolver.resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(2))?;
+        assert_eq!(repeated, expected);
+        let diagnostic = resolver.sock_diag.borrow();
+        let diagnostic = diagnostic
+            .as_ref()
+            .ok_or("repeated SOCK_DIAG query did not retain its socket")?;
+        assert_eq!(diagnostic.socket.as_raw_fd(), first_descriptor);
+        assert_eq!(diagnostic.sequence, first_sequence + 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires AF_INET and NETLINK_SOCK_DIAG access"]
+    fn live_sock_diag_resolves_connected_udp() -> Result<(), Box<dyn Error>> {
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        client.connect(peer.local_addr()?)?;
+        let source = client.local_addr()?;
+        let destination = peer.local_addr()?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            source.ip(),
+            source.port(),
+            destination.ip(),
+            destination.port(),
+            geteuid().as_raw(),
+        )?;
+        let expected = live_socket_inode(client.as_raw_fd())?;
+        let resolver = ProcfsResolver::new();
+        let actual =
+            resolver.resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(2))?;
+        assert_eq!(actual, expected);
+
+        let second = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        second.connect(destination)?;
+        let second_source = second.local_addr()?;
+        let second_connection = loopback_connection(
+            TransportProtocol::Udp,
+            second_source.ip(),
+            second_source.port(),
+            destination.ip(),
+            destination.port(),
+            geteuid().as_raw(),
+        )?;
+        let second_expected = live_socket_inode(second.as_raw_fd())?;
+        let second_actual = resolver
+            .resolve_socket_inode(&second_connection, Instant::now() + Duration::from_secs(2))?;
+        assert_eq!(second_actual, second_expected);
+        assert_ne!(second_actual, actual);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires AF_INET and NETLINK_SOCK_DIAG access"]
+    fn live_sock_diag_resolves_unconnected_wildcard_udp() -> Result<(), Box<dyn Error>> {
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let client = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let destination = peer.local_addr()?;
+        client.send_to(b"probe", destination)?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            client.local_addr()?.port(),
+            destination.ip(),
+            destination.port(),
+            geteuid().as_raw(),
+        )?;
+        let expected = live_socket_inode(client.as_raw_fd())?;
+        let actual = ProcfsResolver::new()
+            .resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(2))?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires AF_INET and NETLINK_SOCK_DIAG access"]
+    fn live_sock_diag_rejects_udp_reuseport_ambiguity() -> Result<(), Box<dyn Error>> {
+        let first = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            SockProtocol::Udp,
+        )?;
+        setsockopt(&first, sockopt::ReusePort, &true)?;
+        bind(
+            first.as_raw_fd(),
+            &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )?;
+        let first_address: SockaddrIn = getsockname(first.as_raw_fd())?;
+        let first_address = SocketAddrV4::from(first_address);
+        let second = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            SockProtocol::Udp,
+        )?;
+        setsockopt(&second, sockopt::ReusePort, &true)?;
+        bind(second.as_raw_fd(), &SockaddrIn::from(first_address))?;
+
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            first_address.port(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            53,
+            geteuid().as_raw(),
+        )?;
+        let resolver = ProcfsResolver::new();
+        let result =
+            resolver.resolve_socket_inode(&connection, Instant::now() + Duration::from_secs(2));
+        assert!(result.is_err());
+        assert!(result.err().is_some_and(|error| {
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("missing or ambiguous"))
+        }));
+        assert!(
+            resolver.sock_diag.borrow().is_none(),
+            "a failed query retained a potentially contaminated netlink socket"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "helper process for the SCM_RIGHTS live attribution test"]
+    fn scm_rights_socket_owner_helper() -> Result<()> {
+        let Some(control_path) = std::env::var_os("OPENSHIELD_TEST_SCM_RIGHTS_CONTROL") else {
+            // This helper is selected explicitly by the parent test. A broad
+            // `--ignored` run without its private control channel is a no-op.
+            return Ok(());
+        };
+        let mut control = UnixStream::connect(control_path)?;
+        control.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut marker = [0_u8; 1];
+        let mut slices = [IoSliceMut::new(&mut marker)];
+        let mut ancillary = cmsg_space!([RawFd; 1]);
+        let message = recvmsg::<UnixAddr>(
+            control.as_raw_fd(),
+            &mut slices,
+            Some(&mut ancillary),
+            MsgFlags::empty(),
+        )?;
+        ensure!(message.bytes == 1, "SCM_RIGHTS marker was truncated");
+        let mut received_fd = None;
+        for control_message in message.cmsgs()? {
+            match control_message {
+                ControlMessageOwned::ScmRights(descriptors) => {
+                    ensure!(
+                        received_fd.is_none() && descriptors.len() == 1,
+                        "SCM_RIGHTS helper received an ambiguous descriptor set"
+                    );
+                    received_fd = descriptors.first().copied();
+                }
+                _ => bail!("SCM_RIGHTS helper received an unexpected control message"),
+            }
+        }
+        ensure!(
+            received_fd.is_some_and(|descriptor| descriptor >= 0),
+            "SCM_RIGHTS helper received no socket descriptor"
+        );
+        control.write_all(b"R")?;
+        control.read_exact(&mut marker)?;
+        // The received raw descriptor deliberately remains installed until
+        // this short-lived helper process exits; that is the ownership state
+        // the parent resolver must observe through procfs.
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires AF_INET, NETLINK_SOCK_DIAG, SCM_RIGHTS, and host procfs access"]
+    fn live_sock_diag_rejects_scm_rights_shared_process_owner() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let control_path = directory.path().join("scm-rights.sock");
+        let listener = UnixListener::bind(&control_path)?;
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("application::tests::scm_rights_socket_owner_helper")
+            .arg("--test-threads=1")
+            .env("OPENSHIELD_TEST_SCM_RIGHTS_CONTROL", &control_path)
+            .spawn()?;
+        let (mut control, _) = listener.accept()?;
+        control.set_read_timeout(Some(Duration::from_secs(10)))?;
+
+        let application_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let rights = [application_socket.as_raw_fd()];
+        let marker = *b"F";
+        sendmsg::<UnixAddr>(
+            control.as_raw_fd(),
+            &[IoSlice::new(&marker)],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::empty(),
+            None,
+        )?;
+        let mut ready = [0_u8; 1];
+        control.read_exact(&mut ready)?;
+        ensure!(ready == *b"R", "SCM_RIGHTS helper did not become ready");
+
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            application_socket.local_addr()?.port(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            53,
+            geteuid().as_raw(),
+        )?;
+        let resolver = ProcfsResolver {
+            root: PathBuf::from("/proc"),
+            sock_diag: RefCell::new(None),
+            use_procfs_socket_lookup: false,
+            daemon_process_id: None,
+        };
+        let ownership_result = (|| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let inode = resolver.resolve_socket_inode(&connection, deadline)?;
+            let error = resolver
+                .resolve_unique_process_tasks(
+                    inode,
+                    connection.socket_uid,
+                    deadline,
+                    MAX_FDS_PER_TASK,
+                )
+                .err()
+                .ok_or_else(|| anyhow!("SCM_RIGHTS shared owner was attributed uniquely"))?;
+            ensure!(
+                error.to_string().contains("multiple processes"),
+                "SCM_RIGHTS shared owner failed for an unexpected reason: {error:#}"
+            );
+            Ok(())
+        })();
+
+        let stop_result = control.write_all(b"X");
+        let child_status = child.wait()?;
+        stop_result?;
+        ensure!(child_status.success(), "SCM_RIGHTS helper process failed");
+        ownership_result?;
         Ok(())
     }
 
@@ -1278,6 +2725,18 @@ mod tests {
         let indexed = ApplicationDecisionPolicy::new(state.snapshot());
         assert_eq!(indexed.candidate_count(identity.executable_file), 1);
         assert!(indexed.matching_rule(&connection, &identity).is_some());
+        assert_eq!(
+            indexed.enforcement_capture_requirements(&connection),
+            Some(IdentityCaptureRequirements::minimal())
+        );
+
+        let mut wrong_uid = connection.clone();
+        wrong_uid.socket_uid += 1;
+        assert!(
+            indexed
+                .enforcement_capture_requirements(&wrong_uid)
+                .is_none()
+        );
 
         let mut unrelated_binary = identity.clone();
         unrelated_binary.executable_file.inode += 1;
@@ -1292,6 +2751,79 @@ mod tests {
         wrong_destination.destination_address = "203.0.113.8".parse()?;
         assert!(
             matching_application_rule(&state.snapshot(), &wrong_destination, &identity).is_none()
+        );
+        assert!(
+            indexed
+                .enforcement_capture_requirements(&wrong_destination)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_prefilter_requests_only_optional_fields_used_by_candidates()
+    -> Result<(), Box<dyn Error>> {
+        let interface = InterfaceName::new("eth0")?;
+        let executable_file = ExecutableFileId {
+            device: 8,
+            inode: 9,
+            size: 10,
+            ctime_seconds: 11,
+            ctime_nanoseconds: 12,
+        };
+        let mut spec = RuleSpec::new(
+            RuleName::new("exact curl identity")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.7/32".parse()?),
+            Some(PortRange::single(443)?),
+            Some(interface.clone()),
+            RuleOrigin::Manual,
+            true,
+        )?;
+        spec.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new("/usr/bin/curl")?),
+            Some(executable_file),
+            Some(CommandLineSelector::new(
+                CommandLineMatch::Exact,
+                vec![CommandArgument::new("curl")?],
+            )?),
+            Some(1_000),
+            Some(CgroupPath::new("/system.slice/curl.service")?),
+        )?);
+        spec.validate()?;
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        state.create_rule(spec)?;
+        let policy = ApplicationDecisionPolicy::new(state.snapshot());
+        let connection = OutboundConnection {
+            source_address: "192.0.2.1".parse()?,
+            source_port: Some(50_000),
+            destination_address: "203.0.113.7".parse()?,
+            destination_port: Some(443),
+            protocol: TransportProtocol::Tcp,
+            output_interface: interface,
+            socket_uid: 1_000,
+        };
+
+        assert_eq!(
+            policy.enforcement_capture_requirements(&connection),
+            Some(IdentityCaptureRequirements::full())
+        );
+
+        let mut wrong_port = connection.clone();
+        wrong_port.destination_port = Some(444);
+        assert!(
+            policy
+                .enforcement_capture_requirements(&wrong_port)
+                .is_none()
+        );
+        let mut wrong_uid = connection;
+        wrong_uid.socket_uid = 1_001;
+        assert!(
+            policy
+                .enforcement_capture_requirements(&wrong_uid)
+                .is_none()
         );
         Ok(())
     }
@@ -1816,6 +3348,41 @@ mod tests {
     }
 
     #[test]
+    fn enforcing_can_skip_unreferenced_optional_identity_files_but_full_resolve_cannot()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("self/net"))?;
+        fs::write(
+            directory.path().join("self/net/udp"),
+            "sl local_address rem_address st tx_queue tr retrnsmt uid timeout inode\n\
+             0: 0100007F:3039 0100007F:D431 01 00000000:00000000 00:00000000 00000000 1000 0 77\n",
+        )?;
+        let owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        complete_identity_fixture(&owner, 100)?;
+        symlink("socket:[77]", owner.join("fd/3"))?;
+        fs::remove_file(owner.join("cmdline"))?;
+        fs::remove_file(owner.join("cgroup"))?;
+        let resolver = ProcfsResolver::at(directory.path());
+        let connection = OutboundConnection {
+            source_address: "127.0.0.1".parse()?,
+            source_port: Some(12_345),
+            destination_address: "127.0.0.1".parse()?,
+            destination_port: Some(54_321),
+            protocol: TransportProtocol::Udp,
+            output_interface: InterfaceName::new("lo")?,
+            socket_uid: 1_000,
+        };
+
+        let selective = resolver
+            .resolve_for_enforcement(&connection, IdentityCaptureRequirements::minimal())?;
+        assert!(selective.command_line.is_empty());
+        assert!(selective.cgroups.is_empty());
+        assert_eq!(selective.uid, 1_000);
+        assert!(resolver.resolve(&connection).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn every_attribution_rescan_follows_a_socket_moved_to_another_fd() -> Result<(), Box<dyn Error>>
     {
         let directory = tempfile::tempdir()?;
@@ -1879,6 +3446,7 @@ mod tests {
             77,
             1_000,
             Instant::now() + Duration::from_secs(1),
+            IdentityCaptureRequirements::full(),
         )?;
 
         assert_eq!(identity.pid, 200);
@@ -1913,6 +3481,7 @@ mod tests {
             77,
             1_000,
             Instant::now() + Duration::from_secs(1),
+            IdentityCaptureRequirements::full(),
         );
 
         assert!(result.is_err());
