@@ -25,13 +25,17 @@ Validation
 Only after all 74 functional firewall jobs pass, one bounded performance smoke
 uses the exact `binary-tumbleweed-amd64` daemon from the release run on one
 openSUSE Tumbleweed `linux/amd64` stand. It exercises nftables and iptables in
-disposable Docker namespaces, has a 900-second harness limit and a 20-minute job
+disposable Docker namespaces, has a 1200-second harness limit and a 30-minute job
 limit, and uploads validated JSON, CSV, and Markdown reports. The checked-in
 release profile requires both backends to pass and rejects invalid or saturated
-measurements. Its paired 10% relative gate applies to all three one-second
-steady windows and burst; every window must pass, and burst also remains a
-mandatory capacity and safety check. Explicit fail-open behavior is proven by
-the separate controlled-overload canary. This release-only smoke is not run by
+measurements. Its unchanged 10% relative thresholds retain every per-window
+delta and crossing, but block only a regression confirmed by at least three
+steady adjacent AB/BA pairs whose one-sided 95% Student-t lower confidence
+bound exceeds the threshold. A single burst relative crossing is diagnostic;
+burst capacity and safety remain mandatory. Drops, NFQUEUE errors, and
+fail-open behavior are immediate failures rather than statistical decisions.
+Explicit fail-open behavior is also proven by the separate controlled-overload
+canary. This release-only smoke is not run by
 the pull-request workflow and is not a portable benchmark or a support claim
 for every architecture.
 

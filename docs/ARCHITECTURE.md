@@ -73,7 +73,14 @@ against retrying and resynchronizes instead of claiming the change failed.
 The TUI separates Status, Outbound rules, Inbound rules, Events, and Help into
 five tabs selected by `1` through `5` or cycled with `Tab`. Status obtains the
 active typed backend identity from the daemon and displays `nftables` or the
-`iptables`/`ip6tables` fallback independently of observation-stream health.
+`iptables`/`ip6tables` fallback independently of observation-stream health. A
+`StatusV2` snapshot also displays the policy mode and dynamically recomputed
+active policy-path classification. A legacy response is shown as `Unknown`; the
+client never infers acceleration from absent data.
+An active read-only fail-closed quarantine is reported as L3 with the distinct
+`EmergencyBlockAll` reason. Both the level and reason are rendered as an
+emergency, so this state cannot look like an operator-selected healthy
+`BlockAll`.
 
 The outbound view is a projection over the authoritative rule snapshot, not a
 second policy model. It selects exactly one grouping key per rule in priority
@@ -256,6 +263,64 @@ network-only rule is emitted before the queue and can accept the same traffic
 without application attribution. Operators must avoid such overlap when the
 application identity is intended to be mandatory.
 
+## Dynamic active-policy path classification
+
+The daemon derives a typed active-policy path classification from the validated
+snapshot and returns it in `StatusV2`. The value is recomputed after every
+committed mode or rule change and describes the worst-case, most expensive data
+path which the current policy can exercise. It is not kernel-capability
+attestation or runtime fallback negotiation for an otherwise identical policy:
+
+- **L3 `KernelNative`** applies in `BlockAll` and in `Enforcing` when no enabled
+  application-bound rule exists. The selected nftables or iptables compiler
+  expresses the complete active filtering policy in kernel rules.
+- **L2 `ConntrackHybrid`** applies in `Enforcing` when every enabled
+  application-bound rule is TCP. A new TCP connection reaches NFQUEUE for
+  process attribution; after successful authorization, packets in both
+  directions must carry the exact current conntrack domain/generation and the
+  established path remains in the kernel. The generated queue expression is
+  TCP-scoped at this level: unrelated UDP and ICMP traffic is resolved by
+  kernel network rules or the terminal kernel drop and never enters NFQUEUE.
+- **L1 `Nfqueue`** applies throughout `Learning`, and in `Enforcing` when any
+  enabled application-bound rule can match UDP, ICMP, ICMPv6, or `Any`.
+  Otherwise-unmatched original packets on those paths require fresh userspace
+  attribution. This level dominates L2 when both kinds of rule are present.
+- **`Unknown`** is reserved for a legacy response or a runtime whose level has
+  not been verified. It is never interpreted as one of the accelerated paths.
+
+Disabled application rules do not affect the level. Network-only rules and
+packets which match them remain kernel-native at L2 and L1; the reported value
+is a conservative daemon-wide summary, not a statement that every packet takes
+the same route. A successful mode or rule transaction recomputes the level from
+the committed snapshot. Level selection does not relax selector conjunctions,
+rewrite a rule, or substitute a network-only allow for an application rule.
+
+Policy mode, firewall backend, and active-path classification are orthogonal
+status dimensions. Startup first installs `BlockAll`. Its only automatic
+backend fallback is from a fully validated nftables backend to the complete
+iptables/ip6tables bundle when nftables is unusable. The same four status
+values have the same meaning on both backends. Startup does not activate a
+saved non-`BlockAll` policy until the
+non-bypass NFQUEUE consumer and the other required resources are ready. If
+NFQUEUE setup fails, the daemon retains `BlockAll` and exits rather than
+starting with a network-only approximation. A later terminal queue failure
+requests emergency `BlockAll`; it never promotes the level or bypasses the
+queue.
+
+Normal `BlockAll` and emergency quarantine both execute a kernel-native deny
+policy, but they are not operationally equivalent. `StatusV2` reports reason
+`BlockAll` for the operator-selected mode and `EmergencyBlockAll` while the
+engine is poisoned and read-only. The latter permits observation but rejects
+all privileged mutations until recovery.
+
+L3 is a description of the policy currently compiled into nftables or
+iptables, not an eBPF implementation. Version 0.1.31 has no eBPF application
+data plane, does not retain `CAP_BPF`, does not install a kernel module, and
+does not modify boot parameters or MOK state. A future cgroup/BPF-LSM path must
+have separate feature/load/attach/exercise probes, exact rule-equivalence tests,
+and a fail-closed detach/downgrade transaction before it can introduce a higher
+level or change these semantics.
+
 ## Modes
 
 `BlockAll`
@@ -343,6 +408,21 @@ mutation or a restart; the active `Learning` traffic behavior remains in force.
 An argv or unified-v2 cgroup change creates a distinct candidate rather than
 widening an existing learned selector. Operators must therefore conduct Learning
 in a controlled window and review its exact selectors before Enforcing.
+
+Application Learning uses a serialized two-phase persistence transaction.
+Under the `Engine` mutex the worker validates the base state, builds the
+candidate and events, reserves persistence, and installs the pending-candidate
+admission index. Atomic save and file/directory `fsync` then run without that
+mutex, keeping packet snapshots, admission, and verdict rechecks live during
+storage latency. Exact endpoints in the pending candidate are deduplicated.
+Finalization reacquires the mutex, verifies the transaction token and exact base
+state, and publishes state and events only after durable commit. Other
+privileged mutations return `Conflict` while persistence is reserved. Root
+`BlockAll` is the exception: it installs the kernel deny immediately, then
+persists the combined blocked state after the learning write and supersedes its
+finalizer. Recoverable failures retain the prior state and pause persistence;
+unsafe storage, rollback, or base-state outcomes enter fail-closed quarantine.
+
 After a save error the daemon rereads authoritative state: an exact previous
 snapshot is left untouched, while a candidate or unknown result is rolled back.
 Only an ambiguous result together with failed rollback escalates to `BlockAll`. This keeps health
@@ -388,9 +468,20 @@ retransmits, daemon CPU/RSS, interface errors, NFQUEUE drops, and expected queue
 shape. Repeated wrong-executable probes during application bursts and direct
 kernel inspection of a reported quarantine prevent a fail-open result from
 passing. Invalid points are excluded from capacity, and a production maximum
-requires three successful steady repetitions. Host `/proc/softirqs` counters
-are not namespaced or attributable to the daemon; they are interpreted only as
-a paired-baseline delta on a quiet runner. The bounded release smoke follows
+requires three successful steady repetitions.
+
+Relative performance uses predetermined adjacent pristine AB/BA pairs. Every
+window delta and threshold crossing is preserved as evidence. The unchanged
+release threshold is 10%, but it becomes a blocking relative regression only
+when at least three valid steady paired deltas have a one-sided 95% Student-t
+lower confidence bound above that threshold. A single burst has no repeated
+sample confidence claim, so its relative crossing is diagnostic only; its
+validity, configured capacity bounds, and safety are still mandatory. Safety
+signals such as loss, retransmits, NIC or NFQUEUE drops/errors, and fail-open
+behavior fail immediately and are not subject to the statistical relative
+decision. Host `/proc/softirqs` counters are not namespaced or attributable to
+the daemon; they are interpreted only as a paired-baseline delta on a quiet
+runner. The bounded release smoke follows
 the functional firewall E2E jobs, but its three short steady repetitions
 validate the path and safety gate rather than certifying a capacity maximum.
 
@@ -418,8 +509,11 @@ saturation pressure.
 ## Trust boundaries
 
 The daemon trusts the Linux kernel, UID 0, and the selected fixed system backend
-executables. nftables is preferred only after a kernel validation probe. The
-fallback requires complete trusted IPv4 and IPv6 xtables bundles. Executable
+executables. nftables is preferred only after a read-only preflight verifies
+the previous xtables state, table ownership, the exact bounded JSON table,
+chain, and counter queries needed by runtime observation, and a representative
+Learning policy with the kernel's check-only transaction. The fallback requires
+complete trusted IPv4 and IPv6 xtables bundles. Executable
 paths come from compiled allowlists, are metadata-checked, and are invoked with a
 cleared environment and typed arguments, never a shell. The daemon does not load
 plugins, scripts, downloaded policy, eBPF objects, or configuration-selected

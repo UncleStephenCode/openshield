@@ -405,6 +405,7 @@ if [ -n "$native_client_source" ]; then
         --env PYTHONDONTWRITEBYTECODE=1 \
         --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$script_directory/tcp-session.py,dst=/opt/tcp-session.py,readonly" \
         --mount "type=bind,src=$native_client_source,dst=/opt/openshield-e2e-client,readonly" \
         "$client_image" sleep infinity)
 else
@@ -415,6 +416,7 @@ else
         --env PYTHONDONTWRITEBYTECODE=1 \
         --mount "type=bind,src=$artifact_directory,dst=$artifact_mount_destination,readonly" \
         --mount "type=bind,src=$script_directory/ipc_client.py,dst=/opt/ipc_client.py,readonly" \
+        --mount "type=bind,src=$script_directory/tcp-session.py,dst=/opt/tcp-session.py,readonly" \
         "$client_image" sleep infinity)
 fi
 docker start "$client_id" >/dev/null
@@ -562,8 +564,10 @@ wait_for_daemon_ready /tmp/openshield.log 'initial daemon'
 assert_exact_unit_process_state
 if [ "$backend" = nftables ]; then
     expected_backend=nftables
+    expected_backend_protocol=nftables
 else
     expected_backend=iptables/ip6tables
+    expected_backend_protocol=iptables
 fi
 docker exec "$client" grep -Fq "firewall_backend=\"$expected_backend\"" \
     /tmp/openshield.log || {
@@ -581,6 +585,8 @@ fi
 begin_stage 'verify IPC access control'
 status=$(docker exec "$client" python3 /opt/ipc_client.py status)
 case "$status" in *'"mode": "learning"'*) ;; *) printf 'unexpected initial status: %s\n' "$status" >&2; exit 1 ;; esac
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    learning "$expected_backend_protocol" nfqueue learning >/dev/null
 # `docker exec --user` does not consistently initialize supplementary groups
 # across Docker/OCI versions. `runuser` exercises the actual group membership
 # installed inside the isolated client instead of weakening the assertion.
@@ -595,13 +601,126 @@ if docker exec "$client" runuser -u observer -- python3 /opt/ipc_client.py set-m
     exit 1
 fi
 
+begin_stage 'verify automatic runtime compatibility selection'
+docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    enforcing "$expected_backend_protocol" kernel_native network_only >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py set-mode learning >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    learning "$expected_backend_protocol" nfqueue learning >/dev/null
+
 server_ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$server")
 client_ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$client")
 case "$server_ip:$client_ip" in
     *[!0-9.:]*) printf '%s\n' 'unsafe container address' >&2; exit 1 ;;
 esac
 
-begin_stage 'learn outbound TCP and UDP applications'
+begin_stage 'verify application-bound TCP conntrack-hybrid path'
+docker exec --detach "$server" python3 -c '
+import socket
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("0.0.0.0", 18083))
+listener.listen(1)
+open("/tmp/openshield-l2-server-ready", "w", encoding="ascii").close()
+connection, _ = listener.accept()
+with connection:
+    while True:
+        data = connection.recv(4096)
+        if not data:
+            break
+        connection.sendall(data)
+'
+wait_for_marker "$server" /tmp/openshield-l2-server-ready 'TCP echo server'
+l2_tcp_executable=$(docker exec "$client" /bin/sh -c '
+    executable=$(command -v python3) || exit 1
+    readlink -f "$executable"
+')
+case "$l2_tcp_executable" in
+    /*) ;;
+    *) printf '%s\n' 'cannot resolve the TCP session executable' >&2; exit 1 ;;
+esac
+case "$l2_tcp_executable" in
+    *[!A-Za-z0-9._/-]*)
+        printf '%s\n' 'unsafe TCP session executable path' >&2
+        exit 1
+        ;;
+esac
+docker exec --detach "$client" /bin/sh -c '
+    server_address=$1
+    server_port=$2
+    status_file=/tmp/openshield-l2-client.status
+    temporary_status="${status_file}.tmp"
+    if python3 /opt/tcp-session.py "$server_address" "$server_port" \
+        >/tmp/openshield-l2-client.log 2>&1; then
+        client_status=0
+    else
+        client_status=$?
+    fi
+    printf "%s\n" "$client_status" >"$temporary_status"
+    mv -f "$temporary_status" "$status_file"
+' openshield-l2-session "$server_ip" 18083
+wait_for_marker "$client" /tmp/openshield-l2-learning-ready \
+    'application-bound TCP session in Learning'
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+    if docker exec "$client" python3 /opt/ipc_client.py assert-learned \
+        "$l2_tcp_executable" "$server_ip" 18083 tcp; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if [ "$attempt" -ge 50 ]; then
+    docker exec "$client" cat /tmp/openshield-l2-client.log >&2 || true
+    exit 1
+fi
+
+docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    enforcing "$expected_backend_protocol" conntrack_hybrid application_tcp >/dev/null
+docker exec "$client" touch /tmp/openshield-l2-enforcing-first
+wait_for_marker "$client" /tmp/openshield-l2-enforcing-first-ready \
+    'first re-attributed TCP exchange in Enforcing'
+
+# Once the current generation has been attached to the established TCP flow,
+# the next exchange must remain entirely in the conntrack fast path. Pausing
+# the daemon makes a hidden second NFQUEUE attribution impossible while the
+# real socket remains connected.
+daemon_pid=$(docker exec "$client" cat "$daemon_pid_file")
+case "$daemon_pid" in ''|*[!0-9]*) printf '%s\n' 'invalid daemon pid' >&2; exit 1 ;; esac
+docker exec "$client" /bin/sh -c 'kill -STOP "$1"' \
+    openshield-daemon-pause "$daemon_pid"
+l2_fast_path_passed=true
+if ! docker exec "$client" touch /tmp/openshield-l2-enforcing-fast \
+    || ! wait_for_marker "$client" /tmp/openshield-l2-enforcing-fast-ready \
+        'established TCP conntrack fast-path exchange'; then
+    l2_fast_path_passed=false
+fi
+docker exec "$client" /bin/sh -c 'kill -CONT "$1"' \
+    openshield-daemon-resume "$daemon_pid"
+if [ "$l2_fast_path_passed" != true ]; then
+    docker exec "$client" cat /tmp/openshield-l2-client.log >&2 || true
+    printf '%s\n' 'established TCP exchange required the paused NFQUEUE worker' >&2
+    exit 1
+fi
+wait_for_marker "$client" /tmp/openshield-l2-client.status \
+    'application-bound TCP session exit'
+l2_client_status=$(docker exec "$client" cat /tmp/openshield-l2-client.status)
+[ "$l2_client_status" = 0 ] || {
+    docker exec "$client" cat /tmp/openshield-l2-client.log >&2 || true
+    printf 'application-bound TCP session exited with status %s\n' \
+        "$l2_client_status" >&2
+    exit 1
+}
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    enforcing "$expected_backend_protocol" conntrack_hybrid application_tcp >/dev/null
+
+docker exec "$client" python3 /opt/ipc_client.py set-mode learning >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    learning "$expected_backend_protocol" nfqueue learning >/dev/null
+
+begin_stage 'learn mixed outbound TCP and UDP applications'
 docker exec --detach "$server" python3 -c '
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -681,7 +800,7 @@ fi
 attempt=0
 while [ "$attempt" -lt 50 ]; do
     if docker exec "$client" python3 /opt/ipc_client.py assert-learned \
-        "$tcp_executable" "$server_ip" 18081; then
+        "$tcp_executable" "$server_ip" 18081 tcp; then
         break
     fi
     attempt=$((attempt + 1))
@@ -691,7 +810,7 @@ done
 attempt=0
 while [ "$attempt" -lt 50 ]; do
     if docker exec "$client" python3 /opt/ipc_client.py assert-learned \
-        "$udp_executable" "$server_ip" 18082; then
+        "$udp_executable" "$server_ip" 18082 udp; then
         break
     fi
     attempt=$((attempt + 1))
@@ -701,6 +820,8 @@ done
 
 begin_stage 'enforce learned outbound rules'
 docker exec "$client" python3 /opt/ipc_client.py set-mode enforcing >/dev/null
+docker exec "$client" python3 /opt/ipc_client.py assert-runtime \
+    enforcing "$expected_backend_protocol" nfqueue application_per_packet >/dev/null
 run_tcp_client 5
 if ! udp_reply=$(run_udp_client); then
     printf '%s\n' 'learned UDP command failed during Enforcing' >&2
@@ -860,4 +981,4 @@ if docker exec "$client" test -S /run/openshield/control.sock; then
     exit 1
 fi
 
-printf 'PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (%s)\n' "$backend"
+printf 'PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (%s)\n' "$backend"

@@ -23,6 +23,11 @@
 9. `BlockAll` denies forwarded traffic. `Learning` and `Enforcing` delegate it
    to the existing firewall without accepting it or providing forwarding-rule
    CRUD.
+10. Active-policy path reporting cannot turn an unverified or more expensive
+    application path into a claimed kernel fast path. Missing legacy status data
+    is `Unknown`, and an unavailable mandatory NFQUEUE runtime keeps `BlockAll`
+    active and stops startup. A live read-only emergency quarantine is reported
+    as `EmergencyBlockAll`, not as a healthy operator-selected `BlockAll`.
 
 ## Attacker model
 
@@ -83,6 +88,19 @@ are broader than firewall administration alone.
 - Network-only decisions remain in default-drop backend chains. Initial
   application decisions use the fixed NFQUEUE 1337 with no fail-open bypass flag, a
   maximum kernel queue length of 256 packets, and a 512-byte copy range.
+- `StatusV2` reports policy mode, firewall backend, and the dynamically
+  recomputed active-policy path classification as separate typed fields. It is
+  not kernel-capability attestation or fallback negotiation. The value is derived from committed
+  enabled rules: `KernelNative` only for `BlockAll` or application-free
+  `Enforcing`, `ConntrackHybrid` only for TCP-only application `Enforcing`, and
+  `Nfqueue` for `Learning` or any enabled per-packet application protocol.
+  Absent legacy data defaults to `Unknown`. This status is descriptive and
+  cannot broaden a rule. Network-only traffic stays in the kernel at every
+  known level. Failure to initialize mandatory NFQUEUE leaves the bootstrap
+  `BlockAll` policy installed and terminates the daemon instead of falling back
+  to a network-only or queue-bypass policy.
+  The only automatic startup backend fallback is nftables to the complete
+  iptables/ip6tables bundle when nftables cannot be validated.
 - The queue consumer accepts only successfully parsed TCP, UDP, ICMP echo, and
   ICMPv6 echo traffic. It maps the kernel UID and network tuple to exactly one
   socket inode and one owner, then repeats process start-time, socket-fd,
@@ -168,7 +186,13 @@ are broader than firewall administration alone.
   the byte quota or a recoverable save failure discards that batch and pauses
   all automatic learning in the daemon process until a successful privileged
   mutation or restart, while retaining the previous state and active traffic
-  policy.
+  policy. Persistence is two-phase: preparation, reservation, and the pending
+  admission index run under the engine lock, while atomic save and `fsync` run
+  after releasing it. Exact pending matches are deduplicated; state and events
+  are published only after durable commit. Other privileged controls return
+  `Conflict`. Root `BlockAll` instead installs the kernel deny immediately and
+  is serialized last. Unsafe storage or base-state outcomes enter fail-closed
+  quarantine rather than publishing an uncommitted candidate.
 - Every daemon start first installs kernel `BlockAll`. Missing state is persisted
   as `Learning`; an existing saved mode is preserved. The engine increments the
   persisted nonzero 30-bit flow generation by exactly one, persists the new
@@ -208,6 +232,16 @@ are broader than firewall administration alone.
   `open_by_handle_at`.
 
 ## Residual risks
+
+- The dynamically recomputed active-policy path is a worst-case classification,
+  not a kernel feature attestation, runtime fallback negotiation for an
+  unchanged policy, or proof that every packet follows one path.
+  `KernelNative` in version 0.1.31 means nftables/iptables policy evaluation; it
+  does not mean eBPF application attribution. This release ships no eBPF
+  application data plane and makes no `CAP_BPF`, boot-parameter, MOK, or kernel
+  module change. The procfs/NFQUEUE attribution risks below therefore remain.
+  The only automatic startup backend fallback is nftables to the complete
+  iptables/ip6tables bundle when nftables cannot be validated.
 
 - The packaged `RequiredBy=network-pre.target` relationship is created by
   `systemctl enable`; merely installing the unit does not activate it. A network

@@ -34,6 +34,23 @@ pub const MAX_STATE_BYTES: usize = 8 * 1024 * 1024;
 /// preserves the remaining 30. Generation exhaustion is fail-closed.
 pub const MAX_FLOW_GENERATION: u32 = 0x3fff_ffff;
 
+/// Kernel/userspace path required by the active policy for outbound
+/// application-aware decisions.
+///
+/// This classification is shared by the policy compilers and runtime status,
+/// so an advertised compatibility level cannot drift from the installed
+/// packet interception policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationInterception {
+    /// No application attribution is required by the active policy.
+    None,
+    /// Only initial TCP packets require attribution; conntrack authorizes the
+    /// established flow after the daemon's decision.
+    TcpInitial,
+    /// At least one eligible protocol requires per-packet attribution.
+    PerPacket,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -45,6 +62,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Returns the application-attribution path required by this snapshot.
+    #[must_use]
+    pub fn application_interception(&self) -> ApplicationInterception {
+        classify_application_interception(self.mode, &self.rules)
+    }
+
     /// Checks rule bounds, identities, and all embedded rule invariants.
     ///
     /// # Errors
@@ -295,6 +318,13 @@ impl State {
     #[must_use]
     pub const fn mode(&self) -> crate::Mode {
         self.mode
+    }
+
+    /// Returns the application-attribution path required by the current
+    /// mutable policy without constructing a snapshot.
+    #[must_use]
+    pub fn application_interception(&self) -> ApplicationInterception {
+        classify_application_interception(self.mode, self.rules.values())
     }
 
     #[must_use]
@@ -793,6 +823,40 @@ impl State {
     }
 }
 
+fn classify_application_interception<'a>(
+    mode: crate::Mode,
+    rules: impl IntoIterator<Item = &'a Rule>,
+) -> ApplicationInterception {
+    match mode {
+        crate::Mode::BlockAll => ApplicationInterception::None,
+        crate::Mode::Learning => ApplicationInterception::PerPacket,
+        crate::Mode::Enforcing => {
+            let mut interception = ApplicationInterception::None;
+            for rule in rules {
+                if !rule.spec.enabled
+                    || rule.spec.direction != Direction::Outbound
+                    || rule.spec.application.is_none()
+                {
+                    continue;
+                }
+
+                match rule.spec.protocol {
+                    crate::TransportProtocol::Tcp => {
+                        interception = ApplicationInterception::TcpInitial;
+                    }
+                    crate::TransportProtocol::Any
+                    | crate::TransportProtocol::Udp
+                    | crate::TransportProtocol::Icmp
+                    | crate::TransportProtocol::IcmpV6 => {
+                        return ApplicationInterception::PerPacket;
+                    }
+                }
+            }
+            interception
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LearnedRuleKey {
     protocol: crate::TransportProtocol,
@@ -1089,6 +1153,48 @@ mod tests {
         )?)
     }
 
+    fn test_application_spec(
+        name: &str,
+        direction: Direction,
+        protocol: TransportProtocol,
+        enabled: bool,
+    ) -> Result<RuleSpec, Box<dyn Error>> {
+        let port = matches!(protocol, TransportProtocol::Tcp | TransportProtocol::Udp)
+            .then(|| PortRange::single(443))
+            .transpose()?;
+        let peer_network = Some(if protocol == TransportProtocol::IcmpV6 {
+            "2001:db8::7/128".parse()?
+        } else {
+            "203.0.113.7/32".parse()?
+        });
+        let mut specification = RuleSpec::new(
+            RuleName::new(name)?,
+            direction,
+            protocol,
+            peer_network,
+            port,
+            None,
+            RuleOrigin::Manual,
+            enabled,
+        )?;
+        specification.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new(
+                "/usr/bin/openshield-interception-test",
+            )?),
+            Some(ExecutableFileId {
+                device: 8,
+                inode: 42,
+                size: 4_096,
+                ctime_seconds: 1_700_000_000,
+                ctime_nanoseconds: 0,
+            }),
+            None,
+            Some(1_000),
+            None,
+        )?);
+        Ok(specification)
+    }
+
     fn learned_application_endpoint(
         address_offset: u32,
         uid: u32,
@@ -1174,6 +1280,127 @@ mod tests {
         assert_eq!(state.mode(), Mode::BlockAll);
         assert_eq!(state.flow_generation(), 1);
         assert!(state.rules().next().is_none());
+        assert_eq!(
+            state.application_interception(),
+            ApplicationInterception::None
+        );
+    }
+
+    #[test]
+    fn application_interception_is_mode_aware() -> Result<(), Box<dyn Error>> {
+        let application_udp = Rule::new(test_application_spec(
+            "application udp",
+            Direction::Outbound,
+            TransportProtocol::Udp,
+            true,
+        )?)?;
+        let block_all = Snapshot {
+            revision: 0,
+            flow_generation: 1,
+            mode: Mode::BlockAll,
+            rules: vec![application_udp],
+        };
+        assert_eq!(
+            block_all.application_interception(),
+            ApplicationInterception::None
+        );
+
+        let learning = Snapshot {
+            revision: 0,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        };
+        assert_eq!(
+            learning.application_interception(),
+            ApplicationInterception::PerPacket
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_interception_ignores_rules_without_an_active_outbound_application_selector()
+    -> Result<(), Box<dyn Error>> {
+        let network = Rule::new(test_spec("network")?)?;
+        let disabled_application = Rule::new(test_application_spec(
+            "disabled application",
+            Direction::Outbound,
+            TransportProtocol::Udp,
+            false,
+        )?)?;
+        let snapshot = Snapshot {
+            revision: 0,
+            flow_generation: 1,
+            mode: Mode::Enforcing,
+            rules: vec![network, disabled_application],
+        };
+        assert_eq!(
+            snapshot.application_interception(),
+            ApplicationInterception::None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_tcp_application_rules_use_initial_packet_attribution() -> Result<(), Box<dyn Error>>
+    {
+        let mut state = State::new();
+        state.create_rule(test_application_spec(
+            "tcp application",
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            true,
+        )?)?;
+        state.set_mode(Mode::Enforcing)?;
+        assert_eq!(
+            state.application_interception(),
+            ApplicationInterception::TcpInitial
+        );
+        assert_eq!(
+            state.snapshot().application_interception(),
+            ApplicationInterception::TcpInitial
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_per_packet_application_protocol_dominates_tcp_in_any_order()
+    -> Result<(), Box<dyn Error>> {
+        let tcp = Rule::new(test_application_spec(
+            "tcp application",
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            true,
+        )?)?;
+        for protocol in [
+            TransportProtocol::Any,
+            TransportProtocol::Udp,
+            TransportProtocol::Icmp,
+            TransportProtocol::IcmpV6,
+        ] {
+            let per_packet = Rule::new(test_application_spec(
+                "per-packet application",
+                Direction::Outbound,
+                protocol,
+                true,
+            )?)?;
+            for rules in [
+                vec![tcp.clone(), per_packet.clone()],
+                vec![per_packet.clone(), tcp.clone()],
+            ] {
+                let snapshot = Snapshot {
+                    revision: 0,
+                    flow_generation: 1,
+                    mode: Mode::Enforcing,
+                    rules,
+                };
+                assert_eq!(
+                    snapshot.application_interception(),
+                    ApplicationInterception::PerPacket
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

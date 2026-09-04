@@ -57,11 +57,16 @@ def exchange(path: str, request: dict[str, Any]) -> dict[str, Any]:
 
 def status() -> dict[str, Any]:
     response = exchange(
-        OBSERVE_SOCKET, {"type": "read", "data": {"type": "status"}}
+        OBSERVE_SOCKET, {"type": "read", "data": {"type": "status_v2"}}
     )
-    if response.get("type") != "status" or not isinstance(response.get("data"), dict):
+    if response.get("type") != "status_v2" or not isinstance(
+        response.get("data"), dict
+    ):
         raise RuntimeError(f"unexpected status response: {response!r}")
-    return response["data"]
+    data = response["data"]
+    if not isinstance(data.get("runtime_compatibility"), dict):
+        raise RuntimeError("status-v2 has no runtime compatibility evidence")
+    return data
 
 
 def rules() -> list[dict[str, Any]]:

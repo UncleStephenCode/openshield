@@ -296,7 +296,9 @@ set +e
                                 valid,
                                 passed,
                                 saturation: {
-                                    proven: (.saturation.proven // null),
+                                    # Preserve explicit false: jq `//` treats
+                                    # false like a missing/null value.
+                                    proven: .saturation.proven,
                                     minimum_nfqueue_drops: (
                                         .saturation.minimum_nfqueue_drops // null
                                     ),
@@ -326,6 +328,13 @@ set +e
                             | group_by(.)
                             | map({reason: .[0], count: length})
                         ),
+                        relative_observation_counts: (
+                            [.results[]?
+                                | .relative_performance_observation_reasons[]?]
+                            | sort
+                            | group_by(.)
+                            | map({reason: .[0], count: length})
+                        ),
                         failed_results: ([.results[]?
                             | select(.valid == true and .passed != true)
                             | {
@@ -346,6 +355,10 @@ set +e
                                 ),
                                 relative_performance_failure_reasons: (
                                     (.relative_performance_failure_reasons // [])
+                                    | reasons
+                                ),
+                                relative_performance_observation_reasons: (
+                                    (.relative_performance_observation_reasons // [])
                                     | reasons
                                 )
                             }
@@ -485,6 +498,15 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and .criteria.require_burst_capacity == true
     and .configuration.criteria.require_burst_capacity == true
     and .configuration.capacity_certification == false
+    and .relative_performance_methodology == {
+        pairing: "predetermined_adjacent_pristine_ab_ba",
+        gate_phase: "steady",
+        burst_relative_role: "diagnostic_only",
+        minimum_paired_samples: 3,
+        confidence_level: 0.95,
+        method: "one_sided_paired_student_t_mean_lower_bound",
+        thresholds_unchanged: true
+    }
     and .harness.schema == "openshield.perf.harness-evidence.v1"
     and (.harness.manifest_sha256
         | type == "string" and test("^[0-9a-f]{64}$"))
@@ -1178,6 +1200,25 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
                        .backend == $backend.name and .phase_role == "burst")
           else true
           end)
+    and all(.results[];
+        if .policy == "baseline" or (.phase_role != "steady" and .phase_role != "burst")
+        then true
+        elif .phase_role == "steady"
+        then (.relative_performance_evidence | type == "array" and length > 0)
+             and all(.relative_performance_evidence[];
+                 .method == "one_sided_paired_student_t_mean_lower_bound"
+                 and .minimum_sample_count == 3
+                 and .confidence_level == 0.95
+                 and (.sample_count | type == "number" and . >= 3)
+                 and (.confirmed_regression == false))
+        else (.relative_performance_evidence | type == "array" and length > 0)
+             and all(.relative_performance_evidence[];
+                 .method == "single_burst_observation_not_a_relative_gate"
+                 and .minimum_sample_count == 3
+                 and .confidence_level == 0.95
+                 and (.sample_count == 0 or .sample_count == 1)
+                 and .confirmed_regression == false)
+        end)
 ' "$report_json" >/dev/null \
     || fail 'report.json does not satisfy the release performance gate'
 

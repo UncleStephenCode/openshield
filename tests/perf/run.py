@@ -43,6 +43,34 @@ import tempfile
 import time
 from typing import Any, Iterable, TextIO
 
+
+# One-sided 95% Student-t critical values for 2..19 degrees of freedom.  The
+# configuration bounds steady repetitions to 20, so this table covers every
+# supported paired sample set without adding a mutable scientific dependency
+# to the release gate.
+ONE_SIDED_T_95 = {
+    2: 2.919986,
+    3: 2.353363,
+    4: 2.131847,
+    5: 2.015048,
+    6: 1.943180,
+    7: 1.894579,
+    8: 1.859548,
+    9: 1.833113,
+    10: 1.812461,
+    11: 1.795885,
+    12: 1.782288,
+    13: 1.770933,
+    14: 1.761310,
+    15: 1.753050,
+    16: 1.745884,
+    17: 1.739607,
+    18: 1.734064,
+    19: 1.729133,
+}
+MINIMUM_RELATIVE_PAIRED_SAMPLES = 3
+RELATIVE_CONFIDENCE_LEVEL = 0.95
+
 def _load_environment_source(
     source_path: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -744,7 +772,12 @@ def validate_config(document: dict[str, Any]) -> dict[str, Any]:
     normalized_ramp = [finite_number(value, "ramp scale", 0.01, 10) for value in ramp_scales]
     if normalized_ramp != sorted(set(normalized_ramp)):
         raise HarnessError("ramp scales must be strictly increasing")
-    integer(phases["steady"].get("repetitions"), "steady repetitions", 1, 20)
+    integer(
+        phases["steady"].get("repetitions"),
+        "steady repetitions",
+        MINIMUM_RELATIVE_PAIRED_SAMPLES,
+        20,
+    )
     finite_number(phases.get("cooldown_seconds"), "cooldown", 0, 300)
     active_seconds = (
         float(phases["warmup"]["duration_seconds"])
@@ -1206,6 +1239,43 @@ def protected_scenarios_for_profile(
     return scenarios
 
 
+def expected_runtime_compatibility(scenario: dict[str, Any]) -> dict[str, str]:
+    """Return the exact policy-derived runtime level required by a scenario."""
+
+    mode = scenario.get("mode")
+    policy = scenario.get("policy")
+    if mode == "learning":
+        return {"level": "nfqueue", "reason": "learning"}
+    if mode != "enforcing":
+        raise HarnessError("protected runtime compatibility requires a policy mode")
+    if policy == "network_only":
+        return {"level": "kernel_native", "reason": "network_only"}
+    if policy == "application_tcp":
+        return {"level": "conntrack_hybrid", "reason": "application_tcp"}
+    if policy == "application_udp":
+        return {"level": "nfqueue", "reason": "application_per_packet"}
+    raise HarnessError("scenario has no defined runtime compatibility level")
+
+
+def validate_runtime_compatibility(
+    status: Any, scenario: dict[str, Any]
+) -> dict[str, str]:
+    """Validate daemon evidence instead of inferring a benchmark packet path."""
+
+    if not isinstance(status, dict):
+        raise HarnessError("daemon runtime status is unavailable")
+    actual = status.get("runtime_compatibility")
+    if not isinstance(actual, dict):
+        raise HarnessError("daemon omitted runtime compatibility evidence")
+    expected = expected_runtime_compatibility(scenario)
+    observed = {"level": actual.get("level"), "reason": actual.get("reason")}
+    if observed != expected:
+        raise HarnessError(
+            f"daemon selected runtime compatibility {observed!r}, expected {expected!r}"
+        )
+    return expected
+
+
 def paired_load_plan(
     config: dict[str, Any], backend: str
 ) -> Iterable[tuple[dict[str, Any], float]]:
@@ -1443,16 +1513,31 @@ def overload_evidence_timestamps_ordered(
     continued_at_ns: int,
     metric_boundary_ns: int,
 ) -> bool:
-    """Verify the stopped-pressure, resume, and metric-boundary ordering."""
+    """Verify the stopped-pressure, resume, and metric-boundary ordering.
+
+    Metric collectors are released together and acknowledge independently, so
+    their start boundaries have no causal order relative to one another.  Each
+    start must instead precede the first queue observation.  Everything after
+    that observation is a single controller-driven causal sequence and remains
+    subject to the stronger pairwise ordering check below.
+    """
 
     if saturation is None:
         return False
+    metric_start_boundaries = [
+        start.get("boundary_monotonic_ns") for start in metric_starts
+    ]
+    before_stop_ns = before_stop.get("observed_at_monotonic_ns")
+    def valid_timestamp(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    if not valid_timestamp(before_stop_ns) or not all(
+        valid_timestamp(start_ns) and start_ns <= before_stop_ns
+        for start_ns in metric_start_boundaries
+    ):
+        return False
     values: list[Any] = [
-        *(
-            start.get("boundary_monotonic_ns")
-            for start in metric_starts
-        ),
-        before_stop.get("observed_at_monotonic_ns"),
+        before_stop_ns,
         stopped_at_ns,
         saturation.get("observed_at_monotonic_ns"),
     ]
@@ -1493,10 +1578,9 @@ def overload_evidence_timestamps_ordered(
             metric_boundary_ns,
         ]
     )
-    return all(
-        isinstance(value, int) and not isinstance(value, bool) and value > 0
-        for value in values
-    ) and all(first <= second for first, second in zip(values, values[1:]))
+    return all(valid_timestamp(value) for value in values) and all(
+        first <= second for first, second in zip(values, values[1:])
+    )
 
 
 def workload_summary_passed(
@@ -3774,6 +3858,7 @@ class DockerBackendRun:
         status_document = self.control(["status"])
         if not isinstance(status_document, dict) or status_document.get("mode") != scenario["mode"]:
             raise HarnessError("daemon did not enter the requested benchmark mode")
+        validate_runtime_compatibility(status_document, scenario)
         return status_document
 
     def start_server(
@@ -7240,16 +7325,17 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
                 unreliable.append(reason)
                 safety_failures.append(reason)
         else:
-            # These counters live for the daemon process. Requiring both
-            # absolute snapshots to remain zero closes the unobserved gaps
-            # between adjacent phase deltas as well as the measured window.
+            # These counters live for the daemon process.  A non-zero delta is
+            # a failure for this window.  Absolute values cannot be used here:
+            # one earlier event would otherwise poison every later window.
+            # apply_nfqueue_counter_continuity() separately checks the first
+            # snapshot and every unmeasured gap between adjacent phases.
             for name in NFQUEUE_RUNTIME_COUNTER_FIELDS:
-                before_value = nested(counter_evidence, "before", name)
-                after_value = nested(counter_evidence, "after", name)
-                if before_value != 0 or after_value != 0:
+                delta = nested(counter_evidence, "delta", name)
+                if delta != 0:
                     reason = (
-                        f"authoritative NFQUEUE {name} counter was nonzero "
-                        "before or after a normal phase"
+                        f"authoritative NFQUEUE {name} counter increased "
+                        "during a normal phase"
                     )
                     failures.append(reason)
                     safety_failures.append(reason)
@@ -7577,6 +7663,168 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
     result["passed"] = result["safety_pass"] and (
         result["capacity_pass"] if capacity_required else True
     )
+
+
+def apply_nfqueue_counter_continuity(
+    results: list[dict[str, Any]], criteria: dict[str, Any]
+) -> None:
+    """Account for cumulative daemon counters exactly once across phase gaps.
+
+    A phase-local before/after delta cannot see a verdict completed after its
+    final status RPC and before the next phase's initial RPC.  Conversely,
+    requiring every absolute process-lifetime counter to remain zero repeats a
+    single event against every later phase.  The protected topology uses one
+    freshly started daemon per backend, so check the first observed snapshot
+    against zero and then compare each adjacent pair of status snapshots.
+    """
+
+    previous_by_backend: dict[str, dict[str, Any] | None] = {}
+    seen_backends: set[str] = set()
+
+    def identity_key(value: Any) -> tuple[int, int, str] | None:
+        if not isinstance(value, dict):
+            return None
+        pid = value.get("pid")
+        starttime = value.get("starttime")
+        executable = value.get("exe")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(starttime, bool)
+            or not isinstance(starttime, int)
+            or starttime <= 0
+            or executable != CONTAINER_DAEMON
+        ):
+            return None
+        return pid, starttime, executable
+
+    for result in results:
+        if result.get("policy") == "baseline":
+            continue
+        backend = result.get("backend")
+        if not isinstance(backend, str):
+            continue
+        counter_evidence = result.get("nfqueue_runtime_counters")
+        continuity: dict[str, Any] = {
+            "measurement": "adjacent_daemon_status_snapshots",
+            "initial_snapshot": backend not in seen_backends,
+            "previous_phase": None,
+            "previous_after": None,
+            "current_before": None,
+            "delta": {name: None for name in NFQUEUE_RUNTIME_COUNTER_FIELDS},
+            "valid": False,
+            "invalid_reasons": [],
+        }
+        result["nfqueue_counter_continuity"] = continuity
+
+        if not isinstance(counter_evidence, dict) or counter_evidence.get("valid") is not True:
+            continuity["invalid_reasons"] = [
+                "phase-local NFQUEUE counter evidence is invalid"
+            ]
+            previous_by_backend[backend] = None
+            seen_backends.add(backend)
+            continue
+
+        before = counter_evidence.get("before")
+        after = counter_evidence.get("after")
+        before_identity = identity_key(counter_evidence.get("identity_before"))
+        after_identity = identity_key(counter_evidence.get("identity_after"))
+        if (
+            not isinstance(before, dict)
+            or not isinstance(after, dict)
+            or before_identity is None
+            or after_identity is None
+        ):
+            # This is defensive: valid phase evidence currently guarantees all
+            # four values, but a report schema change must fail closed.
+            continuity["invalid_reasons"] = [
+                "phase-local NFQUEUE continuity inputs are unavailable"
+            ]
+            result.setdefault("unreliable_reasons", []).append(
+                "authoritative NFQUEUE counter continuity is unavailable"
+            )
+            result.setdefault("safety_failure_reasons", []).append(
+                "authoritative NFQUEUE counter continuity is unavailable"
+            )
+            previous_by_backend[backend] = None
+            seen_backends.add(backend)
+            recompute_result_outcome(result, criteria)
+            continue
+
+        continuity["current_before"] = dict(before)
+        invalid_reasons: list[str] = []
+        increments: dict[str, int] = {}
+        previous = previous_by_backend.get(backend)
+        if backend not in seen_backends:
+            reference = {name: 0 for name in NFQUEUE_RUNTIME_COUNTER_FIELDS}
+            reference_identity = before_identity
+        elif previous is None:
+            reference = None
+            reference_identity = None
+            invalid_reasons.append(
+                "the preceding normal phase has no valid terminal counter snapshot"
+            )
+        else:
+            reference = previous["after"]
+            reference_identity = previous["identity"]
+            continuity["previous_phase"] = previous["phase"]
+            continuity["previous_after"] = dict(reference)
+
+        if reference is not None:
+            if reference_identity != before_identity:
+                invalid_reasons.append(
+                    "daemon identity changed between adjacent normal phases"
+                )
+            else:
+                for name in NFQUEUE_RUNTIME_COUNTER_FIELDS:
+                    first = reference.get(name)
+                    second = before.get(name)
+                    if (
+                        isinstance(first, bool)
+                        or not isinstance(first, int)
+                        or isinstance(second, bool)
+                        or not isinstance(second, int)
+                        or not 0 <= first < U64_MAX
+                        or not 0 <= second < U64_MAX
+                    ):
+                        invalid_reasons.append(
+                            f"NFQUEUE counter {name} cannot establish gap continuity"
+                        )
+                    elif second < first:
+                        invalid_reasons.append(
+                            f"NFQUEUE counter {name} regressed between normal phases"
+                        )
+                    else:
+                        delta = second - first
+                        continuity["delta"][name] = delta
+                        if delta:
+                            increments[name] = delta
+
+        continuity["valid"] = not invalid_reasons
+        continuity["invalid_reasons"] = sorted(set(invalid_reasons))
+        for detail in continuity["invalid_reasons"]:
+            reason = f"authoritative NFQUEUE counter continuity is invalid: {detail}"
+            result.setdefault("unreliable_reasons", []).append(reason)
+            result.setdefault("safety_failure_reasons", []).append(reason)
+        for name, delta in increments.items():
+            reason = (
+                f"authoritative NFQUEUE {name} counter was already {delta} "
+                "at the first normal phase"
+                if continuity["initial_snapshot"]
+                else f"authoritative NFQUEUE {name} counter increased by {delta} "
+                "between adjacent normal phases"
+            )
+            result.setdefault("failure_reasons", []).append(reason)
+            result.setdefault("safety_failure_reasons", []).append(reason)
+
+        previous_by_backend[backend] = {
+            "after": dict(after),
+            "identity": after_identity,
+            "phase": result.get("phase"),
+        }
+        seen_backends.add(backend)
+        recompute_result_outcome(result, criteria)
 
 
 def udp_scenario_accounting(
@@ -7937,6 +8185,165 @@ def relative_reduction_percent(baseline: Any, current: Any) -> float | None:
     return None if increase is None else -increase
 
 
+def relative_metric_specs(transport: Any) -> tuple[tuple[str, str, str], ...]:
+    """Return (measurement, criterion, human description) gate definitions."""
+
+    common = (
+        (
+            "throughput_reduction_percent",
+            "maximum_throughput_reduction_vs_baseline_percent",
+            "application throughput reduction",
+        ),
+        (
+            "aggregate_dut_pps_reduction_percent",
+            "maximum_dut_pps_reduction_vs_baseline_percent",
+            "aggregate DUT PPS reduction",
+        ),
+        (
+            "cgroup_cpu_increase_percent",
+            "maximum_cgroup_cpu_increase_vs_baseline_percent",
+            "DUT cgroup CPU increase",
+        ),
+        *(
+            (
+                f"latency_{percentile}_increase_percent",
+                "maximum_latency_increase_vs_baseline_percent",
+                f"latency {percentile} increase",
+            )
+            for percentile in ("p50", "p95", "p99")
+        ),
+    )
+    if transport != "tcp":
+        return common
+    return (
+        *common,
+        *(
+            (
+                f"connect_latency_{percentile}_increase_percent",
+                "maximum_latency_increase_vs_baseline_percent",
+                f"TCP connect latency {percentile} increase",
+            )
+            for percentile in ("p50", "p95", "p99")
+        ),
+    )
+
+
+def one_sided_mean_lower_bound(values: list[float]) -> float | None:
+    """Return a one-sided 95% lower bound for independent paired deltas."""
+
+    if len(values) < MINIMUM_RELATIVE_PAIRED_SAMPLES:
+        return None
+    critical = ONE_SIDED_T_95.get(len(values) - 1)
+    if critical is None:
+        raise HarnessError("paired relative sample count exceeds the supported bound")
+    mean = sum(values) / len(values)
+    squared_error = sum((value - mean) ** 2 for value in values)
+    sample_deviation = math.sqrt(squared_error / (len(values) - 1))
+    return mean - critical * sample_deviation / math.sqrt(len(values))
+
+
+def apply_confirmed_relative_gates(
+    results: list[dict[str, Any]], criteria: dict[str, Any]
+) -> None:
+    """Gate only regressions confirmed across repeated adjacent AB/BA pairs.
+
+    Per-window deltas remain in ``overhead_vs_baseline`` and threshold
+    crossings remain in ``relative_performance_observation_reasons``. A
+    crossing becomes a release failure only when the one-sided 95% lower
+    confidence bound of at least three steady paired deltas is itself above
+    the unchanged configured threshold. A single burst remains a capacity and
+    safety gate, but is explicitly insufficient for a relative claim.
+    """
+
+    groups: dict[
+        tuple[str, str, str | None, str | None, str, float],
+        list[dict[str, Any]],
+    ] = {}
+    for result in results:
+        if result.get("policy") == "baseline" or result.get("phase_role") != "steady":
+            continue
+        key = (
+            result["backend"],
+            result["policy"],
+            result.get("mode"),
+            result.get("learning_variant"),
+            result["profile"],
+            float(result["load_level"]),
+        )
+        groups.setdefault(key, []).append(result)
+
+    for rows in groups.values():
+        evidence: list[dict[str, Any]] = []
+        for metric_name, criterion_name, description in relative_metric_specs(
+            rows[0].get("transport")
+        ):
+            values = [
+                numeric(row.get("overhead_vs_baseline", {}).get(metric_name))
+                for row in rows
+                if row.get("baseline", {}).get("eligible") is True
+                and row.get("valid") is True
+            ]
+            paired_values = [value for value in values if value is not None]
+            lower_bound = one_sided_mean_lower_bound(paired_values)
+            threshold = float(criteria[criterion_name])
+            confirmed = lower_bound is not None and lower_bound > threshold
+            evidence.append(
+                {
+                    "metric": metric_name,
+                    "description": description,
+                    "threshold_percent": threshold,
+                    "sample_count": len(paired_values),
+                    "minimum_sample_count": MINIMUM_RELATIVE_PAIRED_SAMPLES,
+                    "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
+                    "method": "one_sided_paired_student_t_mean_lower_bound",
+                    "mean_percent": (
+                        sum(paired_values) / len(paired_values)
+                        if paired_values
+                        else None
+                    ),
+                    "lower_confidence_bound_percent": lower_bound,
+                    "confirmed_regression": confirmed,
+                }
+            )
+            if confirmed:
+                reason = (
+                    "paired-sample 95% lower confidence bound for "
+                    f"{description} exceeded the configured bound"
+                )
+                for row in rows:
+                    row["relative_performance_failure_reasons"].append(reason)
+        for row in rows:
+            row["relative_performance_evidence"] = evidence
+            recompute_result_outcome(row, criteria)
+
+    for result in results:
+        if result.get("policy") == "baseline" or result.get("phase_role") != "burst":
+            continue
+        result["relative_performance_evidence"] = [
+            {
+                "metric": metric_name,
+                "description": description,
+                "threshold_percent": float(criteria[criterion_name]),
+                "sample_count": 1
+                if numeric(result.get("overhead_vs_baseline", {}).get(metric_name))
+                is not None
+                else 0,
+                "minimum_sample_count": MINIMUM_RELATIVE_PAIRED_SAMPLES,
+                "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
+                "method": "single_burst_observation_not_a_relative_gate",
+                "mean_percent": numeric(
+                    result.get("overhead_vs_baseline", {}).get(metric_name)
+                ),
+                "lower_confidence_bound_percent": None,
+                "confirmed_regression": False,
+            }
+            for metric_name, criterion_name, description in relative_metric_specs(
+                result.get("transport")
+            )
+        ]
+        recompute_result_outcome(result, criteria)
+
+
 def recompute_result_outcome(
     result: dict[str, Any], criteria: dict[str, Any]
 ) -> None:
@@ -8013,6 +8420,8 @@ def add_baseline_comparisons(
             }
         ]
         result["relative_performance_failure_reasons"] = []
+        result["relative_performance_observation_reasons"] = []
+        result.pop("relative_performance_evidence", None)
         baseline_candidates = baselines.get(
             (
                 result["backend"],
@@ -8168,71 +8577,25 @@ def add_baseline_comparisons(
                     )
                 )
         result["overhead_vs_baseline"] = overhead
-        relative_failures = result["relative_performance_failure_reasons"]
+        observations = result["relative_performance_observation_reasons"]
         if gated_phase and baseline_eligible:
-            gates = (
-                (
-                    "throughput_reduction_percent",
-                    "maximum_throughput_reduction_vs_baseline_percent",
-                    "application throughput reduction",
-                ),
-                (
-                    "aggregate_dut_pps_reduction_percent",
-                    "maximum_dut_pps_reduction_vs_baseline_percent",
-                    "aggregate DUT PPS reduction",
-                ),
-                (
-                    "cgroup_cpu_increase_percent",
-                    "maximum_cgroup_cpu_increase_vs_baseline_percent",
-                    "DUT cgroup CPU increase",
-                ),
-            )
-            for metric_name, criterion_name, description in gates:
+            for metric_name, criterion_name, description in relative_metric_specs(
+                result.get("transport")
+            ):
                 value = numeric(overhead.get(metric_name))
                 if value is None:
-                    relative_failures.append(
+                    result["unreliable_reasons"].append(
                         f"paired-baseline {description} is unavailable"
                     )
                 elif value > criteria[criterion_name]:
-                    relative_failures.append(
-                        f"paired-baseline {description} exceeded the configured bound"
+                    observations.append(
+                        f"single paired window observed {description} above the configured bound"
                     )
-            for percentile in ("p50", "p95", "p99"):
-                value = numeric(
-                    overhead.get(f"latency_{percentile}_increase_percent")
-                )
-                if value is None:
-                    relative_failures.append(
-                        f"paired-baseline latency {percentile} increase is unavailable"
-                    )
-                elif value > criteria[
-                    "maximum_latency_increase_vs_baseline_percent"
-                ]:
-                    relative_failures.append(
-                        f"paired-baseline latency {percentile} increase exceeded the configured bound"
-                    )
-                if result.get("transport") == "tcp":
-                    connect_value = numeric(
-                        overhead.get(
-                            f"connect_latency_{percentile}_increase_percent"
-                        )
-                    )
-                    if connect_value is None:
-                        relative_failures.append(
-                            "paired-baseline TCP connect latency "
-                            f"{percentile} increase is unavailable"
-                        )
-                    elif connect_value > criteria[
-                        "maximum_latency_increase_vs_baseline_percent"
-                    ]:
-                        relative_failures.append(
-                            "paired-baseline TCP connect latency "
-                            f"{percentile} increase exceeded the configured bound"
-                        )
         # Relative overhead is an independent release dimension.  Keep it out
         # of capacity failures so reports can distinguish an unsustainable
         # offered point from a valid point whose firewall overhead is too high.
         recompute_result_outcome(result, criteria)
+    apply_confirmed_relative_gates(results, criteria)
 
 
 def baseline_pairing_evidence(
@@ -9041,6 +9404,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Baseline samples/protected comparisons: {pairing.get('baseline_sample_count', 0)}/{pairing.get('comparison_count', 0)}",
         f"- Maximum baseline comparison gap: {pairing_gap_display}",
         f"- Estimated configured workload time: {report['estimated_workload_seconds']:.1f} s",
+        "- Relative performance method: adjacent AB/BA paired deltas; a regression is blocking only when the one-sided 95% Student-t lower confidence bound from at least three steady repetitions exceeds the unchanged threshold.",
         "",
         "## Environment evidence",
         "",
@@ -9198,6 +9562,33 @@ def markdown_report(report: dict[str, Any]) -> str:
             )
         if len(failed) > 100:
             lines.append(f"- … {len(failed) - 100} additional rows are available in CSV/JSON.")
+    observed = [
+        result
+        for result in report["results"]
+        if result.get("relative_performance_observation_reasons")
+    ]
+    lines.extend(
+        [
+            "",
+            "## Per-window relative observations",
+            "",
+            "These paired windows crossed a 10% threshold. They remain visible whether or not the repeated steady sample established a blocking 95% lower confidence bound; the single burst is diagnostic for relative performance and remains a capacity and safety gate.",
+            "",
+        ]
+    )
+    if not observed:
+        lines.append("None.")
+    else:
+        for result in observed[:100]:
+            lines.append(
+                f"- `{result['backend']}/{result['policy']}/{result['mode'] or 'baseline'}/"
+                f"{result['profile']}/{result['phase']}`: "
+                f"{'; '.join(result['relative_performance_observation_reasons'])}"
+            )
+        if len(observed) > 100:
+            lines.append(
+                f"- … {len(observed) - 100} additional observations are available in CSV/JSON."
+            )
     failed_overload = [
         result
         for result in overload_results
@@ -9758,6 +10149,10 @@ def run_harness(
                     flush=True,
                 )
                 target.run_load_block(scenario, load_level, current)
+            # Attribute process-lifetime NFQUEUE counter changes either to the
+            # measured phase or to the one adjacent unmeasured gap.  This must
+            # run before overload intentionally exercises queue failures.
+            apply_nfqueue_counter_continuity(current, config["criteria"])
             if config["overload"]["enabled"]:
                 for transport in ("tcp", "udp"):
                     profile = next(
@@ -9909,6 +10304,15 @@ def run_harness(
         "baseline_pairing": baseline_pairing,
         "estimated_workload_seconds": config["estimated_workload_seconds"],
         "criteria": config["criteria"],
+        "relative_performance_methodology": {
+            "pairing": "predetermined_adjacent_pristine_ab_ba",
+            "gate_phase": "steady",
+            "burst_relative_role": "diagnostic_only",
+            "minimum_paired_samples": MINIMUM_RELATIVE_PAIRED_SAMPLES,
+            "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
+            "method": "one_sided_paired_student_t_mean_lower_bound",
+            "thresholds_unchanged": True,
+        },
         "backends": backend_results,
         "maximum_sustainable": maxima,
         "overload_plan_complete": overload_plan_complete,

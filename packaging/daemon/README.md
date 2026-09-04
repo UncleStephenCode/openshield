@@ -116,6 +116,14 @@ associate a queued socket inode with protected `/proc/<pid>` metadata across
 local UIDs. The syscall filter denies direct inspection calls including `ptrace`, `process_vm_*`,
 `kcmp`, `pidfd_getfd`, and `open_by_handle_at`.
 
+The dynamically recomputed L3 `KernelNative`, L2 `ConntrackHybrid`, and L1
+`Nfqueue` names reported by `StatusV2` classify the active policy path. They
+are not kernel-capability levels or fallback implementations for an unchanged
+policy. The only automatic startup backend fallback is from nftables to the
+complete iptables/ip6tables bundle. These classifications do not load
+eBPF. Version 0.1.31 deliberately adds neither `CAP_BPF` nor a kernel module,
+boot-parameter change, or MOK enrollment to the packaged service.
+
 This is attack-surface reduction, not complete isolation. After daemon
 compromise, retained capabilities can still permit access to process memory and
 files through other system calls or procfs magic links. Review the

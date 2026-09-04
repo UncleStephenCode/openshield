@@ -51,6 +51,13 @@ is destroyed with the disposable DUT, so this is real persistence for one
 isolated backend run, not state carried between independent harness
 invocations.
 
+The production two-phase Learning path remains active: preparation and pending
+admission run under the engine mutex, while atomic save and file/directory
+`fsync` run after releasing it. Storage latency is therefore part of the
+workload without intentionally stalling packet verdicts on that mutex; exact
+observations covered by the in-flight candidate are deduplicated. The harness
+does not relax fail-closed, NFQUEUE-error, drop, or latency gates during a write.
+
 TCP clients use ordinary nonblocking sockets and complete HTTP/1.1 or bounded
 framed request/response exchanges. UDP clients use persistent ordinary UDP
 sockets. The harness does not inject handcrafted TCP packets. Consequently the
@@ -75,6 +82,21 @@ the pristine baseline DUT. The cases are:
 | `network_only` | Exact network allow is evaluated in the kernel before NFQUEUE; queue sequence delta must be zero (or the explicitly configured tiny noise bound) |
 | `application_tcp` | The first packet of every new TCP connection is attributed through NFQUEUE; established traffic must use the current conntrack generation fast-path |
 | `application_udp` | Every otherwise-unmatched outbound datagram clears the reusable conntrack generation and is attributed again |
+
+For OpenShield 0.1.31, `StatusV2` classifies the worst-case active policy path.
+An `Enforcing` `network_only` case is L3 `KernelNative`; an `Enforcing`
+`application_tcp` case is L2 `ConntrackHybrid`; every `Learning` case and an
+`application_udp` case is L1 `Nfqueue`. Network-only packets remain in the
+kernel even when the policy-wide level is L1. `Unknown` invalidates a claim
+about which OpenShield path was measured. The backend name is recorded
+separately because the nftables-to-iptables startup fallback does not change
+these levels.
+
+These names do not describe an eBPF data plane. Version 0.1.31 exercises the
+existing nftables/iptables, conntrack, NFQUEUE, and procfs paths and introduces
+no `CAP_BPF`, kernel module, boot-parameter, or MOK requirement. The controlled
+NFQUEUE overload case is therefore still the relevant fail-closed saturation
+proof for application attribution.
 
 `network_only` runs in both `Enforcing` and `Learning`. Application cases run
 with a privileged manual executable rule in `Enforcing` and as real learned
@@ -324,15 +346,24 @@ Explicit wrong-executable fail-open behavior is tested separately by the
 independent canary during controlled NFQUEUE overload, so the paired burst
 workloads remain equivalent.
 
-In its steady and burst windows, the release `ci-smoke.json` gate allows at
-most a 10% paired reduction in throughput or DUT PPS and at most a 10% paired
-increase in request p50/p95/p99, TCP connect p50/p95/p99, or DUT-cgroup CPU.
-The pristine AB/BA pairing changes only which predetermined adjacent baseline
-supplies the comparison; these strict 10% limits are unchanged.
-`production-like.json` tightens each relative limit to 5%. Burst additionally
-remains a mandatory capacity and fail-closed safety test. Every ordinary window
-still requires zero application loss/errors, TCP retransmits, NIC drops/errors,
-and NFQUEUE drops/errors. The only intentional exception is
+The release `ci-smoke.json` thresholds remain unchanged: at most a 10% paired
+reduction in throughput or DUT PPS and at most a 10% paired increase in request
+p50/p95/p99, TCP-connect p50/p95/p99, or DUT-cgroup CPU. Every per-window delta
+and every threshold crossing is retained in JSON and Markdown evidence. A
+relative regression becomes blocking only for a group of at least three valid
+steady repetitions when the one-sided 95% Student-t lower confidence bound of
+their adjacent pristine AB/BA paired deltas is itself greater than the
+configured threshold. A noisy single crossing therefore remains visible but
+does not silently become a release claim. `production-like.json` uses the same
+method and tightens each relative limit to 5%.
+
+A single burst has insufficient repeated evidence for that relative
+confidence test, so its relative deltas and crossings are diagnostic only.
+Burst validity, configured capacity ceilings, and fail-closed safety remain
+mandatory and blocking. Safety is never deferred to statistical confirmation:
+application loss/errors, TCP retransmits, NIC drops/errors, NFQUEUE errors or
+drops, a failed identity probe, or any fail-open behavior fails the affected
+ordinary window immediately. The only intentional exception is
 the separately reported controlled-overload proof: there NFQUEUE drops prove
 that saturation actually occurred, an exactly accounted DUT UDP send-buffer
 error may record local fail-closed backpressure before the pressure process is
@@ -430,8 +461,13 @@ observed adjacent-block gap. Every normal phase result, in JSON and CSV, carries
 protected rows must name exactly one adjacent sample and a finite non-negative
 gap.
 
-Relative throughput and p50/p95/p99 latency overhead are paired by backend,
-profile, load level, and phase. A maximum is called capacity-qualified only
+Relative throughput, DUT PPS, request and TCP-connect p50/p95/p99 latency, and
+DUT-cgroup CPU deltas are paired by backend, policy, mode, learning variant,
+profile, load level, and steady phase role. All individual deltas and crossings
+remain in the report. The blocking relative decision is made over at least
+three valid steady AB/BA pairs by the one-sided 95% Student-t lower confidence
+bound described above; a burst contributes diagnostic relative evidence only.
+A maximum is called capacity-qualified only
 when `capacity_certification=true`, at least three steady-state repetitions at
 that load point all remain valid, sustainable, and fail-closed, and every
 configured mandatory burst gate for that point passes as well. With

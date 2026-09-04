@@ -38,7 +38,8 @@ pub use nftables::{
     application_flow_mark, application_handoff_mark, application_pending_mark,
 };
 pub use state::{
-    ApplicationLearningAdmission, ApplicationLearningAdmissionIndex, CoreError, Event, EventKind,
-    LearnOutcome, MAX_FLOW_GENERATION, MAX_RULES, MAX_STATE_BYTES, Snapshot, State,
+    ApplicationInterception, ApplicationLearningAdmission, ApplicationLearningAdmissionIndex,
+    CoreError, Event, EventKind, LearnOutcome, MAX_FLOW_GENERATION, MAX_RULES, MAX_STATE_BYTES,
+    Snapshot, State,
 };
 pub use storage::{AtomicStateStore, StateStore, StorageError};

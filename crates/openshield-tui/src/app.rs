@@ -5,7 +5,7 @@ use openshield_core::{
     InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_LINE_BYTES, Mode,
     PortRange, Rule, RuleName, RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
 };
-use openshield_protocol::{ControlRequest, FirewallBackendKind};
+use openshield_protocol::{ControlRequest, FirewallBackendKind, RuntimeCompatibility};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -766,6 +766,7 @@ pub struct App {
     pub snapshot: Option<Snapshot>,
     rule_ids: HashSet<Uuid>,
     pub backend: Option<FirewallBackendKind>,
+    pub runtime_compatibility: RuntimeCompatibility,
     pub counters: Option<FirewallCounters>,
     pub events: VecDeque<Event>,
     selected_outbound_group: usize,
@@ -796,6 +797,7 @@ impl App {
             snapshot: None,
             rule_ids: HashSet::new(),
             backend: None,
+            runtime_compatibility: RuntimeCompatibility::default(),
             counters: None,
             events: VecDeque::with_capacity(MAX_VISIBLE_EVENTS),
             selected_outbound_group: 0,
@@ -819,10 +821,19 @@ impl App {
 
     #[cfg(test)]
     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
-        self.set_observed_snapshot(snapshot, FirewallBackendKind::Unknown);
+        self.set_observed_snapshot(
+            snapshot,
+            FirewallBackendKind::Unknown,
+            RuntimeCompatibility::default(),
+        );
     }
 
-    pub fn set_observed_snapshot(&mut self, snapshot: Snapshot, backend: FirewallBackendKind) {
+    pub fn set_observed_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+        runtime_compatibility: RuntimeCompatibility,
+    ) {
         if self
             .snapshot
             .as_ref()
@@ -833,22 +844,29 @@ impl App {
         self.rule_ids = snapshot.rules.iter().map(|rule| rule.id).collect();
         self.snapshot = Some(snapshot);
         self.backend = Some(backend);
+        self.runtime_compatibility = runtime_compatibility;
         self.clamp_rule_selection();
     }
 
     #[cfg(test)]
     pub fn set_restarted_snapshot(&mut self, snapshot: Snapshot) {
-        self.set_restarted_observed_snapshot(snapshot, FirewallBackendKind::Unknown);
+        self.set_restarted_observed_snapshot(
+            snapshot,
+            FirewallBackendKind::Unknown,
+            RuntimeCompatibility::default(),
+        );
     }
 
     pub fn set_restarted_observed_snapshot(
         &mut self,
         snapshot: Snapshot,
         backend: FirewallBackendKind,
+        runtime_compatibility: RuntimeCompatibility,
     ) {
         self.rule_ids = snapshot.rules.iter().map(|rule| rule.id).collect();
         self.snapshot = Some(snapshot);
         self.backend = Some(backend);
+        self.runtime_compatibility = runtime_compatibility;
         self.counters = None;
         self.last_counters_at = None;
         self.events.clear();
@@ -864,6 +882,7 @@ impl App {
         self.snapshot = None;
         self.rule_ids.clear();
         self.backend = None;
+        self.runtime_compatibility = RuntimeCompatibility::default();
         self.counters = None;
         self.last_counters_at = None;
         self.reset_rule_selections();
@@ -922,6 +941,14 @@ impl App {
     fn push_event_at(&mut self, event: Event, received_at: Instant) -> bool {
         self.set_telemetry_connected_at(received_at);
         let mut policy_changed = false;
+        let changes_policy = matches!(
+            &event.kind,
+            EventKind::ModeChanged { .. }
+                | EventKind::RuleCreated { .. }
+                | EventKind::RuleUpdated { .. }
+                | EventKind::RuleDeleted { .. }
+                | EventKind::RuleEnabledChanged { .. }
+        );
         let record_event = if let EventKind::CountersUpdated { counters } = &event.kind {
             let values_changed = self.counters.as_ref() != Some(counters);
             self.counters = Some(counters.clone());
@@ -931,14 +958,6 @@ impl App {
             true
         };
         if let Some(snapshot) = &mut self.snapshot {
-            let changes_policy = matches!(
-                &event.kind,
-                EventKind::ModeChanged { .. }
-                    | EventKind::RuleCreated { .. }
-                    | EventKind::RuleUpdated { .. }
-                    | EventKind::RuleDeleted { .. }
-                    | EventKind::RuleEnabledChanged { .. }
-            );
             if changes_policy && event.revision > snapshot.revision.saturating_add(1) {
                 let first = snapshot.revision.saturating_add(1).to_string();
                 let last = event.revision.saturating_sub(1).to_string();
@@ -948,6 +967,11 @@ impl App {
                 ));
             }
             if changes_policy && event.revision > snapshot.revision {
+                // Runtime compatibility is an attestation for one exact
+                // policy. Only a structural event which advances that policy
+                // invalidates it; delayed or duplicate events must not erase
+                // a newer StatusV2 attestation.
+                self.runtime_compatibility = RuntimeCompatibility::default();
                 match &event.kind {
                     EventKind::ModeChanged { current, .. } => snapshot.mode = *current,
                     EventKind::RuleCreated { rule } => {
@@ -1466,6 +1490,7 @@ pub fn peer_label(rule: &Rule, i18n: &I18n) -> String {
 mod tests {
     use chrono::Utc;
     use openshield_core::FirewallCounters;
+    use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 
     use super::*;
 
@@ -2048,6 +2073,64 @@ mod tests {
         assert!(app.counters_age(Instant::now()).is_none());
         assert_eq!(app.overlay, Overlay::None);
         assert!(matches!(app.connection, ConnectionState::Disconnected(_)));
+    }
+
+    #[test]
+    fn structural_event_invalidates_runtime_attestation_but_counters_do_not() {
+        let mut app = App::new(true, I18n::test_english());
+        let attested = RuntimeCompatibility {
+            level: CompatibilityLevel::KernelNative,
+            reason: CompatibilityReason::NetworkOnly,
+        };
+        app.set_observed_snapshot(
+            Snapshot {
+                revision: 2,
+                flow_generation: 1,
+                mode: Mode::Enforcing,
+                rules: Vec::new(),
+            },
+            FirewallBackendKind::Nftables,
+            attested,
+        );
+
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::CountersUpdated {
+                counters: FirewallCounters::default(),
+            },
+        });
+        assert_eq!(app.runtime_compatibility, attested);
+
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::ModeChanged {
+                previous: Mode::Enforcing,
+                current: Mode::Learning,
+            },
+        });
+        assert_eq!(app.runtime_compatibility, attested);
+
+        app.push_event(Event {
+            revision: 1,
+            occurred_at: Utc::now(),
+            kind: EventKind::ModeChanged {
+                previous: Mode::Enforcing,
+                current: Mode::Learning,
+            },
+        });
+        assert_eq!(app.runtime_compatibility, attested);
+
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::ModeChanged {
+                previous: Mode::Enforcing,
+                current: Mode::Learning,
+            },
+        });
+        assert_eq!(app.runtime_compatibility, RuntimeCompatibility::default());
     }
 
     #[test]

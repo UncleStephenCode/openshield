@@ -1,7 +1,10 @@
 use ipnet::IpNet;
 use thiserror::Error;
 
-use crate::{CoreError, Direction, MAX_FLOW_GENERATION, Mode, Rule, Snapshot, TransportProtocol};
+use crate::{
+    ApplicationInterception, CoreError, Direction, MAX_FLOW_GENERATION, Mode, Rule, Snapshot,
+    TransportProtocol,
+};
 
 pub const TABLE_NAME: &str = "openshield";
 pub const LEARNED_TCP_V4_SET: &str = "learned_tcp_v4";
@@ -100,6 +103,7 @@ impl NftablesCompiler {
     /// Returns [`CompileError`] when the snapshot violates a state invariant.
     pub fn compile(snapshot: &Snapshot) -> Result<NftablesPolicy, CompileError> {
         snapshot.validate()?;
+        let interception = snapshot.application_interception();
 
         // `add` is idempotent and makes the following `delete` valid on both
         // first boot and reload. Recreating the dedicated table in one netlink
@@ -111,13 +115,13 @@ impl NftablesCompiler {
         script.push_str("table inet openshield {\n");
         append_named_counters(&mut script);
 
-        append_chain(&mut script, snapshot, Direction::Inbound);
+        append_chain(&mut script, snapshot, Direction::Inbound, interception);
         append_application_mark_sanitization_chain(&mut script);
-        append_chain(&mut script, snapshot, Direction::Outbound);
+        append_chain(&mut script, snapshot, Direction::Outbound, interception);
         // Keep the base-chain topology constant in every mode so integrity
         // observation can enforce one exact structure. In BlockAll, the
         // earlier output chain drops every packet before this chain.
-        append_application_authorization_chain(&mut script, snapshot);
+        append_application_authorization_chain(&mut script, snapshot, interception);
         append_forward_chain(&mut script, snapshot.mode);
         script.push_str("}\n");
 
@@ -156,7 +160,12 @@ fn append_named_counters(script: &mut String) {
     }
 }
 
-fn append_chain(script: &mut String, snapshot: &Snapshot, direction: Direction) {
+fn append_chain(
+    script: &mut String,
+    snapshot: &Snapshot,
+    direction: Direction,
+    interception: ApplicationInterception,
+) {
     let chain_name = match direction {
         Direction::Inbound => "input",
         Direction::Outbound => "output",
@@ -177,9 +186,17 @@ fn append_chain(script: &mut String, snapshot: &Snapshot, direction: Direction) 
         script.push_str(dropped_counter);
         script.push_str(" drop\n");
 
-        if application_interception_required(snapshot) {
-            append_application_flow_accept(script, snapshot, direction, accepted_counter);
-            if direction == Direction::Outbound {
+        if interception != ApplicationInterception::None {
+            append_application_flow_accept(
+                script,
+                snapshot,
+                direction,
+                accepted_counter,
+                interception,
+            );
+            if direction == Direction::Outbound
+                && interception == ApplicationInterception::PerPacket
+            {
                 append_application_non_tcp_connmark_reset(script);
             }
         }
@@ -216,8 +233,8 @@ fn append_chain(script: &mut String, snapshot: &Snapshot, direction: Direction) 
             append_allow_rule(script, rule, direction, true, accepted_counter);
         }
 
-        if application_interception_required(snapshot) && direction == Direction::Outbound {
-            append_application_queue(script);
+        if interception != ApplicationInterception::None && direction == Direction::Outbound {
+            append_application_queue(script, interception);
         }
     }
 
@@ -227,29 +244,28 @@ fn append_chain(script: &mut String, snapshot: &Snapshot, direction: Direction) 
     script.push_str("  }\n");
 }
 
-fn application_interception_required(snapshot: &Snapshot) -> bool {
-    snapshot.mode == Mode::Learning
-        || snapshot.rules.iter().any(|rule| {
-            rule.spec.enabled
-                && rule.spec.direction == Direction::Outbound
-                && rule.spec.application.is_some()
-        })
-}
-
 fn append_application_flow_accept(
     script: &mut String,
     snapshot: &Snapshot,
     direction: Direction,
     accepted_counter: &str,
+    interception: ApplicationInterception,
 ) {
     // A UDP/ICMP conntrack tuple can outlive its owning socket and then be
     // reused by another process. Outbound caching is consequently TCP-only;
     // inbound replies may use the generation mark for the explicit protocol
     // allowlist because every new non-TCP original packet clears and refreshes
     // that mark after successful attribution.
-    let protocol_matches: &[&str] = match direction {
-        Direction::Inbound => &APPLICATION_REPLY_PROTOCOL_MATCHES,
-        Direction::Outbound => &APPLICATION_REPLY_PROTOCOL_MATCHES[..1],
+    let protocol_matches: &[&str] = match (direction, interception) {
+        (_, ApplicationInterception::None) => return,
+        (Direction::Inbound, ApplicationInterception::PerPacket) => {
+            &APPLICATION_REPLY_PROTOCOL_MATCHES
+        }
+        (Direction::Inbound, ApplicationInterception::TcpInitial)
+        | (
+            Direction::Outbound,
+            ApplicationInterception::TcpInitial | ApplicationInterception::PerPacket,
+        ) => &APPLICATION_REPLY_PROTOCOL_MATCHES[..1],
     };
     for protocol_match in protocol_matches {
         script.push_str("    ct direction ");
@@ -282,11 +298,17 @@ fn append_application_non_tcp_connmark_reset(script: &mut String) {
     }
 }
 
-fn append_application_queue(script: &mut String) {
+fn append_application_queue(script: &mut String, interception: ApplicationInterception) {
     // There is deliberately no `bypass` flag: if the authenticated queue
     // consumer is absent or overloaded, application-scoped traffic fails
     // closed in the kernel.
-    script.push_str("    ct direction original ");
+    match interception {
+        ApplicationInterception::None => return,
+        ApplicationInterception::TcpInitial => {
+            script.push_str("    ct direction original meta l4proto tcp ");
+        }
+        ApplicationInterception::PerPacket => script.push_str("    ct direction original "),
+    }
     append_packet_mark_domain_set(script, APPLICATION_PENDING_DOMAIN);
     script.push_str(" queue num ");
     script.push_str(&APPLICATION_QUEUE_NUMBER.to_string());
@@ -321,18 +343,27 @@ fn append_hex_u32(script: &mut String, value: u32) {
     let _infallible = write!(script, "{value:08x}");
 }
 
-fn append_application_authorization_chain(script: &mut String, snapshot: &Snapshot) {
+fn append_application_authorization_chain(
+    script: &mut String,
+    snapshot: &Snapshot,
+    interception: ApplicationInterception,
+) {
     let flow = application_flow_mark(snapshot.flow_generation);
     script.push_str(
         "  chain output_authorize {\n    type filter hook output priority 1; policy drop;\n",
     );
-    if application_interception_required(snapshot) && snapshot.mode != Mode::BlockAll {
+    let authorization_protocols: &[&str] = match interception {
+        ApplicationInterception::None => &[],
+        ApplicationInterception::TcpInitial => &APPLICATION_REPLY_PROTOCOL_MATCHES[..1],
+        ApplicationInterception::PerPacket => &APPLICATION_REPLY_PROTOCOL_MATCHES,
+    };
+    if interception != ApplicationInterception::None {
         // All attributable protocols receive the current generation so a
         // reply can be recognized. Only TCP uses that mark as an outbound
         // cache; UDP/ICMP clear it before every original packet and are queued
         // again. Restricting this branch to the parser's explicit allowlist
         // makes an accidental NF_ACCEPT for another protocol fail closed.
-        for protocol_match in APPLICATION_REPLY_PROTOCOL_MATCHES {
+        for protocol_match in authorization_protocols {
             script.push_str("    ");
             script.push_str(protocol_match);
             script.push_str(" meta mark & 0x");
@@ -469,7 +500,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
-    use crate::{Direction, InterfaceName, Mode, PortRange, RuleName, RuleOrigin, RuleSpec, State};
+    use crate::{
+        ApplicationPath, ApplicationSelector, Direction, ExecutableFileId, InterfaceName, Mode,
+        PortRange, RuleName, RuleOrigin, RuleSpec, State,
+    };
 
     fn add_https_rule(
         state: &mut State,
@@ -517,6 +551,53 @@ mod tests {
         )?;
         state.create_rule_at(id, spec, now)?;
         Ok(())
+    }
+
+    fn add_application_rule(
+        state: &mut State,
+        protocol: TransportProtocol,
+        enabled: bool,
+    ) -> Result<uuid::Uuid, Box<dyn Error>> {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .ok_or("invalid test time")?;
+        let port = match protocol {
+            TransportProtocol::Tcp => Some(PortRange::single(443)?),
+            TransportProtocol::Udp => Some(PortRange::single(53)?),
+            TransportProtocol::Any | TransportProtocol::Icmp | TransportProtocol::IcmpV6 => None,
+        };
+        let network = if protocol == TransportProtocol::IcmpV6 {
+            "2001:db8::7/128".parse()?
+        } else {
+            "203.0.113.7/32".parse()?
+        };
+        let mut spec = RuleSpec::new(
+            RuleName::new("application")?,
+            Direction::Outbound,
+            protocol,
+            Some(network),
+            port,
+            Some(InterfaceName::new("eth0")?),
+            RuleOrigin::Manual,
+            enabled,
+        )?;
+        spec.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new("/usr/bin/openshield-nft-test")?),
+            Some(ExecutableFileId {
+                device: 1,
+                inode: 2,
+                size: 3,
+                ctime_seconds: 4,
+                ctime_nanoseconds: 5,
+            }),
+            None,
+            Some(1_000),
+            None,
+        )?);
+        let id = uuid::Uuid::new_v4();
+        state.create_rule_at(id, spec, now)?;
+        Ok(id)
     }
 
     #[test]
@@ -668,6 +749,95 @@ mod tests {
             "chain output_authorize {\n    type filter hook output priority 1; policy drop;"
         ));
         assert!(!script.contains("set learned_"));
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_tcp_application_policy_has_no_non_tcp_nfqueue_path() -> Result<(), Box<dyn Error>>
+    {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.application_interception(),
+            ApplicationInterception::TcpInitial
+        );
+
+        let flow = format!("{:08x}", application_flow_mark(snapshot.flow_generation));
+        let script = NftablesCompiler::compile(&snapshot)?.into_string();
+        assert_eq!(script.matches("queue num 1337").count(), 1);
+        assert!(script.contains(
+            "ct direction original meta l4proto tcp meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337\n"
+        ));
+        assert!(!script.contains(
+            "ct direction original meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337\n"
+        ));
+        assert!(script.contains(&format!(
+            "ct direction reply ct state established meta l4proto tcp ct mark & 0x7fffffff == 0x{flow} counter name accepted_in accept"
+        )));
+        assert!(!script.contains(&format!(
+            "ct direction reply ct state established meta l4proto udp ct mark & 0x7fffffff == 0x{flow}"
+        )));
+        assert!(script.contains(&format!(
+            "meta l4proto tcp meta mark & 0xc0000000 == 0x80000000 ct mark set (ct mark & 0x80000000) | 0x{flow}"
+        )));
+        assert!(!script.contains("meta l4proto udp meta mark & 0xc0000000 == 0x80000000"));
+        assert!(
+            !script.contains(
+                "ct direction original meta l4proto udp ct mark set ct mark & 0x80000000"
+            )
+        );
+        assert!(
+            script.contains(
+                "meta mark & 0xc0000000 != 0x00000000 meta mark set meta mark & 0x3fffffff"
+            )
+        );
+        assert!(script.contains("counter name dropped_out drop"));
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_per_packet_rule_does_not_promote_mixed_policy_until_enabled()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let disabled_udp = add_application_rule(&mut state, TransportProtocol::Udp, false)?;
+        add_udp_rule(&mut state, Direction::Outbound, "192.0.2.53/32")?;
+
+        let tcp_only = state.snapshot();
+        assert_eq!(
+            tcp_only.application_interception(),
+            ApplicationInterception::TcpInitial
+        );
+        let tcp_only_script = NftablesCompiler::compile(&tcp_only)?.into_string();
+        assert!(tcp_only_script.contains(
+            "ct direction original meta l4proto tcp meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337"
+        ));
+        assert!(
+            !tcp_only_script.contains(
+                "ct direction original meta l4proto udp ct mark set ct mark & 0x80000000"
+            )
+        );
+        assert!(!tcp_only_script.contains("meta l4proto udp meta mark & 0xc0000000 == 0x80000000"));
+
+        state.set_rule_enabled(disabled_udp, true)?;
+        let mixed = state.snapshot();
+        assert_eq!(
+            mixed.application_interception(),
+            ApplicationInterception::PerPacket
+        );
+        let mixed_script = NftablesCompiler::compile(&mixed)?.into_string();
+        assert!(mixed_script.contains(
+            "ct direction original meta mark set (meta mark & 0x3fffffff) | 0x80000000 queue num 1337"
+        ));
+        assert!(
+            mixed_script.contains(
+                "ct direction original meta l4proto udp ct mark set ct mark & 0x80000000"
+            )
+        );
+        assert!(mixed_script.contains("meta l4proto udp meta mark & 0xc0000000 == 0x80000000"));
         Ok(())
     }
 

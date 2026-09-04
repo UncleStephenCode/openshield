@@ -4,9 +4,10 @@
 
 use std::io::{self, Read, Write};
 
-use openshield_core::{Event, Mode, Rule, RuleSpec};
+use openshield_core::{ApplicationInterception, Event, Mode, Rule, RuleSpec};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -30,6 +31,206 @@ pub enum FirewallBackendKind {
     Unknown,
     Nftables,
     Iptables,
+}
+
+/// Coarse execution level selected for the currently active policy.
+///
+/// This is runtime evidence, not a user preference. `Unknown` is deliberately
+/// fail-safe for test backends and producers which cannot attest their active
+/// packet path.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum CompatibilityLevel {
+    #[default]
+    Unknown,
+    /// Every active policy decision is made by the kernel firewall backend.
+    KernelNative,
+    /// New application TCP flows use NFQUEUE attribution and established TCP
+    /// uses the conntrack-generation fast path.
+    ConntrackHybrid,
+    /// Application traffic requires repeated NFQUEUE attribution.
+    Nfqueue,
+}
+
+/// Policy property responsible for the selected compatibility level.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum CompatibilityReason {
+    #[default]
+    Unknown,
+    BlockAll,
+    EmergencyBlockAll,
+    NetworkOnly,
+    Learning,
+    ApplicationTcp,
+    ApplicationPerPacket,
+}
+
+/// Typed description of the effective runtime packet path.
+///
+/// An empty nested object decodes to the fail-safe `Unknown`/`Unknown` pair.
+/// Partially populated, contradictory, and unknown fields are rejected so a
+/// producer cannot accidentally advertise an impossible verified fast path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeCompatibility {
+    pub level: CompatibilityLevel,
+    pub reason: CompatibilityReason,
+}
+
+impl Serialize for RuntimeCompatibility {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if !self.is_consistent() {
+            return Err(<S::Error as serde::ser::Error>::custom(
+                "runtime compatibility level and reason are inconsistent",
+            ));
+        }
+        let mut state = serializer.serialize_struct("RuntimeCompatibility", 2)?;
+        state.serialize_field("level", &self.level)?;
+        state.serialize_field("reason", &self.reason)?;
+        state.end()
+    }
+}
+
+impl RuntimeCompatibility {
+    /// Derives the conservative active path from the committed policy and the
+    /// attested backend. Policy compilers, daemon status, and clients use this
+    /// same mapping so the label cannot acquire independent semantics.
+    #[must_use]
+    pub const fn for_policy(
+        backend: FirewallBackendKind,
+        mode: Mode,
+        application_interception: ApplicationInterception,
+    ) -> Self {
+        if matches!(backend, FirewallBackendKind::Unknown) {
+            return Self {
+                level: CompatibilityLevel::Unknown,
+                reason: CompatibilityReason::Unknown,
+            };
+        }
+
+        match mode {
+            Mode::BlockAll => Self {
+                level: CompatibilityLevel::KernelNative,
+                reason: CompatibilityReason::BlockAll,
+            },
+            Mode::Learning => Self {
+                level: CompatibilityLevel::Nfqueue,
+                reason: CompatibilityReason::Learning,
+            },
+            Mode::Enforcing => match application_interception {
+                ApplicationInterception::None => Self {
+                    level: CompatibilityLevel::KernelNative,
+                    reason: CompatibilityReason::NetworkOnly,
+                },
+                ApplicationInterception::TcpInitial => Self {
+                    level: CompatibilityLevel::ConntrackHybrid,
+                    reason: CompatibilityReason::ApplicationTcp,
+                },
+                ApplicationInterception::PerPacket => Self {
+                    level: CompatibilityLevel::Nfqueue,
+                    reason: CompatibilityReason::ApplicationPerPacket,
+                },
+            },
+        }
+    }
+
+    /// Returns whether the level and its policy reason form one of the
+    /// protocol-defined evidence pairs.
+    #[must_use]
+    pub const fn is_consistent(self) -> bool {
+        matches!(
+            (self.level, self.reason),
+            (CompatibilityLevel::Unknown, CompatibilityReason::Unknown)
+                | (
+                    CompatibilityLevel::KernelNative,
+                    CompatibilityReason::BlockAll
+                        | CompatibilityReason::EmergencyBlockAll
+                        | CompatibilityReason::NetworkOnly
+                )
+                | (
+                    CompatibilityLevel::ConntrackHybrid,
+                    CompatibilityReason::ApplicationTcp
+                )
+                | (
+                    CompatibilityLevel::Nfqueue,
+                    CompatibilityReason::Learning | CompatibilityReason::ApplicationPerPacket
+                )
+        )
+    }
+
+    /// Validates this evidence against the surrounding policy mode and
+    /// attested production backend from a `StatusV2` response.
+    #[must_use]
+    pub const fn is_consistent_with(self, mode: Mode, backend: FirewallBackendKind) -> bool {
+        matches!(
+            (backend, mode, self.level, self.reason),
+            (
+                FirewallBackendKind::Nftables | FirewallBackendKind::Iptables,
+                Mode::BlockAll,
+                CompatibilityLevel::KernelNative,
+                CompatibilityReason::BlockAll | CompatibilityReason::EmergencyBlockAll,
+            ) | (
+                FirewallBackendKind::Nftables | FirewallBackendKind::Iptables,
+                Mode::Learning,
+                CompatibilityLevel::Nfqueue,
+                CompatibilityReason::Learning,
+            ) | (
+                FirewallBackendKind::Nftables | FirewallBackendKind::Iptables,
+                Mode::Enforcing,
+                CompatibilityLevel::KernelNative,
+                CompatibilityReason::NetworkOnly,
+            ) | (
+                FirewallBackendKind::Nftables | FirewallBackendKind::Iptables,
+                Mode::Enforcing,
+                CompatibilityLevel::ConntrackHybrid,
+                CompatibilityReason::ApplicationTcp,
+            ) | (
+                FirewallBackendKind::Nftables | FirewallBackendKind::Iptables,
+                Mode::Enforcing,
+                CompatibilityLevel::Nfqueue,
+                CompatibilityReason::ApplicationPerPacket,
+            ) | (
+                FirewallBackendKind::Unknown,
+                _,
+                CompatibilityLevel::Unknown,
+                CompatibilityReason::Unknown,
+            )
+        )
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RuntimeCompatibilityWire {
+    level: Option<CompatibilityLevel>,
+    reason: Option<CompatibilityReason>,
+}
+
+impl<'de> Deserialize<'de> for RuntimeCompatibility {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RuntimeCompatibilityWire::deserialize(deserializer)?;
+        let compatibility = match (wire.level, wire.reason) {
+            (None, None) => Self::default(),
+            (Some(level), Some(reason)) => Self { level, reason },
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(de::Error::custom(
+                    "runtime compatibility level and reason must both be present",
+                ));
+            }
+        };
+        if !compatibility.is_consistent() {
+            return Err(de::Error::custom(
+                "runtime compatibility level and reason are inconsistent",
+            ));
+        }
+        Ok(compatibility)
+    }
 }
 
 /// Monotonic error counters reported by the live NFQUEUE runtime.
@@ -84,6 +285,10 @@ pub enum ReadRequest {
     /// Returns mode, revision, total rule count, active firewall backend, and
     /// process-lifetime NFQUEUE counters.
     Status,
+    /// Returns the legacy status fields plus typed runtime compatibility
+    /// evidence. The separate request keeps the original `Status` wire shape
+    /// stable for older clients.
+    StatusV2,
     /// Returns rules ordered by UUID strictly after `after`.
     ///
     /// `limit` is a bounded client hint. Servers may choose any positive page
@@ -167,6 +372,16 @@ pub enum Response {
         backend: FirewallBackendKind,
         #[serde(default)]
         nfqueue: NfqueueCounters,
+    },
+    StatusV2 {
+        revision: u64,
+        mode: Mode,
+        rule_count: u32,
+        #[serde(default)]
+        backend: FirewallBackendKind,
+        #[serde(default)]
+        nfqueue: NfqueueCounters,
+        runtime_compatibility: RuntimeCompatibility,
     },
     RulesPage {
         revision: u64,
@@ -571,6 +786,163 @@ mod tests {
         let mut bytes = Vec::new();
         write_response(&mut bytes, &response)?;
         assert_eq!(read_response(&mut Cursor::new(bytes))?, response);
+        Ok(())
+    }
+
+    #[test]
+    fn status_v2_round_trip_preserves_runtime_compatibility() -> Result<(), Box<dyn Error>> {
+        let request = Request::Read(ReadRequest::StatusV2);
+        let mut request_bytes = Vec::new();
+        write_request(&mut request_bytes, &request)?;
+        assert_eq!(read_request(&mut Cursor::new(request_bytes))?, request);
+
+        let response = Response::StatusV2 {
+            revision: 11,
+            mode: Mode::Enforcing,
+            rule_count: 4,
+            backend: FirewallBackendKind::Nftables,
+            nfqueue: NfqueueCounters::default(),
+            runtime_compatibility: RuntimeCompatibility {
+                level: CompatibilityLevel::ConntrackHybrid,
+                reason: CompatibilityReason::ApplicationTcp,
+            },
+        };
+        let mut response_bytes = Vec::new();
+        write_response(&mut response_bytes, &response)?;
+        assert_eq!(read_response(&mut Cursor::new(response_bytes))?, response);
+        Ok(())
+    }
+
+    #[test]
+    fn status_v2_compatibility_defaults_unknown_but_rejects_unknown_fields()
+    -> Result<(), Box<dyn Error>> {
+        let payload = br#"{"type":"status_v2","data":{"revision":7,"mode":"learning","rule_count":3,"runtime_compatibility":{}}}"#;
+        let mut bytes = Vec::from(u32::try_from(payload.len())?.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        assert_eq!(
+            read_response(&mut Cursor::new(bytes))?,
+            Response::StatusV2 {
+                revision: 7,
+                mode: Mode::Learning,
+                rule_count: 3,
+                backend: FirewallBackendKind::Unknown,
+                nfqueue: NfqueueCounters::default(),
+                runtime_compatibility: RuntimeCompatibility::default(),
+            }
+        );
+
+        let payload = br#"{"type":"status_v2","data":{"revision":7,"mode":"learning","rule_count":3,"runtime_compatibility":{"unexpected":true}}}"#;
+        let mut bytes = Vec::from(u32::try_from(payload.len())?.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        assert!(matches!(
+            read_response(&mut Cursor::new(bytes)),
+            Err(FrameError::Decode { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_compatibility_rejects_partial_and_contradictory_evidence() {
+        let valid_pairs = [
+            ("unknown", "unknown"),
+            ("kernel_native", "block_all"),
+            ("kernel_native", "emergency_block_all"),
+            ("kernel_native", "network_only"),
+            ("conntrack_hybrid", "application_tcp"),
+            ("nfqueue", "learning"),
+            ("nfqueue", "application_per_packet"),
+        ];
+        let levels = ["unknown", "kernel_native", "conntrack_hybrid", "nfqueue"];
+        let reasons = [
+            "unknown",
+            "block_all",
+            "emergency_block_all",
+            "network_only",
+            "learning",
+            "application_tcp",
+            "application_per_packet",
+        ];
+
+        assert!(serde_json::from_value::<RuntimeCompatibility>(serde_json::json!({})).is_ok());
+        for level in levels {
+            assert!(
+                serde_json::from_value::<RuntimeCompatibility>(
+                    serde_json::json!({ "level": level })
+                )
+                .is_err(),
+                "partially populated level {level} must be rejected"
+            );
+            for reason in reasons {
+                let decoded = serde_json::from_value::<RuntimeCompatibility>(serde_json::json!({
+                    "level": level,
+                    "reason": reason,
+                }));
+                let expected_valid = valid_pairs.contains(&(level, reason));
+                assert_eq!(
+                    decoded.is_ok(),
+                    expected_valid,
+                    "unexpected consistency result for {level}/{reason}"
+                );
+            }
+        }
+        for reason in reasons {
+            assert!(
+                serde_json::from_value::<RuntimeCompatibility>(
+                    serde_json::json!({ "reason": reason })
+                )
+                .is_err(),
+                "partially populated reason {reason} must be rejected"
+            );
+        }
+
+        assert!(
+            serde_json::to_value(RuntimeCompatibility {
+                level: CompatibilityLevel::KernelNative,
+                reason: CompatibilityReason::ApplicationPerPacket,
+            })
+            .is_err(),
+            "an in-process producer must not serialize contradictory evidence"
+        );
+    }
+
+    #[test]
+    fn runtime_compatibility_validates_the_surrounding_status() {
+        let network_only = RuntimeCompatibility {
+            level: CompatibilityLevel::KernelNative,
+            reason: CompatibilityReason::NetworkOnly,
+        };
+        assert!(network_only.is_consistent_with(Mode::Enforcing, FirewallBackendKind::Nftables));
+        assert!(!network_only.is_consistent_with(Mode::Learning, FirewallBackendKind::Nftables));
+        assert!(!network_only.is_consistent_with(Mode::Enforcing, FirewallBackendKind::Unknown));
+        assert!(
+            RuntimeCompatibility {
+                level: CompatibilityLevel::KernelNative,
+                reason: CompatibilityReason::EmergencyBlockAll,
+            }
+            .is_consistent_with(Mode::BlockAll, FirewallBackendKind::Iptables)
+        );
+        assert!(
+            RuntimeCompatibility::default()
+                .is_consistent_with(Mode::Learning, FirewallBackendKind::Unknown)
+        );
+        assert!(
+            !RuntimeCompatibility::default()
+                .is_consistent_with(Mode::Learning, FirewallBackendKind::Iptables)
+        );
+    }
+
+    #[test]
+    fn legacy_status_wire_shape_does_not_gain_v2_fields() -> Result<(), Box<dyn Error>> {
+        let response = Response::Status {
+            revision: 7,
+            mode: Mode::Learning,
+            rule_count: 3,
+            backend: FirewallBackendKind::Nftables,
+            nfqueue: NfqueueCounters::default(),
+        };
+        let encoded = serde_json::to_value(response)?;
+        assert_eq!(encoded["type"], "status");
+        assert!(encoded["data"].get("runtime_compatibility").is_none());
         Ok(())
     }
 

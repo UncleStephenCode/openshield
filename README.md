@@ -59,6 +59,60 @@ immutable current-policy admission index also keeps exact-known and saturated
 observations out of the 512-item persistence queue; only a new candidate consumes
 a queue slot.
 
+Application Learning uses a two-phase durable commit. Candidate preparation,
+admission reservation, and a pending-candidate admission index run under the
+engine lock; atomic save and file/directory `fsync` run after releasing it, so
+packet verdicts do not wait for storage latency. The pending index deduplicates
+exact observations already covered by the in-flight candidate. State and events
+are published only after the durable commit. Other privileged changes receive
+`Conflict` while it is in flight. Root `BlockAll` instead installs the kernel
+deny immediately and is serialized last, preventing the older learning write
+from restoring Learning. A recoverable save failure retains the previous state
+and pauses automatic persistence; an unsafe outcome enters fail-closed
+`BlockAll` quarantine.
+
+## Dynamic active-policy path
+
+OpenShield 0.1.31 reports a dynamically recomputed active-policy path
+classification in its `StatusV2` response. This is not kernel-capability
+attestation, compatibility negotiation, the policy mode, or the selected
+firewall backend. It identifies the most expensive active path required by the
+current policy. A lower-numbered value describes a more userspace-intensive
+path, not weaker enforcement and not a runtime fallback for the same policy:
+
+| Level | Reported name | Active policy path |
+| ---: | --- | --- |
+| L3 | `KernelNative` | `BlockAll`, or `Enforcing` without an enabled application-bound rule; filtering is compiled directly into the selected kernel firewall backend |
+| L2 | `ConntrackHybrid` | `Enforcing` with enabled application-bound TCP rules only; the first packet is attributed through NFQUEUE and established TCP uses the current conntrack-generation fast path |
+| L1 | `Nfqueue` | `Learning`, or `Enforcing` with an enabled application-bound UDP, ICMP, ICMPv6, or `Any` rule; otherwise-unmatched packets require per-packet userspace attribution |
+| — | `Unknown` | a legacy status response or an unverified runtime; the UI must not present it as an accelerated path |
+
+The level is deliberately a worst-case summary. Network-only packets continue
+to be handled by nftables or iptables in the kernel even when the reported
+level is L2 or L1. Rule and mode changes recompute the level from validated
+state; they do not turn a strict application selector into a broader network
+allow.
+
+An operator-selected `BlockAll` reports reason `BlockAll`. If an ambiguous
+backend or persistence outcome forces the live daemon into its read-only
+fail-closed quarantine, the same L3 kernel path is reported with the distinct
+reason `EmergencyBlockAll`; the TUI highlights it as an emergency rather than
+as a healthy accelerated state. Privileged mutations remain disabled until the
+documented recovery procedure is completed.
+
+Backend selection is a separate startup decision. The only automatic startup
+backend fallback is from nftables to the complete iptables/ip6tables bundle
+when nftables cannot be validated. Neither choice changes the active-path
+semantics. If the fail-closed NFQUEUE
+runtime cannot be made ready, startup retains `BlockAll` and exits; it never
+continues with a network-only approximation or a fail-open queue.
+
+This release does not enable an eBPF application data plane. It neither grants
+`CAP_BPF`, changes the boot command line, enrolls a MOK, nor requires a custom
+kernel module. Kernel eBPF/cgroup/LSM acceleration remains future work until its
+rule equivalence, lifecycle downgrade, packaging, and distribution-kernel tests
+can demonstrate the same fail-closed behavior.
+
 ## Application-bound outbound rules
 
 An application selector always includes a canonical executable path and a
@@ -147,8 +201,10 @@ reloads state and never retries an unconfirmed change automatically.
 The TUI has five top-level tabs: `1` Status, `2` Outbound, `3` Inbound,
 `4` Events, and `5` Help. `Tab` advances to the next tab. The Status tab reports
 the firewall implementation that the daemon actually selected (`nftables` or
-the `iptables`/`ip6tables` fallback), separately from policy and telemetry
-connection health.
+the `iptables`/`ip6tables` fallback), the policy mode, and the dynamically
+selected active policy path from `StatusV2`, separately from telemetry
+connection health. `Unknown` is shown explicitly for a legacy or unverified
+response; the label is not a claim about eBPF or distribution-kernel features.
 
 The Outbound tab presents rules as a two-pane view. The left pane groups them by
 the first available identity in this fixed priority order:
@@ -222,7 +278,12 @@ concurrency, latency percentiles, loss/retransmits, daemon CPU/RSS, softirq,
 conntrack, NIC/NFQUEUE evidence, fail-closed probes, paired overhead, and
 sustainable points. Generator or peer saturation invalidates a result. The
 bounded release smoke runs only after functional firewall E2E; it validates
-paths and safety but is not a portable capacity claim.
+paths and safety but is not a portable capacity claim. Its unchanged 10%
+relative thresholds block only a regression confirmed from at least three
+steady adjacent AB/BA pairs by a one-sided 95% Student-t lower confidence
+bound. Every individual delta and crossing remains visible; a single burst is
+relative-performance diagnostics only, while burst capacity, drops, NFQUEUE
+errors, and fail-closed safety remain mandatory gates.
 
 ## Installation and init systems
 
@@ -337,14 +398,15 @@ arbitrary privileged ruleset editors.
 
 Compatibility claims are intentionally scoped:
 
-- final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 283 tests: 55 core,
-  147 daemon, 13 protocol, and 68 TUI tests. These are component tests, not a
-  live-firewall end-to-end result;
-- the v0.1.29 x86-64 release daemon passed the isolated Debian Bookworm
-  Learning-to-Enforcing scenario with both nftables and the iptables fallback,
-  including application attribution, inbound default deny and explicit allow,
-  fail-closed shutdown, and restart with the persisted policy;
+- the recorded Rust 1.98.0 workspace verification passed formatting, locked
+  all-target checks, clippy with warnings denied, and the complete test suite
+  present in that revision. These are component tests, not a live-firewall
+  end-to-end result;
+- the locally built v0.1.31 x86-64 daemon passed the isolated Debian Bookworm
+  scenario with both nftables and the iptables fallback, including Learning,
+  TCP-only L2 and mixed UDP/TCP L1 application attribution, inbound default
+  deny and explicit allow, fail-closed shutdown, and restart with the persisted
+  policy;
 - both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
   `tests/compat/distros.tsv`;
@@ -384,17 +446,21 @@ The release workflow now requires the isolated
 the 37 runtime-tested distribution/platform rows. The nftables scenario
 installs both frontends and requires nftables to win; the iptables scenario
 omits `nft` and requires the compatibility backend. Each run covers Learning,
-UDP/TCP Enforcing, application identity, an explicit inbound allow, and
-restart. These 74 configured publication gates must not be read as results
-until the corresponding workflow has completed. They run in disposable
-namespaces on a Unix-socket Docker engine, do not modify the host firewall,
-and are not production or native-hardware certification.
+TCP-only application `Enforcing` at L2 `ConntrackHybrid`, mixed UDP/TCP
+application `Enforcing` at L1 `Nfqueue`, an explicit inbound allow, and
+restart. The L2 check uses a real persistent TCP socket: its first exchange
+after the mode-generation change is attributed through NFQUEUE, then the
+daemon is paused while another exchange must complete through the established
+conntrack fast path. These 74 configured publication gates must not be read as
+results until the corresponding workflow has completed. They run in disposable
+namespaces on a Unix-socket Docker engine, do not modify the host firewall, and
+are not production or native-hardware certification.
 
 ## TUI localization
 
-The TUI embeds 31 separate JSON resources with 225 messages each: the original
-20 locales plus 11 additions. Each non-English resource is loaded as a complete
-map without merging or falling back to English. Tests verify exact key,
+The TUI embeds 31 separate JSON resources with one complete, identical key set:
+the original 20 locales plus 11 additions. Each non-English resource is loaded
+as a complete map without merging or falling back to English. Tests verify exact key,
 placeholder, and newline parity for every compiled resource; no non-English
 value is exactly equal to its English counterpart. An all-pairs regression also
 rejects bulk reuse of substantive messages across languages. The complete

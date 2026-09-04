@@ -391,7 +391,7 @@ fn handle_observe_client(
         };
 
         match request {
-            ReadRequest::Status => {
+            request @ (ReadRequest::Status | ReadRequest::StatusV2) => {
                 if pages_started || status_requests >= 2 {
                     write_error(
                         &mut stream,
@@ -401,8 +401,13 @@ fn handle_observe_client(
                     return Ok(());
                 }
                 status_requests += 1;
-                let response = lock_engine(engine)
-                    .map_or_else(Response::Error, |engine| engine.status_response());
+                let response = lock_engine(engine).map_or_else(Response::Error, |engine| {
+                    if matches!(request, ReadRequest::StatusV2) {
+                        engine.status_v2_response()
+                    } else {
+                        engine.status_response()
+                    }
+                });
                 write_response_with_deadline(&mut stream, &response)
                     .context("cannot write status")?;
             }
@@ -1461,6 +1466,15 @@ mod tests {
         assert!(matches!(
             read_response(&mut client_stream)?,
             Response::Status { rule_count: 0, .. }
+        ));
+        write_request(&mut client_stream, &Request::Read(ReadRequest::StatusV2))?;
+        assert!(matches!(
+            read_response(&mut client_stream)?,
+            Response::StatusV2 {
+                rule_count: 0,
+                runtime_compatibility,
+                ..
+            } if runtime_compatibility == openshield_protocol::RuntimeCompatibility::default()
         ));
         write_request(
             &mut client_stream,

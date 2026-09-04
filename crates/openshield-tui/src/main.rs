@@ -127,16 +127,28 @@ fn drain_observer_updates(observer: &Observer, app: &mut App) -> bool {
             ObserverUpdate::TelemetryDisconnected(reason) => {
                 app.set_telemetry_disconnected(reason);
             }
-            ObserverUpdate::Snapshot { snapshot, backend } => {
+            ObserverUpdate::Snapshot {
+                snapshot,
+                backend,
+                runtime_compatibility,
+            } => {
                 app.connection = app::ConnectionState::Connected;
-                app.set_observed_snapshot(snapshot, backend);
+                app.set_observed_snapshot(snapshot, backend, runtime_compatibility);
             }
-            ObserverUpdate::Restarted { snapshot, backend } => {
+            ObserverUpdate::Restarted {
+                snapshot,
+                backend,
+                runtime_compatibility,
+            } => {
                 app.connection = app::ConnectionState::Connected;
-                app.set_restarted_observed_snapshot(snapshot, backend);
+                app.set_restarted_observed_snapshot(snapshot, backend, runtime_compatibility);
             }
             ObserverUpdate::Event(event) => {
-                reconcile_rules |= app.push_observer_event(*event);
+                let policy_changed = app.push_observer_event(*event);
+                reconcile_rules |= policy_changed;
+                if policy_changed && let Err(error) = observer.request_resync() {
+                    app.notice = Some(error.localized(&app.i18n));
+                }
             }
             ObserverUpdate::Dropped(count) => {
                 app.dropped_events = app.dropped_events.saturating_add(count);

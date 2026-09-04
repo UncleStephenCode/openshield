@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -837,13 +837,15 @@ fn enumerate_task_ids(
 ) -> Result<Option<Vec<u32>>> {
     let entries = match fs::read_dir(task_root) {
         Ok(entries) => entries,
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            if path_disappeared(process)? {
+        Err(error) if procfs_enumeration_may_indicate_disappearance(&error) => {
+            if procfs_subject_disappeared_after(&error, process)? {
                 return Ok(None);
             }
-            bail!(
-                "cannot prove socket ownership: task list for live process {process_id} is unavailable"
-            );
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot prove socket ownership: task list for live process {process_id} is unavailable"
+                )
+            });
         }
         Err(error) => {
             return Err(error)
@@ -930,13 +932,15 @@ fn task_socket_fd(
     }
     let descriptors = match fs::read_dir(task.join("fd")) {
         Ok(entries) => entries,
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            if path_disappeared(task)? {
+        Err(error) if procfs_enumeration_may_indicate_disappearance(&error) => {
+            if procfs_subject_disappeared_after(&error, task)? {
                 return Ok(None);
             }
-            bail!(
-                "cannot prove socket ownership: descriptor table for live task {task_id} is unavailable"
-            );
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot prove socket ownership: descriptor table for live task {task_id} is unavailable"
+                )
+            });
         }
         Err(error) => {
             if error.kind() == ErrorKind::PermissionDenied
@@ -1019,10 +1023,26 @@ fn equivalent_enforcement_identity(
         && left.cgroups == right.cgroups
 }
 
+fn procfs_enumeration_may_indicate_disappearance(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+        || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn procfs_subject_disappeared_after(error: &io::Error, subject: &Path) -> Result<bool> {
+    if !procfs_enumeration_may_indicate_disappearance(error) {
+        return Ok(false);
+    }
+    path_disappeared(subject)
+}
+
 fn path_disappeared(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error)
+            if error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(true)
+        }
         Err(error) => {
             Err(error).with_context(|| format!("cannot recheck procfs path {}", path.display()))
         }
@@ -1835,6 +1855,36 @@ mod tests {
             "cannot enumerate procfs",
             "caller context should remain the public diagnostic"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn esrch_is_skipped_only_after_the_procfs_subject_is_confirmed_absent()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let live_subject = directory.path().join("live");
+        fs::create_dir(&live_subject)?;
+        let vanished_subject = directory.path().join("vanished");
+        let esrch = io::Error::from_raw_os_error(libc::ESRCH);
+
+        assert!(procfs_enumeration_may_indicate_disappearance(&esrch));
+        assert!(!procfs_subject_disappeared_after(&esrch, &live_subject)?);
+        assert!(procfs_subject_disappeared_after(&esrch, &vanished_subject)?);
+        Ok(())
+    }
+
+    #[test]
+    fn permission_and_unrelated_io_errors_never_hide_a_procfs_subject() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let absent_subject = directory.path().join("absent");
+        for error in [
+            io::Error::from(ErrorKind::PermissionDenied),
+            io::Error::from(ErrorKind::Other),
+        ] {
+            assert!(!procfs_enumeration_may_indicate_disappearance(&error));
+            assert!(!procfs_subject_disappeared_after(&error, &absent_subject)?);
+        }
         Ok(())
     }
 

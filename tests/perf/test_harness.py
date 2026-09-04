@@ -572,6 +572,53 @@ class KernelBlockAllObservationTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_runtime_compatibility_expectations_cover_every_policy_path(self) -> None:
+        cases = (
+            ("network_only", "enforcing", "kernel_native", "network_only"),
+            ("network_only", "learning", "nfqueue", "learning"),
+            (
+                "application_tcp",
+                "enforcing",
+                "conntrack_hybrid",
+                "application_tcp",
+            ),
+            ("application_tcp", "learning", "nfqueue", "learning"),
+            (
+                "application_udp",
+                "enforcing",
+                "nfqueue",
+                "application_per_packet",
+            ),
+            ("application_udp", "learning", "nfqueue", "learning"),
+        )
+        for policy, mode, level, reason in cases:
+            with self.subTest(policy=policy, mode=mode):
+                scenario = {"policy": policy, "mode": mode}
+                expected = {"level": level, "reason": reason}
+                self.assertEqual(
+                    runner.expected_runtime_compatibility(scenario), expected
+                )
+                self.assertEqual(
+                    runner.validate_runtime_compatibility(
+                        {"runtime_compatibility": dict(expected)}, scenario
+                    ),
+                    expected,
+                )
+
+    def test_runtime_compatibility_rejects_silent_downgrade(self) -> None:
+        with self.assertRaisesRegex(
+            runner.HarnessError, "selected runtime compatibility"
+        ):
+            runner.validate_runtime_compatibility(
+                {
+                    "runtime_compatibility": {
+                        "level": "nfqueue",
+                        "reason": "application_per_packet",
+                    }
+                },
+                {"policy": "application_tcp", "mode": "enforcing"},
+            )
+
     def test_interface_pattern_is_linux_bounded_and_path_safe(self) -> None:
         for valid in ("eth0", "veth.1", "br-test_0", "a" * 15):
             with self.subTest(valid=valid):
@@ -962,6 +1009,12 @@ class ConfigTests(unittest.TestCase):
         self.assertIn(
             ".configuration.criteria.require_burst_capacity == true", source
         )
+        self.assertIn("minimum_paired_samples: 3", source)
+        self.assertIn("confidence_level: 0.95", source)
+        self.assertIn(
+            'method: "one_sided_paired_student_t_mean_lower_bound"', source
+        )
+        self.assertIn(".confirmed_regression == false", source)
 
     def test_ci_wrapper_accepts_only_the_rpm_signing_key_none_architecture(self) -> None:
         source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
@@ -976,7 +1029,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("environment_consistency", summary)
         self.assertIn("resource_validity", summary)
         self.assertIn("relative_failure_counts", summary)
+        self.assertIn("relative_observation_counts", summary)
         self.assertIn("relative_performance_failure_reasons", summary)
+        self.assertIn("relative_performance_observation_reasons", summary)
+        self.assertIn("proven: .saturation.proven", summary)
+        self.assertNotIn("proven: (.saturation.proven // null)", summary)
 
     def test_ci_wrapper_requires_exact_udp_accounting_and_drain_barriers(self) -> None:
         source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
@@ -1206,6 +1263,16 @@ class EvaluationTests(unittest.TestCase):
                 self.assertTrue(result["capacity_pass"])
                 self.assertTrue(result["passed"])
 
+    def test_relative_confidence_bound_requires_three_paired_samples(self) -> None:
+        self.assertIsNone(runner.one_sided_mean_lower_bound([20.0, 20.0]))
+        self.assertAlmostEqual(
+            runner.one_sided_mean_lower_bound([11.0, 11.0, 11.0]),
+            11.0,
+        )
+        noisy = runner.one_sided_mean_lower_bound([11.0, 30.0, -5.0])
+        self.assertIsNotNone(noisy)
+        self.assertLess(noisy, 10.0)
+
     def test_unauthorized_round_trip_is_a_hard_fail_open_failure(self) -> None:
         result = synthetic_result("application_tcp")
         result["identity_probe"] = {
@@ -1331,7 +1398,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(result["safety_pass"])
         self.assertFalse(result["passed"])
 
-    def test_nonzero_nfqueue_counter_before_phase_fails_even_with_zero_delta(self) -> None:
+    def test_prior_nfqueue_counter_does_not_poison_a_zero_delta_phase(self) -> None:
         for counter in runner.NFQUEUE_RUNTIME_COUNTER_FIELDS:
             with self.subTest(counter=counter):
                 result = synthetic_result("network_only")
@@ -1342,12 +1409,74 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(
                     result["nfqueue_runtime_counters"]["delta"][counter], 0
                 )
-                self.assertFalse(result["capacity_pass"])
-                self.assertFalse(result["safety_pass"])
-                self.assertIn(
-                    "nonzero before or after",
-                    " ".join(result["safety_failure_reasons"]),
-                )
+                self.assertTrue(result["capacity_pass"])
+                self.assertTrue(result["safety_pass"])
+
+    def test_nfqueue_counter_continuity_fails_gap_increment_exactly_once(self) -> None:
+        phases = []
+        for index, value in enumerate((0, 8, 8), 1):
+            result = synthetic_result("network_only")
+            result["phase"] = f"warmup_{index}"
+            result["phase_role"] = "warmup"
+            result["status_before"]["nfqueue"]["denied"] = value
+            result["status_after"]["nfqueue"]["denied"] = value
+            runner.evaluate_result(result, self.criteria)
+            phases.append(result)
+
+        runner.apply_nfqueue_counter_continuity(phases, self.criteria)
+
+        self.assertTrue(phases[0]["safety_pass"])
+        self.assertFalse(phases[1]["safety_pass"])
+        self.assertEqual(
+            phases[1]["nfqueue_counter_continuity"]["delta"]["denied"], 8
+        )
+        self.assertIn(
+            "increased by 8 between adjacent normal phases",
+            " ".join(phases[1]["safety_failure_reasons"]),
+        )
+        self.assertTrue(phases[2]["safety_pass"])
+        self.assertEqual(
+            phases[2]["nfqueue_counter_continuity"]["delta"]["denied"], 0
+        )
+
+    def test_nfqueue_counter_continuity_checks_fresh_daemon_origin(self) -> None:
+        result = synthetic_result("network_only")
+        result["phase_role"] = "warmup"
+        result["status_before"]["nfqueue"]["queue_overflow"] = 1
+        result["status_after"]["nfqueue"]["queue_overflow"] = 1
+        runner.evaluate_result(result, self.criteria)
+
+        runner.apply_nfqueue_counter_continuity([result], self.criteria)
+
+        self.assertFalse(result["safety_pass"])
+        self.assertTrue(
+            result["nfqueue_counter_continuity"]["initial_snapshot"]
+        )
+        self.assertIn(
+            "was already 1 at the first normal phase",
+            " ".join(result["safety_failure_reasons"]),
+        )
+
+    def test_nfqueue_counter_continuity_rejects_daemon_restart(self) -> None:
+        first = synthetic_result("network_only")
+        second = synthetic_result("network_only")
+        for result in (first, second):
+            result["phase_role"] = "warmup"
+            runner.evaluate_result(result, self.criteria)
+        second["daemon_identity_before"]["starttime"] += 1
+        second["daemon_identity_after"]["starttime"] += 1
+        runner.evaluate_result(second, self.criteria)
+
+        runner.apply_nfqueue_counter_continuity(
+            [first, second], self.criteria
+        )
+
+        self.assertFalse(second["valid"])
+        self.assertFalse(second["safety_pass"])
+        self.assertIn(
+            "daemon identity changed between adjacent normal phases",
+            " ".join(second["unreliable_reasons"]),
+        )
 
     def test_invalid_authoritative_nfqueue_evidence_is_invalid_and_unsafe(self) -> None:
         cases = {
@@ -1787,8 +1916,6 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(result["safety_pass"])
 
     def test_relative_performance_gates_cover_throughput_pps_latency_and_cpu(self) -> None:
-        baseline = synthetic_result("baseline")
-        runner.evaluate_result(baseline, self.criteria)
         cases = {
             "throughput": lambda result: result["workload"]["metrics"].update(
                 {"application_mbps": 10.0}
@@ -1814,36 +1941,87 @@ class EvaluationTests(unittest.TestCase):
         }
         for expected_reason, mutate in cases.items():
             with self.subTest(metric=expected_reason):
-                measured = synthetic_result("network_only")
-                mutate(measured)
-                runner.evaluate_result(measured, self.criteria)
-                runner.add_baseline_comparisons(
-                    [baseline, measured], self.criteria
-                )
-                self.assertTrue(measured["capacity_pass"])
-                self.assertFalse(measured["relative_performance_pass"])
-                self.assertFalse(measured["passed"])
-                self.assertIn(
-                    expected_reason,
-                    " ".join(
-                        measured["relative_performance_failure_reasons"]
-                    ),
-                )
+                results = []
+                measured_rows = []
+                for repetition in range(1, 4):
+                    baseline = synthetic_result("baseline")
+                    measured = synthetic_result("network_only")
+                    for row, sequence in ((baseline, 0), (measured, 1)):
+                        row["phase"] = f"steady_{repetition}"
+                        row["repetition"] = repetition
+                        row["baseline_sample_id"] = f"b{repetition:05d}"
+                        row["execution_sequence"] = sequence
+                    mutate(measured)
+                    runner.evaluate_result(baseline, self.criteria)
+                    runner.evaluate_result(measured, self.criteria)
+                    results.extend((baseline, measured))
+                    measured_rows.append(measured)
+                runner.add_baseline_comparisons(results, self.criteria)
+                for measured in measured_rows:
+                    self.assertTrue(measured["capacity_pass"])
+                    self.assertFalse(measured["relative_performance_pass"])
+                    self.assertFalse(measured["passed"])
+                    self.assertIn(
+                        expected_reason,
+                        " ".join(
+                            measured["relative_performance_failure_reasons"]
+                        ),
+                    )
 
     def test_relative_gate_keeps_the_strict_ten_percent_boundary(self) -> None:
         for throughput, expected_pass in ((10.8, True), (10.799_988, False)):
             with self.subTest(throughput=throughput):
-                baseline = synthetic_result("baseline")
-                measured = synthetic_result("network_only")
-                measured["workload"]["metrics"]["application_mbps"] = throughput
-                runner.evaluate_result(baseline, self.criteria)
-                runner.evaluate_result(measured, self.criteria)
-                runner.add_baseline_comparisons(
-                    [baseline, measured], self.criteria
+                results = []
+                measured_rows = []
+                for repetition in range(1, 4):
+                    baseline = synthetic_result("baseline")
+                    measured = synthetic_result("network_only")
+                    for row, sequence in ((baseline, 0), (measured, 1)):
+                        row["phase"] = f"steady_{repetition}"
+                        row["repetition"] = repetition
+                        row["baseline_sample_id"] = f"b{repetition:05d}"
+                        row["execution_sequence"] = sequence
+                    measured["workload"]["metrics"]["application_mbps"] = throughput
+                    runner.evaluate_result(baseline, self.criteria)
+                    runner.evaluate_result(measured, self.criteria)
+                    results.extend((baseline, measured))
+                    measured_rows.append(measured)
+                runner.add_baseline_comparisons(results, self.criteria)
+                self.assertTrue(
+                    all(
+                        measured["relative_performance_pass"] is expected_pass
+                        for measured in measured_rows
+                    )
                 )
-                self.assertIs(
-                    measured["relative_performance_pass"], expected_pass
-                )
+
+    def test_noisy_single_window_crossings_remain_visible_but_do_not_block(self) -> None:
+        results = []
+        measured_rows = []
+        for repetition, cpu in enumerate((55.5, 65.0, 47.5), start=1):
+            baseline = synthetic_result("baseline")
+            measured = synthetic_result("network_only")
+            for row, sequence in ((baseline, 0), (measured, 1)):
+                row["phase"] = f"steady_{repetition}"
+                row["repetition"] = repetition
+                row["baseline_sample_id"] = f"b{repetition:05d}"
+                row["execution_sequence"] = sequence
+            measured["dut_metrics"]["cgroup"]["cpu_percent_one_core"] = cpu
+            runner.evaluate_result(baseline, self.criteria)
+            runner.evaluate_result(measured, self.criteria)
+            results.extend((baseline, measured))
+            measured_rows.append(measured)
+        runner.add_baseline_comparisons(results, self.criteria)
+        self.assertTrue(all(row["relative_performance_pass"] for row in measured_rows))
+        self.assertTrue(
+            any(row["relative_performance_observation_reasons"] for row in measured_rows)
+        )
+        cpu_evidence = next(
+            item
+            for item in measured_rows[0]["relative_performance_evidence"]
+            if item["metric"] == "cgroup_cpu_increase_percent"
+        )
+        self.assertFalse(cpu_evidence["confirmed_regression"])
+        self.assertLessEqual(cpu_evidence["lower_confidence_bound_percent"], 10.0)
 
     def test_paired_baseline_must_be_unique_and_temporally_adjacent(self) -> None:
         baseline = synthetic_result("baseline")
@@ -1869,7 +2047,7 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertFalse(measured["valid"])
 
-    def test_relative_gate_applies_to_equivalent_burst_workload(self) -> None:
+    def test_single_burst_relative_crossing_is_diagnostic_not_confirmation(self) -> None:
         criteria = dict(self.criteria)
         criteria["require_burst_capacity"] = True
         baseline = synthetic_result("baseline")
@@ -1881,10 +2059,18 @@ class EvaluationTests(unittest.TestCase):
         measured["workload"]["metrics"]["application_mbps"] = 9.0
         runner.evaluate_result(measured, criteria)
         runner.add_baseline_comparisons([baseline, measured], criteria)
-        self.assertFalse(measured["relative_performance_pass"])
+        self.assertTrue(measured["relative_performance_pass"])
         self.assertTrue(measured["capacity_pass"])
         self.assertTrue(measured["safety_pass"])
-        self.assertFalse(measured["passed"])
+        self.assertTrue(measured["passed"])
+        self.assertTrue(measured["relative_performance_observation_reasons"])
+        self.assertTrue(
+            all(
+                item["method"] == "single_burst_observation_not_a_relative_gate"
+                and item["confirmed_regression"] is False
+                for item in measured["relative_performance_evidence"]
+            )
+        )
 
     def test_burst_requires_a_paired_baseline(self) -> None:
         measured = synthetic_result("network_only")
@@ -2718,6 +2904,13 @@ class MetricAndOutputTests(unittest.TestCase):
             runner.nfqueue_drop_delta(before, saturated),
             {"kernel_dropped": 5, "user_dropped": 2, "total": 7},
         )
+        self.assertEqual(
+            runner.nfqueue_drop_delta(
+                {"kernel_dropped": 0, "user_dropped": 10},
+                {"kernel_dropped": 0, "user_dropped": 816},
+            ),
+            {"kernel_dropped": 0, "user_dropped": 806, "total": 806},
+        )
         probes = [
             {
                 "liveness_before": {
@@ -2746,6 +2939,27 @@ class MetricAndOutputTests(unittest.TestCase):
         self.assertTrue(
             runner.overload_evidence_timestamps_ordered(
                 metric_starts,
+                before,
+                20,
+                saturated,
+                probes,
+                75,
+                before_continue,
+                90,
+                100,
+            )
+        )
+        # The collectors are released together.  Their independently observed
+        # boundaries need only precede the first queue sample; label order is
+        # not a temporal ordering guarantee.
+        concurrent_metric_starts = (
+            metric_starts[2],
+            metric_starts[0],
+            metric_starts[1],
+        )
+        self.assertTrue(
+            runner.overload_evidence_timestamps_ordered(
+                concurrent_metric_starts,
                 before,
                 20,
                 saturated,

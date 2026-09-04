@@ -55,6 +55,18 @@ def status() -> dict:
     return response["data"]
 
 
+def status_v2() -> dict:
+    response = exchange(OBSERVE, {"type": "read", "data": {"type": "status_v2"}})
+    if response.get("type") != "status_v2":
+        raise RuntimeError(f"unexpected status-v2 response: {response}")
+    data = response.get("data")
+    if not isinstance(data, dict) or not isinstance(
+        data.get("runtime_compatibility"), dict
+    ):
+        raise RuntimeError(f"malformed status-v2 response: {response}")
+    return data
+
+
 def all_rules() -> list[dict]:
     rules: list[dict] = []
     after = None
@@ -100,6 +112,22 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("status")
+    runtime = subcommands.add_parser("assert-runtime")
+    runtime.add_argument("mode", choices=("block_all", "learning", "enforcing"))
+    runtime.add_argument("backend", choices=("nftables", "iptables"))
+    runtime.add_argument(
+        "level", choices=("kernel_native", "conntrack_hybrid", "nfqueue")
+    )
+    runtime.add_argument(
+        "reason",
+        choices=(
+            "block_all",
+            "network_only",
+            "learning",
+            "application_tcp",
+            "application_per_packet",
+        ),
+    )
     mode = subcommands.add_parser("set-mode")
     mode.add_argument("mode", choices=("block_all", "learning", "enforcing"))
     inbound = subcommands.add_parser("allow-inbound-tcp")
@@ -109,10 +137,31 @@ def main() -> int:
     learned.add_argument("executable")
     learned.add_argument("address")
     learned.add_argument("port", type=int)
+    learned.add_argument("protocol", choices=("tcp", "udp"))
     arguments = parser.parse_args()
 
     if arguments.command == "status":
         print(json.dumps(status(), sort_keys=True))
+    elif arguments.command == "assert-runtime":
+        current = status_v2()
+        compatibility = current["runtime_compatibility"]
+        expected = {
+            "mode": arguments.mode,
+            "backend": arguments.backend,
+            "level": arguments.level,
+            "reason": arguments.reason,
+        }
+        actual = {
+            "mode": current.get("mode"),
+            "backend": current.get("backend"),
+            "level": compatibility.get("level"),
+            "reason": compatibility.get("reason"),
+        }
+        if actual != expected:
+            raise RuntimeError(
+                f"unexpected runtime compatibility: expected {expected}, received {actual}"
+            )
+        print(json.dumps(current, sort_keys=True))
     elif arguments.command == "rules":
         print(json.dumps(all_rules(), sort_keys=True))
     elif arguments.command == "set-mode":
@@ -168,6 +217,7 @@ def main() -> int:
             port = spec.get("port") or {}
             if (
                 spec.get("origin") == "learned"
+                and spec.get("protocol") == arguments.protocol
                 and application.get("executable") == arguments.executable
                 and application.get("uid") is not None
                 and application.get("metadata_redacted") is False

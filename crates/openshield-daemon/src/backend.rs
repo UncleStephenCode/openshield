@@ -150,6 +150,25 @@ impl NftBackend {
     }
 
     fn probe(&self) -> Result<()> {
+        ensure!(
+            !active_xtables_artifacts()?,
+            "OpenShield artifacts from an xtables backend are still active"
+        );
+        self.ensure_owned_table_or_absent()
+            .context("nftables ownership preflight failed")?;
+
+        // Runtime integrity monitoring depends on all three bounded JSON
+        // queries.  Exercise their exact command forms before selecting this
+        // backend, even when no OpenShield table exists yet.  Merely accepting
+        // `nft -c` is insufficient: a partially compatible frontend could
+        // install the bootstrap policy and then make safe readback impossible.
+        for (kind, query) in [("chain", &NFT_CHAIN_QUERY), ("counter", &NFT_COUNTER_QUERY)] {
+            let output = self
+                .capture(query)
+                .with_context(|| format!("nftables {kind} query preflight failed"))?;
+            validate_nft_json_document(&output, kind)?;
+        }
+
         let mut state = openshield_core::State::new();
         state
             .set_mode(openshield_core::Mode::Learning)
@@ -299,9 +318,10 @@ impl FirewallObserver for NftBackend {
     }
 }
 
-/// Deterministic firewall backend selection. A fully usable nftables backend
-/// is always preferred. The compatibility backend is considered only when
-/// nft validation against the running kernel fails.
+/// Deterministic firewall backend selection. A safely preflighted nftables
+/// backend is always preferred. The compatibility backend is considered when
+/// any read-only nftables ownership, observation, coexistence, or kernel
+/// capability check fails.
 #[derive(Clone, Debug)]
 pub enum AutoBackend {
     Nft(NftBackend),
@@ -310,14 +330,29 @@ pub enum AutoBackend {
 
 impl AutoBackend {
     pub fn discover() -> Result<Self> {
-        let nft_error = match NftBackend::discover() {
-            Ok(backend) => match backend.probe() {
-                Ok(()) => return Ok(Self::Nft(backend)),
-                Err(error) => error,
+        Self::discover_with(
+            || {
+                let backend = NftBackend::discover()?;
+                backend.probe()?;
+                Ok(backend)
             },
+            IptablesBackend::discover,
+        )
+    }
+
+    fn discover_with<Nft, Iptables>(
+        discover_usable_nft: Nft,
+        discover_usable_iptables: Iptables,
+    ) -> Result<Self>
+    where
+        Nft: FnOnce() -> Result<NftBackend>,
+        Iptables: FnOnce() -> Result<IptablesBackend>,
+    {
+        let nft_error = match discover_usable_nft() {
+            Ok(backend) => return Ok(Self::Nft(backend)),
             Err(error) => error,
         };
-        match IptablesBackend::discover() {
+        match discover_usable_iptables() {
             Ok(backend) => Ok(Self::Iptables(backend)),
             Err(iptables_error) => Err(anyhow!(
                 "neither firewall backend is safely usable: nftables: {nft_error:#}; iptables fallback: {iptables_error:#}"
@@ -2607,6 +2642,14 @@ fn nft_objects(document: &Value) -> Result<&[Value]> {
         .ok_or_else(|| anyhow!("nft JSON has no nftables array"))
 }
 
+fn validate_nft_json_document(input: &[u8], kind: &str) -> Result<()> {
+    let document: Value =
+        serde_json::from_slice(input).with_context(|| format!("invalid nft {kind} query JSON"))?;
+    let _objects =
+        nft_objects(&document).with_context(|| format!("invalid nft {kind} query document"))?;
+    Ok(())
+}
+
 fn verify_table(input: &[u8]) -> Result<()> {
     ensure!(
         openshield_table_count(input)? == 1,
@@ -2829,6 +2872,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn automatic_backend_discovery_prefers_nft_and_falls_back_in_order() -> Result<()> {
+        let calls = RefCell::new(Vec::new());
+        let selected = AutoBackend::discover_with(
+            || {
+                calls.borrow_mut().push("nftables");
+                Ok(NftBackend {
+                    binary: TestPathBuf::from("/nft"),
+                })
+            },
+            || -> Result<IptablesBackend> {
+                calls.borrow_mut().push("iptables");
+                anyhow::bail!("iptables must not be probed after nftables succeeds")
+            },
+        )?;
+        assert!(matches!(selected, AutoBackend::Nft(_)));
+        assert_eq!(*calls.borrow(), ["nftables"]);
+
+        let calls = RefCell::new(Vec::new());
+        let selected = AutoBackend::discover_with(
+            || {
+                calls.borrow_mut().push("nftables");
+                anyhow::bail!("nft probe failed")
+            },
+            || {
+                calls.borrow_mut().push("iptables");
+                Ok(IptablesBackend {
+                    ipv4: inert_xtables_tools("ip"),
+                    ipv6: inert_xtables_tools("ip6"),
+                    expected: Arc::new(Mutex::new(super::ExpectedXtablesPolicy::default())),
+                })
+            },
+        )?;
+        assert!(matches!(selected, AutoBackend::Iptables(_)));
+        assert_eq!(*calls.borrow(), ["nftables", "iptables"]);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_backend_discovery_reports_both_probe_failures() -> Result<()> {
+        let result = AutoBackend::discover_with(
+            || anyhow::bail!("nft capability rejected"),
+            || anyhow::bail!("xtables capability rejected"),
+        );
+        let error = result
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("both rejected backends must fail discovery"))?;
+        let message = format!("{error:#}");
+        assert!(message.contains("nft capability rejected"), "{message}");
+        assert!(message.contains("xtables capability rejected"), "{message}");
+        Ok(())
+    }
+
     fn learning_set(name: &str, data_types: &[&str], elements: Option<Value>) -> Value {
         let mut object = json!({"set": {
             "family": "inet",
@@ -2948,6 +3044,14 @@ mod tests {
         let mut invalid = serde_json::from_slice::<Value>(&learning_document(None, None, None)?)?;
         invalid["nftables"][1]["set"]["size"] = json!(8192);
         assert!(parse_learned_endpoints(&serde_json::to_vec(&invalid)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nft_query_preflight_requires_a_well_formed_json_document() -> Result<()> {
+        super::validate_nft_json_document(br#"{"nftables":[]}"#, "chain")?;
+        assert!(super::validate_nft_json_document(br"{}", "chain").is_err());
+        assert!(super::validate_nft_json_document(b"not-json", "counter").is_err());
         Ok(())
     }
 

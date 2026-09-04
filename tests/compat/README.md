@@ -189,6 +189,27 @@ This matrix does not boot systemd in a container or as PID 1.
 The lifecycle fixtures mount a stub daemon. Their successful result does not
 mean a backend was selected or that real packets were filtered.
 
+## Dynamic active-policy path evidence
+
+OpenShield 0.1.31 exposes a dynamically recomputed, conservative active-policy
+path classification through `StatusV2`:
+L3 `KernelNative` for `BlockAll` or application-free `Enforcing`, L2
+`ConntrackHybrid` for TCP-only application `Enforcing`, L1 `Nfqueue` for
+`Learning` or an enabled UDP/ICMP/ICMPv6/`Any` application rule, and `Unknown`
+for a legacy or unverified response. This is the worst-case active path;
+network-only matches remain in the kernel at L2 and L1.
+
+This is not kernel-capability attestation or fallback negotiation for an
+unchanged policy. The classification is independent of nftables-versus-iptables selection. Both backend
+scenarios must preserve identical rule semantics and fail closed if mandatory
+NFQUEUE setup is unavailable. A container result demonstrates the level
+calculation and packet paths on the runner kernel only. It does not certify the
+stock kernel, boot configuration, LSM, or Secure Boot state of the named
+distribution. Version 0.1.31 has no eBPF application data plane, so none of the
+37 runtime rows or 49 build-only mappings is an eBPF support claim.
+The only automatic startup backend fallback is from nftables to the complete
+iptables/ip6tables bundle when nftables cannot be validated.
+
 ## Real firewall end-to-end workflow
 
 The workflow expands every one of the 37 runtime platform rows into two
@@ -251,8 +272,8 @@ Each successful runtime release row reports both backend runs in its selected
 userspace:
 
 ```text
-PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
-PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
+PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (nftables)
+PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (iptables)
 ```
 
 In an nftables run both frontends are installed and nftables must be selected.

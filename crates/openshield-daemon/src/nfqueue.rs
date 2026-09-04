@@ -105,12 +105,23 @@ pub fn spawn(
     let learning_thread = thread::Builder::new()
         .name("openshield-app-learning".to_owned())
         .spawn(move || {
-            learning_loop(
-                &learning_receiver,
-                &learning_engine,
-                &learning_shutdown,
-                &learning_counters,
-            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                learning_loop(
+                    &learning_receiver,
+                    &learning_engine,
+                    &learning_shutdown,
+                    &learning_counters,
+                );
+            }));
+            if let Err(payload) = outcome {
+                error!("application-learning worker panicked; entering fail-closed quarantine");
+                // Stop the packet worker first so dropping its NFQUEUE socket
+                // is an independent fail-closed boundary even if quarantine
+                // persistence encounters another unexpected failure.
+                learning_shutdown.store(true, Ordering::Release);
+                quarantine_engine(&learning_engine);
+                std::panic::resume_unwind(payload);
+            }
         })
         .context("cannot spawn bounded application-learning worker")?;
 
@@ -411,14 +422,28 @@ fn learning_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         let (generation, endpoints) = collect_learning_batch(first, receiver);
-        let result = engine
-            .lock()
-            .map_err(|_| anyhow!("policy engine mutex is poisoned during application learning"))
-            .and_then(|mut engine| {
-                engine
-                    .harvest_application_learning(generation, endpoints)
-                    .map_err(|error| anyhow!(error.message))
-            });
+        let result = (|| {
+            let transaction = engine
+                .lock()
+                .map_err(|_| {
+                    anyhow!("policy engine mutex is poisoned during application learning")
+                })?
+                .prepare_application_learning(generation, endpoints)
+                .map_err(|error| anyhow!(error.message))?;
+            let Some(transaction) = transaction else {
+                return Ok(0);
+            };
+
+            // Atomic file replacement and both fsync operations deliberately
+            // run without the engine mutex. Packet snapshot/admission/final
+            // verdict rechecks therefore remain live while storage is slow.
+            let persisted = transaction.persist();
+            engine
+                .lock()
+                .map_err(|_| anyhow!("policy engine mutex is poisoned after application learning"))?
+                .finalize_application_learning(persisted)
+                .map_err(|error| anyhow!(error.message))
+        })();
         match result {
             Ok(0) => {}
             Ok(count) => info!(count, "persisted application-bound outbound rules"),
@@ -459,8 +484,20 @@ fn collect_learning_batch(
 }
 
 fn quarantine_engine(engine: &SharedEngine) {
-    if let Ok(mut engine) = engine.lock() {
-        engine.quarantine_after_runtime_failure();
+    match engine.lock() {
+        Ok(mut engine) => engine.quarantine_after_runtime_failure(),
+        Err(poisoned) => {
+            error!(
+                "policy engine mutex is poisoned; installing BlockAll from the recovered backend"
+            );
+            let mut recovered = poisoned.into_inner();
+            recovered.quarantine_after_engine_poison();
+            drop(recovered);
+            // The recovered Engine is now fatal and contains no trusted live
+            // policy claim. Let shutdown paths acquire it only to repeat
+            // BlockAll and terminate; normal protocol calls still see fatal.
+            engine.clear_poison();
+        }
     }
 }
 

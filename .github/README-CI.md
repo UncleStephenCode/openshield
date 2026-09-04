@@ -168,6 +168,22 @@ IPv6 xtables tool set must be available, and the daemon must select
 `iptables/ip6tables`. This proves preference and fallback rather than merely
 forcing a backend label.
 
+OpenShield 0.1.31 additionally reports a dynamically recomputed, conservative
+`StatusV2` active-policy path classification independently of that backend:
+L3 `KernelNative` for `BlockAll` or
+application-free `Enforcing`, L2 `ConntrackHybrid` for TCP-only application
+`Enforcing`, and L1 `Nfqueue` for `Learning` or an enabled
+UDP/ICMP/ICMPv6/`Any` application rule. Missing legacy data is `Unknown`, never
+an inferred fast path. This classification describes the most expensive active
+path; it is not kernel-capability attestation or a fallback sequence for an
+unchanged policy. A network-only match remains in the kernel at L2 and L1. The
+only automatic startup backend fallback is nftables to the complete
+iptables/ip6tables bundle. Failure to make
+mandatory NFQUEUE ready must leave the bootstrap `BlockAll` active and fail the
+job. Version 0.1.31 does not contain an eBPF application data plane, add
+`CAP_BPF`, or change boot/MOK state, and container results are not evidence for
+such support in a distribution kernel.
+
 ## Bounded performance release gate
 
 The performance job belongs only to the tag/`workflow_dispatch` release
@@ -232,12 +248,16 @@ reconstructs and validates that plan.
   errors, an invalid sample, a failed configured ceiling in a required
   steady/burst window, a missing backend, or a missing/malformed report fails
   the job;
-- in steady and burst windows, the release profile blocks publication when
-  paired throughput or DUT PPS falls by more than 10%, or paired p50/p95/p99
-  request or TCP-connect p50/p95/p99 latency, or DUT-cgroup CPU grows by more
-  than 10%; the longer production-like profile tightens all relative limits to
-  5%;
-- burst windows additionally remain mandatory capacity and safety checks;
+- all per-window relative deltas and threshold crossings are retained; the
+  release profile blocks an unchanged 10% relative regression only when at
+  least three valid steady adjacent pristine AB/BA pairs produce a one-sided
+  95% Student-t lower confidence bound above that threshold; the longer
+  production-like profile applies the same method with 5% limits;
+- a single burst relative observation is diagnostic only, while burst
+  validity, configured capacity ceilings, and safety remain mandatory;
+- application errors/loss, TCP retransmits, NIC drops/errors, NFQUEUE
+  drops/errors, or fail-open behavior block immediately and are never deferred
+  to the repeated-sample relative decision;
   explicit fail-open behavior is proven by the independent canary during the
   separate controlled-overload test, outside the paired performance workload;
 - the overload pressure client must publish readiness and wait at its explicit

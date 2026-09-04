@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use openshield_core::{
     CounterValue, Direction, Event, EventKind, Mode, Rule, RuleOrigin, TransportProtocol,
 };
+use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -124,12 +125,47 @@ fn draw_status(
             Span::raw(i18n.tr("status.backend")),
             Span::styled(backend.to_owned(), Style::default().fg(Color::Cyan)),
         ]),
-        Line::from(vec![Span::raw(i18n.tr("status.telemetry")), telemetry]),
-        Line::from(vec![Span::raw(i18n.tr("status.access")), access]),
         Line::from(vec![
             Span::raw(i18n.tr("status.mode")),
             Span::styled(mode, mode_style.add_modifier(Modifier::BOLD)),
         ]),
+        Line::from(vec![
+            Span::styled(
+                i18n.tr("status.compatibility_level"),
+                compatibility_reason_style(app.runtime_compatibility.reason),
+            ),
+            Span::styled(
+                compatibility_level_label(app.runtime_compatibility.level, i18n),
+                compatibility_level_style(
+                    app.runtime_compatibility.level,
+                    app.runtime_compatibility.reason,
+                )
+                .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                i18n.tr("status.compatibility_reason"),
+                compatibility_reason_style(app.runtime_compatibility.reason),
+            ),
+            Span::styled(
+                compatibility_reason_label(app.runtime_compatibility.reason, i18n),
+                compatibility_reason_style(app.runtime_compatibility.reason),
+            ),
+        ]),
+    ];
+    // The compact 80x24 layout keeps the attested backend, mode, level and
+    // reason ahead of all optional detail. The explanatory scope is omitted
+    // there because it can wrap to several rows in translated interfaces.
+    if area.height >= 24 {
+        lines.push(Line::from(Span::styled(
+            i18n.tr("status.compatibility_scope"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.extend([
+        Line::from(vec![Span::raw(i18n.tr("status.telemetry")), telemetry]),
+        Line::from(vec![Span::raw(i18n.tr("status.access")), access]),
         Line::from(i18n.format("status.revision", &[("revision", revision.as_str())])),
         Line::from(i18n.format(
             "status.rule_counts",
@@ -144,7 +180,7 @@ fn draw_status(
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
-    ];
+    ]);
     if let Some(counters) = &app.counters {
         let age = counters_age.map_or_else(
             || i18n.tr("status.age_unknown").to_owned(),
@@ -1178,6 +1214,56 @@ pub fn mode_label(mode: Mode, i18n: &I18n) -> &str {
     }
 }
 
+fn compatibility_level_label(level: CompatibilityLevel, i18n: &I18n) -> &str {
+    match level {
+        CompatibilityLevel::Unknown => i18n.tr("compatibility.level_unknown"),
+        CompatibilityLevel::KernelNative => i18n.tr("compatibility.level_kernel_native"),
+        CompatibilityLevel::ConntrackHybrid => i18n.tr("compatibility.level_conntrack_hybrid"),
+        CompatibilityLevel::Nfqueue => i18n.tr("compatibility.level_nfqueue"),
+    }
+}
+
+fn compatibility_reason_label(reason: CompatibilityReason, i18n: &I18n) -> &str {
+    match reason {
+        CompatibilityReason::Unknown => i18n.tr("compatibility.reason_unknown"),
+        CompatibilityReason::BlockAll => i18n.tr("compatibility.reason_block_all"),
+        CompatibilityReason::EmergencyBlockAll => {
+            i18n.tr("compatibility.reason_emergency_block_all")
+        }
+        CompatibilityReason::NetworkOnly => i18n.tr("compatibility.reason_network_only"),
+        CompatibilityReason::Learning => i18n.tr("compatibility.reason_learning"),
+        CompatibilityReason::ApplicationTcp => i18n.tr("compatibility.reason_application_tcp"),
+        CompatibilityReason::ApplicationPerPacket => {
+            i18n.tr("compatibility.reason_application_per_packet")
+        }
+    }
+}
+
+const fn compatibility_level_style(
+    level: CompatibilityLevel,
+    reason: CompatibilityReason,
+) -> Style {
+    let color = if matches!(reason, CompatibilityReason::EmergencyBlockAll) {
+        Color::Red
+    } else {
+        match level {
+            CompatibilityLevel::Unknown => Color::DarkGray,
+            CompatibilityLevel::KernelNative => Color::Green,
+            CompatibilityLevel::ConntrackHybrid => Color::Yellow,
+            CompatibilityLevel::Nfqueue => Color::Cyan,
+        }
+    };
+    Style::new().fg(color)
+}
+
+fn compatibility_reason_style(reason: CompatibilityReason) -> Style {
+    if matches!(reason, CompatibilityReason::EmergencyBlockAll) {
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    }
+}
+
 const fn mode_style(mode: Mode) -> Style {
     Style::new().fg(mode_color(mode))
 }
@@ -1285,10 +1371,13 @@ mod tests {
     use std::path::Path;
 
     use openshield_core::{ExecutableFileId, Snapshot};
-    use openshield_protocol::FirewallBackendKind;
+    use openshield_protocol::{
+        CompatibilityLevel, CompatibilityReason, FirewallBackendKind, RuntimeCompatibility,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+    use crate::i18n::Locale;
 
     #[test]
     fn status_renders_verified_backend_instead_of_subscription_wording()
@@ -1302,6 +1391,10 @@ mod tests {
                 rules: Vec::new(),
             },
             FirewallBackendKind::Nftables,
+            RuntimeCompatibility {
+                level: CompatibilityLevel::ConntrackHybrid,
+                reason: CompatibilityReason::ApplicationTcp,
+            },
         );
         app.connection = ConnectionState::Connected;
         app.set_telemetry_connected();
@@ -1316,7 +1409,137 @@ mod tests {
         })?;
         let screen = buffer_text(terminal.backend());
         assert!(screen.contains("Firewall backend: nftables"), "{screen}");
+        assert!(
+            screen.contains("Active policy path: L2 — conntrack/NFQUEUE hybrid"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Selection reason: application-bound TCP attributes new flows"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("network-only packets always stay in the kernel"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Compatibility level:"), "{screen}");
+        assert!(!screen.to_ascii_lowercase().contains("ebpf"), "{screen}");
         assert!(!screen.to_ascii_lowercase().contains("subscription"));
+        Ok(())
+    }
+
+    #[test]
+    fn emergency_quarantine_renders_level_and_reason_in_red()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::new(true, I18n::test_english());
+        app.set_observed_snapshot(
+            Snapshot {
+                revision: 9,
+                flow_generation: 1,
+                mode: Mode::BlockAll,
+                rules: Vec::new(),
+            },
+            FirewallBackendKind::Nftables,
+            RuntimeCompatibility {
+                level: CompatibilityLevel::KernelNative,
+                reason: CompatibilityReason::EmergencyBlockAll,
+            },
+        );
+        app.connection = ConnectionState::Connected;
+        let mut terminal = Terminal::new(TestBackend::new(110, 32))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                &app,
+                Path::new("/run/openshield/observe.sock"),
+                Path::new("/run/openshield/control.sock"),
+            );
+        })?;
+
+        let red_text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::Red)
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(red_text.contains("L3 — kernel native"), "{red_text}");
+        assert!(red_text.contains("Active policy path:"), "{red_text}");
+        assert!(red_text.contains("Selection reason:"), "{red_text}");
+        assert!(
+            red_text.contains("emergency fail-closed quarantine is active"),
+            "{red_text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_status_keeps_runtime_evidence_visible_in_every_locale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for &locale in Locale::SUPPORTED {
+            let i18n = I18n::load(locale)?;
+            let expected_mode = i18n.tr("mode.enforcing").to_owned();
+            let expected_level = i18n.tr("compatibility.level_kernel_native").to_owned();
+            let reason_prefix = i18n
+                .tr("compatibility.reason_network_only")
+                .chars()
+                .take(12)
+                .collect::<String>();
+            let scope = i18n.tr("status.compatibility_scope").to_owned();
+            let mut app = App::new(true, i18n);
+            app.set_observed_snapshot(
+                Snapshot {
+                    revision: 7,
+                    flow_generation: 1,
+                    mode: Mode::Enforcing,
+                    rules: Vec::new(),
+                },
+                FirewallBackendKind::Nftables,
+                RuntimeCompatibility {
+                    level: CompatibilityLevel::KernelNative,
+                    reason: CompatibilityReason::NetworkOnly,
+                },
+            );
+            app.connection = ConnectionState::Connected;
+            app.set_telemetry_connected();
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+            terminal.draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    Path::new("/run/openshield/observe.sock"),
+                    Path::new("/run/openshield/control.sock"),
+                );
+            })?;
+            let screen = buffer_text(terminal.backend());
+            let compact = |value: &str| {
+                value
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>()
+            };
+            let compact_screen = compact(&screen);
+            for expected in [
+                "nftables",
+                expected_mode.as_str(),
+                expected_level.as_str(),
+                app.i18n.tr("status.compatibility_reason"),
+                reason_prefix.as_str(),
+            ] {
+                let compact_expected = compact(expected);
+                assert!(
+                    compact_screen.contains(&compact_expected),
+                    "missing {expected:?} in {} compact status: {screen}",
+                    locale.code(),
+                );
+            }
+            assert!(
+                !compact_screen.contains(&compact(&scope)),
+                "scope must be omitted from {} compact status: {screen}",
+                locale.code(),
+            );
+        }
         Ok(())
     }
 
