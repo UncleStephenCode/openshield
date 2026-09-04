@@ -68,6 +68,34 @@ or EOF after sending a command is treated as an unconfirmed outcome because the
 daemon may have committed before its acknowledgement was lost. The TUI warns
 against retrying and resynchronizes instead of claiming the change failed.
 
+## TUI policy projection
+
+The TUI separates Status, Outbound rules, Inbound rules, Events, and Help into
+five tabs selected by `1` through `5` or cycled with `Tab`. Status obtains the
+active typed backend identity from the daemon and displays `nftables` or the
+`iptables`/`ip6tables` fallback independently of observation-stream health.
+
+The outbound view is a projection over the authoritative rule snapshot, not a
+second policy model. It selects exactly one grouping key per rule in priority
+order: unified-cgroup-v2 path, exact validated executable path without argv, then
+destination network. A rule with no destination network uses an explicit
+"any destination" key. All lower-priority selectors remain individual rule
+fields. The left pane selects a group; the right pane retains each member and
+shows its complete network and application constraints. Navigation follows
+stable rule UUIDs so insertion, sorting, or migration between groups cannot
+redirect an edit, delete, or enable operation to a different rule. Grouping
+never changes matching or creates an implicit bulk mutation.
+
+Inbound rules have a separate view and editor entry point. They expose source
+network, local port or range, interface, and protocol, but never an application
+selector. `Up`/`Down` change the current group or inbound rule and
+`Left`/`Right` change the selected member of an outbound group.
+`PageUp`/`PageDown` scroll the complete, bounded rule detail projection. The
+current tab supplies the direction for `n`; `e`, `d`, and `Space` act on one
+selected UUID. The daemon still independently enforces root-only control;
+authorized non-root `openshield` observers can navigate only the redacted,
+read-only projection.
+
 ## Application attribution
 
 An application selector is valid only on an outbound rule. The executable path
@@ -322,6 +350,70 @@ and learning work bounded. The nftables lightweight observation does not compare
 complete rule bodies; a privileged targeted edit or additional allow can evade
 it. The iptables comparison is stricter for owned chains, but no monitor makes
 arbitrary concurrent privileged firewall editors a supported configuration.
+
+## Performance verification model
+
+The isolated harness in [`tests/perf`](../tests/perf/README.md) exercises the
+same nftables and, where the kernel supports it, iptables/ip6tables paths as the
+daemon. Network-only policy is measured in both `Learning` and `Enforcing`;
+outbound application TCP and UDP use privileged exact rules in `Enforcing` and
+persisted learned rules in `Learning`. The DUT creates the real
+`/var/lib/openshield` directory in its writable container overlay rather than a
+`tmpfs`, so the production atomic-rename and `fsync` state path is exercised.
+State and learned rules survive phase-client exits and daemon control
+transactions within one backend topology, but that disposable writable layer
+is not reused by a later independent harness run.
+
+Warm-up, every ramp step, every steady repetition, and burst each start an
+independent client process and initial socket set. The server remains alive for
+the whole load point. Application TCP fast-path evidence is collected inside
+each phase: a keep-alive connection first crosses NFQUEUE for process
+attribution and then carries multiple request/response operations under the
+current conntrack generation. No established connection is carried across a
+phase boundary. A bounded 50--3,600,000 ms weighted lifetime distribution is
+selected deterministically for every persistent connection. Expiry closes and
+reopens an ordinary TCP socket between completed exchanges, producing a real
+new conntrack/NFQUEUE attribution path without interrupting in-flight work;
+short-connection profiles validate but otherwise ignore the lifetime. Each
+protected measurement is paired with a sequential
+no-daemon baseline using identical offered parameters and a policy-independent
+deterministic trace seed; conntrack is flushed before each baseline and policy
+load point.
+
+The result model separates validity, capacity, and safety. Generator CPU or
+scheduler saturation and peer/server CPU, rejection, or protocol saturation
+invalidate a window; an invalid baseline propagates to its pair. Valid windows
+then have formal configured gates for target attainment, latency, loss,
+retransmits, daemon CPU/RSS, interface errors, NFQUEUE drops, and expected queue
+shape. Repeated wrong-executable probes during application bursts and direct
+kernel inspection of a reported quarantine prevent a fail-open result from
+passing. Invalid points are excluded from capacity, and a production maximum
+requires three successful steady repetitions. Host `/proc/softirqs` counters
+are not namespaced or attributable to the daemon; they are interpreted only as
+a paired-baseline delta on a quiet runner. The bounded release smoke follows
+the functional firewall E2E jobs, but its three short steady repetitions
+validate the path and safety gate rather than certifying a capacity maximum.
+
+A separate configured overload gate deliberately stops the daemon with
+`SIGSTOP`, drives real application TCP and UDP until the bounded NFQUEUE shows
+at least the required combined kernel/userspace drop count, and repeatedly
+tests a different executable while the consumer is stalled. The pressure
+client first publishes readiness and waits at an explicit start barrier. A
+separate network-only endpoint on the same canary veth and transport must
+complete a real round trip immediately before and after every negative probe;
+resource saturation or socket/NIC errors at the generator, peer, or canary make
+the proof invalid. `SIGCONT` is attempted in a `finally` path, with
+disposable-container teardown as the outer fallback. After resume, the daemon
+must either retain `Enforcing` and pass an allowed-traffic recovery exchange or
+expose a `BlockAll` quarantine independently verified in the selected kernel
+backend. A reported quarantine additionally requires bracketed real TCP and UDP
+negative probes while loopback round trips inside the canary container prove
+both peer servers healthy immediately before and after each probe. The
+different executable must remain blocked both during and after the stall. This
+controlled test is a fail-closed stress proof and is kept out of capacity
+calculations. Its TCP pressure payload forces short connections, so the
+inherited validated keep-alive lifetime distribution cannot reduce NFQUEUE
+saturation pressure.
 
 ## Trust boundaries
 

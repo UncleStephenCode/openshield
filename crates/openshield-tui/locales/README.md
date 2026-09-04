@@ -9,7 +9,7 @@ per-message merge with, or fallback to, English.
 
 ## Supported locales
 
-The current set has 31 locales and 183 messages per locale.
+The current set has 31 locales and 225 messages per locale.
 
 | Code | Language | Code | Language |
 | --- | --- | --- | --- |
@@ -41,7 +41,7 @@ from `be` onward listed in the lower part of the table.
 ## Translation gap inventory
 
 These requested locale identifiers are not exposed yet because a complete,
-technically meaningful 183-message translation could not be reviewed with
+technically meaningful 225-message translation could not be reviewed with
 sufficient confidence: `hy` (Armenian), `ka` (Georgian), `ky` (Kyrgyz), `tg`
 (Tajik), `mn` (Mongolian), `kbd` (Kabardian), `nog` (Nogai), `lbe` (Lak),
 `tab` (Tabasaran), `ab` (Abkhaz), `abq` (Abaza), and `agx` (Aghul).
@@ -50,7 +50,7 @@ The fallback audit also removed these previously proposed resources: `udm`
 (Udmurt), `kv` (Komi-Zyrian), `krl` (Karelian), `mhr` (Meadow Mari), `mrj`
 (Hill Mari), `myv` (Erzya), `mdf` (Moksha), `alt` (Southern Altai), `av`
 (Avar), `dar` (Dargwa), `lez` (Lezgin), and `kum` (Kumyk). Between 29 and
-119 of their 183 messages were copied verbatim from Russian, so presenting
+119 of their former 183 messages were copied verbatim from Russian, so presenting
 them as complete translations would be misleading.
 
 A subsequent all-pairs forensic audit quarantined `os` (Ossetian), `inh`

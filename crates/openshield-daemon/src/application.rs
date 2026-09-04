@@ -23,6 +23,27 @@ const MAX_STAT_BYTES: usize = 64 * 1024;
 const MAX_CGROUP_BYTES: usize = 256 * 1024;
 const PROC_SCAN_DEADLINE: Duration = Duration::from_millis(250);
 
+#[derive(Debug)]
+struct ProcfsAttributionTimeout;
+
+impl std::fmt::Display for ProcfsAttributionTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bounded procfs scan timed out")
+    }
+}
+
+impl std::error::Error for ProcfsAttributionTimeout {}
+
+/// Distinguishes the bounded attribution deadline from ordinary attribution
+/// failures without relying on log text. Context added by callers remains in
+/// the anyhow chain and does not erase this marker.
+#[must_use]
+pub(crate) fn is_attribution_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ProcfsAttributionTimeout>().is_some())
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OutboundConnection {
     pub source_address: IpAddr,
@@ -1103,7 +1124,9 @@ fn read_bounded(path: &Path, maximum: usize, deadline: Instant) -> Result<Vec<u8
 }
 
 fn ensure_within_deadline(deadline: Instant) -> Result<()> {
-    ensure!(Instant::now() <= deadline, "bounded procfs scan timed out");
+    if Instant::now() > deadline {
+        return Err(ProcfsAttributionTimeout.into());
+    }
     Ok(())
 }
 
@@ -1117,6 +1140,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn attribution_timeout_remains_typed_through_context() -> Result<(), Box<dyn Error>> {
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .ok_or("cannot construct an expired attribution deadline")?;
+        let error = ensure_within_deadline(expired)
+            .context("cannot enumerate procfs")
+            .err()
+            .ok_or("expired deadline unexpectedly succeeded")?;
+
+        assert!(is_attribution_timeout(&error));
+        assert_eq!(
+            error.to_string(),
+            "cannot enumerate procfs",
+            "caller context should remain the public diagnostic"
+        );
+        Ok(())
+    }
 
     fn create_task_fixture(
         root: &Path,

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex,
     mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
@@ -14,8 +16,10 @@ use openshield_core::{
     FirewallCounters, LearnedApplicationEndpoint, MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule,
     RuleOrigin, Snapshot, State, StateStore,
 };
+#[cfg(test)]
+use openshield_protocol::FirewallBackendKind;
 use openshield_protocol::{
-    Ack, ControlRequest, ErrorCode, ProtocolError, Response, clamp_page_limit,
+    Ack, ControlRequest, ErrorCode, NfqueueCounters, ProtocolError, Response, clamp_page_limit,
 };
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -32,6 +36,108 @@ pub const EVENT_QUEUE_CAPACITY: usize = 512;
 const MAX_LEARNED_RULES_PER_POLL: usize = 256;
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
+
+/// Process-lifetime NFQUEUE counters shared by the packet workers and the
+/// status path. Targets with native 64-bit atomics use relaxed ordering
+/// because these values carry no synchronization payload. The `ARMv5` fallback
+/// serializes each full-width value with a mutex.
+#[derive(Debug, Default)]
+struct SaturatingCounter {
+    #[cfg(target_has_atomic = "64")]
+    value: AtomicU64,
+    // Rust supports OpenShield's ARMv5 target, but that target has no native
+    // 64-bit atomics. Keep the full u64 contract there instead of silently
+    // narrowing or making the target fail to compile.
+    #[cfg(not(target_has_atomic = "64"))]
+    value: Mutex<u64>,
+}
+
+impl SaturatingCounter {
+    #[cfg(target_has_atomic = "64")]
+    fn increment(&self) {
+        // Returning `Some` makes this update infallible. Saturation is
+        // intentional: wrapping a long-running daemon's telemetry to zero
+        // could make a release gate mistake an error for a clean interval.
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            });
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn increment(&self) {
+        let mut value = match self.value.lock() {
+            Ok(value) => value,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *value = value.saturating_add(1);
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn load(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn load(&self) -> u64 {
+        let value = match self.value.lock() {
+            Ok(value) => value,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *value
+    }
+
+    #[cfg(test)]
+    fn set_for_test(&self, value: u64) {
+        #[cfg(target_has_atomic = "64")]
+        self.value.store(value, Ordering::Relaxed);
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            let mut current = match self.value.lock() {
+                Ok(current) => current,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *current = value;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct NfqueueRuntimeCounters {
+    queue_overflow: SaturatingCounter,
+    attribution_timeout: SaturatingCounter,
+    terminal_queue_error: SaturatingCounter,
+    denied: SaturatingCounter,
+}
+
+impl NfqueueRuntimeCounters {
+    pub(crate) fn record_queue_overflow(&self) {
+        self.queue_overflow.increment();
+    }
+
+    pub(crate) fn record_attribution_timeout(&self) {
+        self.attribution_timeout.increment();
+    }
+
+    pub(crate) fn record_terminal_queue_error(&self) {
+        self.terminal_queue_error.increment();
+    }
+
+    pub(crate) fn record_denied(&self) {
+        self.denied.increment();
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> NfqueueCounters {
+        NfqueueCounters {
+            queue_overflow: self.queue_overflow.load(),
+            attribution_timeout: self.attribution_timeout.load(),
+            terminal_queue_error: self.terminal_queue_error.load(),
+            denied: self.denied.load(),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct EventBusState {
@@ -161,6 +267,7 @@ pub struct Engine {
     backend: Box<dyn FirewallBackend>,
     store: Box<dyn StateStore>,
     events: EventBus,
+    nfqueue_counters: Arc<NfqueueRuntimeCounters>,
     poisoned: bool,
     fatal: bool,
     restart_required: bool,
@@ -209,6 +316,7 @@ impl std::fmt::Debug for Engine {
             )
             .field("store", &self.store)
             .field("events", &self.events)
+            .field("nfqueue_counters", &self.nfqueue_counters.snapshot())
             .field("poisoned", &self.poisoned)
             .field("fatal", &self.fatal)
             .field("restart_required", &self.restart_required)
@@ -317,6 +425,7 @@ impl Engine {
             backend,
             store,
             events,
+            nfqueue_counters: Arc::new(NfqueueRuntimeCounters::default()),
             poisoned: false,
             fatal: false,
             restart_required: false,
@@ -354,6 +463,11 @@ impl Engine {
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.state.mode()
+    }
+
+    #[must_use]
+    pub(crate) fn nfqueue_counters(&self) -> Arc<NfqueueRuntimeCounters> {
+        Arc::clone(&self.nfqueue_counters)
     }
 
     #[must_use]
@@ -460,6 +574,8 @@ impl Engine {
             revision: self.state.revision(),
             mode: self.state.mode(),
             rule_count,
+            backend: self.backend.kind(),
+            nfqueue: self.nfqueue_counters.snapshot(),
         }
     }
 
@@ -1008,6 +1124,7 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct BackendProbe {
+        kind: FirewallBackendKind,
         applied: Arc<Mutex<Vec<Snapshot>>>,
         fail_next: Arc<AtomicBool>,
         error_after_apply: Arc<AtomicBool>,
@@ -1021,6 +1138,10 @@ mod tests {
     }
 
     impl FirewallBackend for BackendProbe {
+        fn kind(&self) -> FirewallBackendKind {
+            self.kind
+        }
+
         fn apply(&mut self, snapshot: &Snapshot) -> AnyResult<()> {
             let scripted_failure = self
                 .failure_script
@@ -1166,6 +1287,78 @@ mod tests {
             .map_err(|_| anyhow!("backend probe poisoned"))?
             .clear();
         Ok((engine, backend, store, events))
+    }
+
+    #[test]
+    fn status_reports_the_backend_owned_by_the_engine() -> AnyResult<()> {
+        let backend = BackendProbe {
+            kind: FirewallBackendKind::Nftables,
+            ..BackendProbe::default()
+        };
+        let store = StoreProbe::new(State::new());
+        let engine = Engine::load(Box::new(backend), Box::new(store), EventBus::new())?;
+
+        assert!(matches!(
+            engine.status_response(),
+            Response::Status {
+                backend: FirewallBackendKind::Nftables,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_a_typed_nfqueue_counter_snapshot() -> AnyResult<()> {
+        let store = StoreProbe::new(State::new());
+        let engine = Engine::load(
+            Box::new(BackendProbe::default()),
+            Box::new(store),
+            EventBus::new(),
+        )?;
+        let counters = engine.nfqueue_counters();
+        counters.record_queue_overflow();
+        counters.record_attribution_timeout();
+        counters.record_terminal_queue_error();
+        counters.record_denied();
+
+        assert!(matches!(
+            engine.status_response(),
+            Response::Status {
+                nfqueue: NfqueueCounters {
+                    queue_overflow: 1,
+                    attribution_timeout: 1,
+                    terminal_queue_error: 1,
+                    denied: 1,
+                },
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn nfqueue_counters_saturate_instead_of_wrapping() {
+        let counters = NfqueueRuntimeCounters::default();
+        counters.queue_overflow.set_for_test(u64::MAX);
+        counters.attribution_timeout.set_for_test(u64::MAX);
+        counters.terminal_queue_error.set_for_test(u64::MAX);
+        counters.denied.set_for_test(u64::MAX);
+
+        counters.record_queue_overflow();
+        counters.record_attribution_timeout();
+        counters.record_terminal_queue_error();
+        counters.record_denied();
+
+        assert_eq!(
+            counters.snapshot(),
+            NfqueueCounters {
+                queue_overflow: u64::MAX,
+                attribution_timeout: u64::MAX,
+                terminal_queue_error: u64::MAX,
+                denied: u64::MAX,
+            }
+        );
     }
 
     #[test]
@@ -1829,7 +2022,9 @@ mod tests {
                 revision,
                 mode: Mode::BlockAll,
                 rule_count: 1,
-            } if revision == engine.revision()
+                backend: FirewallBackendKind::Unknown,
+                nfqueue,
+            } if revision == engine.revision() && nfqueue == NfqueueCounters::default()
         ));
         Ok(())
     }

@@ -34,6 +34,7 @@ Validation
     -> Install Matrix
     -> Container Tests
     -> Firewall E2E
+    -> Performance Smoke
     -> Release Evidence
     -> Publish
 ```
@@ -43,6 +44,10 @@ Validation
 разрешается только после Validation и Quality Gate. Публикация разрешается
 только после того, как этап evidence сверит каждую обязательную строку матрицы
 и каждый релизный файл.
+
+Единственная проба производительности openSUSE Tumbleweed `linux/amd64` начинается только после
+успеха всей функциональной E2E-матрицы. Это ограниченный релизный барьер регрессий, который
+не добавляет в эту матрицу свидетельств поддержки архитектур или дистрибутивов.
 
 37 строк времени выполнения охватывают Debian 12/13, Ubuntu 22.04/24.04/26.04,
 Fedora 43/44, Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0,

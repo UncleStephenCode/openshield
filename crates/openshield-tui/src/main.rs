@@ -117,6 +117,7 @@ fn run() -> Result<()> {
 
 fn drain_observer_updates(observer: &Observer, app: &mut App) -> bool {
     let mut updated = false;
+    let mut reconcile_rules = false;
     while let Ok(update) = observer.try_recv() {
         updated = true;
         match update {
@@ -126,19 +127,24 @@ fn drain_observer_updates(observer: &Observer, app: &mut App) -> bool {
             ObserverUpdate::TelemetryDisconnected(reason) => {
                 app.set_telemetry_disconnected(reason);
             }
-            ObserverUpdate::Snapshot(snapshot) => {
+            ObserverUpdate::Snapshot { snapshot, backend } => {
                 app.connection = app::ConnectionState::Connected;
-                app.set_snapshot(snapshot);
+                app.set_observed_snapshot(snapshot, backend);
             }
-            ObserverUpdate::Restarted(snapshot) => {
+            ObserverUpdate::Restarted { snapshot, backend } => {
                 app.connection = app::ConnectionState::Connected;
-                app.set_restarted_snapshot(snapshot);
+                app.set_restarted_observed_snapshot(snapshot, backend);
             }
-            ObserverUpdate::Event(event) => app.push_event(*event),
+            ObserverUpdate::Event(event) => {
+                reconcile_rules |= app.push_observer_event(*event);
+            }
             ObserverUpdate::Dropped(count) => {
                 app.dropped_events = app.dropped_events.saturating_add(count);
             }
         }
+    }
+    if reconcile_rules {
+        app.reconcile_rule_selection();
     }
     updated
 }
@@ -149,8 +155,13 @@ fn execute_control(
     app: &mut App,
     request: ControlRequest,
 ) {
+    let action = ControlAction::from_request(&request);
     match transport::send_control(paths, request) {
-        Ok(ack) => app.notice = Some(ack_message(&ack, &app.i18n)),
+        Ok(ack) => {
+            let message = ack_message(&ack, action, &app.i18n);
+            let resync = request_resync_notice(observer, &app.i18n);
+            app.notice = Some(format!("{message}{resync}"));
+        }
         Err(error) => {
             let presentation = control_failure_presentation(&error, &app.i18n);
             let resync_status = if presentation.request_resync {
@@ -220,17 +231,55 @@ fn request_resync_notice(observer: &Observer, i18n: &I18n) -> String {
     )
 }
 
-fn ack_message(ack: &Ack, i18n: &I18n) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlAction {
+    SetMode(Mode),
+    CreateRule,
+    UpdateRule,
+    DeleteRule,
+    SetRuleEnabled(bool),
+}
+
+impl ControlAction {
+    const fn from_request(request: &ControlRequest) -> Self {
+        match request {
+            ControlRequest::SetMode { mode, .. } => Self::SetMode(*mode),
+            ControlRequest::CreateRule { .. } => Self::CreateRule,
+            ControlRequest::UpdateRule { .. } => Self::UpdateRule,
+            ControlRequest::DeleteRule { .. } => Self::DeleteRule,
+            ControlRequest::SetRuleEnabled { enabled, .. } => Self::SetRuleEnabled(*enabled),
+        }
+    }
+}
+
+fn ack_message(ack: &Ack, action: ControlAction, i18n: &I18n) -> String {
     let revision = ack.revision.to_string();
-    ack.affected_rule.as_ref().map_or_else(
-        || i18n.format("control.applied", &[("revision", revision.as_str())]),
-        |rule| {
-            let name = rule.spec.name.to_string();
-            i18n.format(
-                "control.applied_rule",
-                &[("rule", name.as_str()), ("revision", revision.as_str())],
-            )
-        },
+    if let ControlAction::SetMode(mode) = action {
+        let mode = match mode {
+            Mode::BlockAll => i18n.tr("mode.block_all"),
+            Mode::Learning => i18n.tr("mode.learning"),
+            Mode::Enforcing => i18n.tr("mode.enforcing"),
+        };
+        return i18n.format(
+            "control.mode_changed",
+            &[("mode", mode), ("revision", revision.as_str())],
+        );
+    }
+    let name = ack.affected_rule.as_ref().map_or_else(
+        || i18n.tr("common.unknown").to_owned(),
+        |rule| rule.spec.name.to_string(),
+    );
+    let key = match action {
+        ControlAction::CreateRule => "control.rule_created",
+        ControlAction::UpdateRule => "control.rule_updated",
+        ControlAction::DeleteRule => "control.rule_deleted",
+        ControlAction::SetRuleEnabled(true) => "control.rule_enabled",
+        ControlAction::SetRuleEnabled(false) => "control.rule_disabled",
+        ControlAction::SetMode(_) => unreachable!("mode action returned above"),
+    };
+    i18n.format(
+        key,
+        &[("rule", name.as_str()), ("revision", revision.as_str())],
     )
 }
 
@@ -259,20 +308,39 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
 fn handle_normal_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
     match key.code {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
-        KeyCode::Char('?' | '4') => app.view = View::Help,
+        KeyCode::Char('?' | '5') => app.view = View::Help,
         KeyCode::Char('1') => app.view = View::Status,
-        KeyCode::Char('2') => app.view = View::Rules,
-        KeyCode::Char('3') => app.view = View::Events,
+        KeyCode::Char('2') => app.view = View::Outbound,
+        KeyCode::Char('3') => app.view = View::Inbound,
+        KeyCode::Char('4') => app.view = View::Events,
         KeyCode::Tab => app.view = app.view.next(),
-        KeyCode::Up if app.view == View::Rules => app.select_previous_rule(),
-        KeyCode::Down if app.view == View::Rules => app.select_next_rule(),
+        KeyCode::Up if matches!(app.view, View::Outbound | View::Inbound) => {
+            app.select_previous_rule();
+        }
+        KeyCode::Down if matches!(app.view, View::Outbound | View::Inbound) => {
+            app.select_next_rule();
+        }
+        KeyCode::Left if app.view == View::Outbound => app.select_previous_group_member(),
+        KeyCode::Right if app.view == View::Outbound => app.select_next_group_member(),
+        KeyCode::PageUp if matches!(app.view, View::Outbound | View::Inbound) => {
+            app.scroll_rule_details(true);
+        }
+        KeyCode::PageDown if matches!(app.view, View::Outbound | View::Inbound) => {
+            app.scroll_rule_details(false);
+        }
         KeyCode::Char('m' | 'M') => app.open_mode_picker(),
-        KeyCode::Char('n' | 'N') if app.view == View::Rules => app.open_create_rule(),
-        KeyCode::Char('e' | 'E') if app.view == View::Rules => app.open_edit_rule(),
-        KeyCode::Char('d' | 'D') if app.view == View::Rules => {
+        KeyCode::Char('n' | 'N') if matches!(app.view, View::Outbound | View::Inbound) => {
+            app.open_create_rule();
+        }
+        KeyCode::Char('e' | 'E') if matches!(app.view, View::Outbound | View::Inbound) => {
+            app.open_edit_rule();
+        }
+        KeyCode::Char('d' | 'D') if matches!(app.view, View::Outbound | View::Inbound) => {
             app.open_delete_confirmation();
         }
-        KeyCode::Char(' ') if app.view == View::Rules => return app.toggle_selected_rule(),
+        KeyCode::Char(' ') if matches!(app.view, View::Outbound | View::Inbound) => {
+            return app.toggle_selected_rule();
+        }
         _ => {}
     }
     None
@@ -355,8 +423,7 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> Option<ControlRequest> {
         KeyCode::Right | KeyCode::Char(' ')
             if matches!(
                 form.active_field,
-                FormField::Direction
-                    | FormField::Protocol
+                FormField::Protocol
                     | FormField::Application
                     | FormField::CommandMode
                     | FormField::Enabled
@@ -382,13 +449,14 @@ mod tests {
     use std::io;
 
     use crossterm::event::KeyEvent;
+    use openshield_core::{Direction, Rule, RuleName, RuleOrigin, RuleSpec, TransportProtocol};
 
     use super::*;
 
     #[test]
     fn read_only_keyboard_shortcut_does_not_open_editor() {
         let mut app = App::new(true, I18n::test_english());
-        app.view = View::Rules;
+        app.view = View::Outbound;
         let request = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
@@ -435,5 +503,32 @@ mod tests {
             terminal_safe("safe\u{1b}[31m\u{202e}tail"),
             "safe [31m tail"
         );
+    }
+
+    #[test]
+    fn russian_ack_message_names_the_completed_operation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let rule = Rule::new(RuleSpec::new(
+            RuleName::new("Веб-сервер")?,
+            Direction::Inbound,
+            TransportProtocol::Tcp,
+            Some("192.0.2.0/24".parse()?),
+            None,
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?)?;
+        let ack = Ack::new(12, Some(rule));
+        let i18n = I18n::load(Locale::Ru)?;
+
+        assert_eq!(
+            ack_message(&ack, ControlAction::CreateRule, &i18n),
+            "Правило «Веб-сервер» успешно создано; ревизия политики 12"
+        );
+        assert_eq!(
+            ack_message(&ack, ControlAction::DeleteRule, &i18n),
+            "Правило «Веб-сервер» успешно удалено; ревизия политики 12"
+        );
+        Ok(())
     }
 }

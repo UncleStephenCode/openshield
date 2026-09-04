@@ -19,6 +19,42 @@ pub const OBSERVE_SOCKET_PATH: &str = "/run/openshield/observe.sock";
 pub const CONTROL_SOCKET_PATH: &str = "/run/openshield/control.sock";
 pub const OBSERVE_GROUP_NAME: &str = "openshield";
 
+/// Firewall implementation which currently owns the `OpenShield` policy.
+///
+/// `Unknown` is deliberately the default so an older daemon response or a
+/// test backend can never be presented as a verified production backend.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum FirewallBackendKind {
+    #[default]
+    Unknown,
+    Nftables,
+    Iptables,
+}
+
+/// Monotonic error counters reported by the live NFQUEUE runtime.
+///
+/// Every field is saturating: a daemon never wraps a counter back to zero.
+/// The nested default keeps status responses from older daemons readable by
+/// newer clients and permits future producers to omit zero-valued fields.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NfqueueCounters {
+    /// Netlink receive-overflow events (`ENOBUFS`). The kernel denied an
+    /// unknown number of queued packets for each event.
+    pub queue_overflow: u64,
+    /// Packets denied because the bounded `/proc` attribution deadline
+    /// expired.
+    pub attribution_timeout: u64,
+    /// Errors which terminate the queue runtime and trigger fail-closed
+    /// quarantine.
+    pub terminal_queue_error: u64,
+    /// Packets for which userspace successfully returned an explicit drop
+    /// verdict. Overflow losses are not included because their cardinality is
+    /// unavailable to userspace.
+    pub denied: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[allow(
     clippy::large_enum_variant,
@@ -45,7 +81,8 @@ pub type ClientRequest = Request;
     content = "data"
 )]
 pub enum ReadRequest {
-    /// Returns only mode, revision, and total rule count.
+    /// Returns mode, revision, total rule count, active firewall backend, and
+    /// process-lifetime NFQUEUE counters.
     Status,
     /// Returns rules ordered by UUID strictly after `after`.
     ///
@@ -126,6 +163,10 @@ pub enum Response {
         revision: u64,
         mode: Mode,
         rule_count: u32,
+        #[serde(default)]
+        backend: FirewallBackendKind,
+        #[serde(default)]
+        nfqueue: NfqueueCounters,
     },
     RulesPage {
         revision: u64,
@@ -509,6 +550,67 @@ mod tests {
         let mut bytes = Vec::new();
         write_request(&mut bytes, &request)?;
         assert_eq!(read_request(&mut Cursor::new(bytes))?, request);
+        Ok(())
+    }
+
+    #[test]
+    fn status_round_trip_preserves_backend_and_nfqueue_counters() -> Result<(), Box<dyn Error>> {
+        let nfqueue = NfqueueCounters {
+            queue_overflow: 1,
+            attribution_timeout: 2,
+            terminal_queue_error: 3,
+            denied: 4,
+        };
+        let response = Response::Status {
+            revision: 7,
+            mode: Mode::Learning,
+            rule_count: 3,
+            backend: FirewallBackendKind::Nftables,
+            nfqueue,
+        };
+        let mut bytes = Vec::new();
+        write_response(&mut bytes, &response)?;
+        assert_eq!(read_response(&mut Cursor::new(bytes))?, response);
+        Ok(())
+    }
+
+    #[test]
+    fn status_without_backend_is_safely_reported_as_unknown() -> Result<(), Box<dyn Error>> {
+        let payload =
+            br#"{"type":"status","data":{"revision":7,"mode":"learning","rule_count":3}}"#;
+        let mut bytes = Vec::from(u32::try_from(payload.len())?.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        assert_eq!(
+            read_response(&mut Cursor::new(bytes))?,
+            Response::Status {
+                revision: 7,
+                mode: Mode::Learning,
+                rule_count: 3,
+                backend: FirewallBackendKind::Unknown,
+                nfqueue: NfqueueCounters::default(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_nested_nfqueue_fields_default_to_zero() -> Result<(), Box<dyn Error>> {
+        let payload = br#"{"type":"status","data":{"revision":7,"mode":"learning","rule_count":3,"nfqueue":{"queue_overflow":9}}}"#;
+        let mut bytes = Vec::from(u32::try_from(payload.len())?.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        assert_eq!(
+            read_response(&mut Cursor::new(bytes))?,
+            Response::Status {
+                revision: 7,
+                mode: Mode::Learning,
+                rule_count: 3,
+                backend: FirewallBackendKind::Unknown,
+                nfqueue: NfqueueCounters {
+                    queue_overflow: 9,
+                    ..NfqueueCounters::default()
+                },
+            }
+        );
         Ok(())
     }
 

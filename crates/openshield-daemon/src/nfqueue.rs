@@ -19,9 +19,9 @@ use openshield_core::{
 };
 use tracing::{error, info, warn};
 
-use crate::application::{OutboundConnection, ProcfsResolver};
+use crate::application::{OutboundConnection, ProcfsResolver, is_attribution_timeout};
 use crate::backend::QueueVerdictStrategy;
-use crate::engine::{LearningQueueAdmission, SharedEngine};
+use crate::engine::{LearningQueueAdmission, NfqueueRuntimeCounters, SharedEngine};
 
 const NFNL_SUBSYS_QUEUE: u16 = 3;
 const NFQNL_MSG_PACKET: u16 = 0;
@@ -67,13 +67,20 @@ const INTERFACE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(50);
 pub struct QueueRuntime {
     packet_thread: JoinHandle<()>,
     learning_thread: JoinHandle<()>,
+    counters: Arc<NfqueueRuntimeCounters>,
 }
 
 impl QueueRuntime {
     pub fn join(self) -> Result<()> {
-        let packet = self.packet_thread.join();
-        let learning = self.learning_thread.join();
+        let Self {
+            packet_thread,
+            learning_thread,
+            counters,
+        } = self;
+        let packet = packet_thread.join();
+        let learning = learning_thread.join();
         if packet.is_err() || learning.is_err() {
+            counters.record_terminal_queue_error();
             bail!("application quarantine worker terminated unexpectedly");
         }
         Ok(())
@@ -85,18 +92,31 @@ pub fn spawn(
     shutdown: &Arc<AtomicBool>,
     verdict_strategy: QueueVerdictStrategy,
 ) -> Result<QueueRuntime> {
+    let counters = engine
+        .lock()
+        .map_err(|_| anyhow!("policy engine mutex is poisoned during NFQUEUE startup"))?
+        .nfqueue_counters();
     let queue = QueueSocket::open(APPLICATION_QUEUE_NUMBER)
         .context("cannot bind the fail-closed application packet queue")?;
     let (learning_sender, learning_receiver) = mpsc::sync_channel(LEARNING_QUEUE_CAPACITY);
     let learning_engine = Arc::clone(engine);
     let learning_shutdown = Arc::clone(shutdown);
+    let learning_counters = Arc::clone(&counters);
     let learning_thread = thread::Builder::new()
         .name("openshield-app-learning".to_owned())
-        .spawn(move || learning_loop(&learning_receiver, &learning_engine, &learning_shutdown))
+        .spawn(move || {
+            learning_loop(
+                &learning_receiver,
+                &learning_engine,
+                &learning_shutdown,
+                &learning_counters,
+            );
+        })
         .context("cannot spawn bounded application-learning worker")?;
 
     let packet_engine = Arc::clone(engine);
     let packet_shutdown = Arc::clone(shutdown);
+    let packet_counters = Arc::clone(&counters);
     let packet_thread = match thread::Builder::new()
         .name("openshield-nfqueue".to_owned())
         .spawn(move || {
@@ -106,6 +126,7 @@ pub fn spawn(
                 &packet_shutdown,
                 &learning_sender,
                 verdict_strategy,
+                &packet_counters,
             );
         }) {
         Ok(thread) => thread,
@@ -119,6 +140,7 @@ pub fn spawn(
     Ok(QueueRuntime {
         packet_thread,
         learning_thread,
+        counters,
     })
 }
 
@@ -128,6 +150,7 @@ fn packet_loop(
     shutdown: &AtomicBool,
     learning: &SyncSender<LearningObservation>,
     verdict_strategy: QueueVerdictStrategy,
+    counters: &NfqueueRuntimeCounters,
 ) {
     let resolver = ProcfsResolver::new();
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_BYTES];
@@ -142,6 +165,7 @@ fn packet_loop(
                 // so affected traffic remains fail-closed. Keep serving later
                 // packets instead of turning transient pressure into a global
                 // daemon quarantine/restart loop.
+                counters.record_queue_overflow();
                 errors.report("application packet queue overflowed; affected packets were denied");
             }
             Ok(QueueReceive::Datagram(size)) => {
@@ -149,18 +173,32 @@ fn packet_loop(
                     let message = match message {
                         Ok(message) => message,
                         Err(error) => {
+                            // A malformed kernel datagram can hide the packet
+                            // identifier required to return a verdict.  Do not
+                            // continue with an unaccounted queued packet: make
+                            // the failure observable and move the whole policy
+                            // to the explicit fail-closed quarantine.
+                            counters.record_terminal_queue_error();
                             errors.report(&format!("invalid netfilter netlink message: {error:#}"));
-                            continue;
+                            quarantine_engine(engine);
+                            shutdown.store(true, Ordering::Release);
+                            return;
                         }
                     };
                     if message.message_type != queue_message_type(NFQNL_MSG_PACKET) {
                         continue;
                     }
                     let Some(packet_id) = packet_id(message.payload) else {
+                        counters.record_terminal_queue_error();
                         errors.report("queued packet has no bounded packet identifier");
-                        continue;
+                        quarantine_engine(engine);
+                        shutdown.store(true, Ordering::Release);
+                        return;
                     };
                     let decision = decide_packet(message.payload, engine, &resolver, learning);
+                    if decision.as_ref().is_err_and(is_attribution_timeout) {
+                        counters.record_attribution_timeout();
+                    }
                     let returned = return_packet_verdict(
                         &mut queue,
                         packet_id,
@@ -171,6 +209,7 @@ fn packet_loop(
                     let (accepted, decision_error) = match returned {
                         Ok(returned) => returned,
                         Err(error) => {
+                            counters.record_terminal_queue_error();
                             errors.report(&format!(
                                 "cannot return fail-closed packet verdict: {error:#}"
                             ));
@@ -179,12 +218,16 @@ fn packet_loop(
                             return;
                         }
                     };
-                    if !accepted && let Some(error) = decision_error {
-                        errors.report(&format!("application packet denied: {error:#}"));
+                    if !accepted {
+                        counters.record_denied();
+                        if let Some(error) = decision_error {
+                            errors.report(&format!("application packet denied: {error:#}"));
+                        }
                     }
                 }
             }
             Err(error) => {
+                counters.record_terminal_queue_error();
                 errors.report(&format!("application packet queue failed: {error:#}"));
                 quarantine_engine(engine);
                 shutdown.store(true, Ordering::Release);
@@ -344,6 +387,7 @@ fn learning_loop(
     receiver: &Receiver<LearningObservation>,
     engine: &SharedEngine,
     shutdown: &AtomicBool,
+    counters: &NfqueueRuntimeCounters,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         let first = match receiver.recv_timeout(Duration::from_millis(RECEIVE_POLL_MILLIS.into())) {
@@ -364,6 +408,7 @@ fn learning_loop(
             Ok(0) => {}
             Ok(count) => info!(count, "persisted application-bound outbound rules"),
             Err(error) => {
+                counters.record_terminal_queue_error();
                 error!(error = %format_args!("{error:#}"), "application learning failed");
                 quarantine_engine(engine);
                 shutdown.store(true, Ordering::Release);

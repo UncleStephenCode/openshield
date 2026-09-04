@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.28"
+version = "0.1.29"
 edition = "2024"
 rust-version = "1.98"
 license = "GPL-3.0-only"
@@ -29,6 +29,7 @@ tempfile = "3.10"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+unicode-width = "0.2"
 uuid = { version = "1.8", features = ["serde", "v4"] }
 
 [workspace.lints.rust]

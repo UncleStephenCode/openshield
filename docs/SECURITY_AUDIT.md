@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-03, OpenShield 0.1.28, Rust stable 1.98.0.
+Review snapshot: 2026-09-03, OpenShield 0.1.29, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -35,6 +35,11 @@ The normative boundary is defined by the
   rejected before state, backend, or event side effects. A lost reply is treated
   by the TUI as an unconfirmed outcome followed by a snapshot refresh, not as a
   safe invitation to repeat the mutation.
+- The TUI reports the daemon-selected typed backend separately from telemetry
+  health. Its outbound cgroup/executable/destination grouping is presentation
+  only: individual rules retain all selectors, selection follows stable UUIDs,
+  and edit, delete, or enable actions cannot implicitly target a whole group.
+  Inbound rules have a separate view and cannot carry application selectors.
 
 ### Policy construction and firewall backends
 
@@ -191,34 +196,39 @@ The normative boundary is defined by the
 The evidence layers below are intentionally separate. Passing one layer does not
 establish the properties of another.
 
+The component-suite, localization, and Debian x86-64 live-firewall results
+below are refreshed for v0.1.29. Broader binary, packaging, cross-target, and
+Tumbleweed results are explicitly identified as v0.1.28 historical evidence
+and do not certify newly built v0.1.29 artifacts.
+
 - Final Rust 1.98.0 verification passed `cargo fmt --all -- --check`, locked
   workspace all-target checks, workspace all-target clippy with warnings denied,
-  and all 263 workspace tests: 55 core, 145 daemon, 11 protocol, and 52 TUI.
+  and all 287 workspace tests: 55 core, 150 daemon, 14 protocol, and 68 TUI.
   This includes automatic-learning budgets, version pinning, fsuid-prefilter,
   and immutable policy-index cases. Daemon tests used mock backends and temporary
   Unix sockets and did not touch the host firewall. These are component results,
   not a live-firewall result.
-- `cargo-audit` checked the current 152-dependency lock graph against 1,235
+- For v0.1.28, `cargo-audit` checked the 152-dependency lock graph against 1,235
   advisories from the RustSec database revision dated 2026-09-01 and reported no
   applicable advisory. The offline cargo-deny advisories, bans, licenses, and
   sources checks passed; only the two explicitly allowed duplicate-version
   warnings for `hashbrown` and `syn` remained.
-- Both final static-PIE musl binaries completed a no-network, read-only,
+- Both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 rows of
   `tests/compat/distros.tsv`. This establishes startup compatibility of those
   artifacts with the selected container userspaces, not firewall operation or
   certification of 60 distributions.
-- `cargo check --workspace --all-targets --locked` completed for all 23 Linux
+- For v0.1.28, `cargo check --workspace --all-targets --locked` completed for all 23 Linux
   targets whose standard libraries were available from stable Rust 1.98.0. The
   two recorded RISC-V 32 targets are Tier 3 and were skipped because stable
   rustup does not provide their standard libraries; a separately reviewed
   nightly `build-std` workflow would be required.
-- Separate Tumbleweed GNU binaries were linked and ELF-validated for x86_64,
+- Separate v0.1.28 Tumbleweed GNU binaries were linked and ELF-validated for x86_64,
   i586, AArch64, ppc64le, and s390x. The four non-host daemon/TUI pairs ran
   capability-free `--version` smokes under digest-pinned Cross QEMU images;
   i586 also ran in the pinned official Tumbleweed `linux/386` image. These are
   execution smokes, not hardware or firewall certification.
-- Static staging checks covered all six init layouts. Isolated container
+- For v0.1.28, static staging checks covered all six init layouts. Isolated container
   parser/supervisor fixtures passed for OpenRC, SysVinit, runit, s6, and dinit,
   including lifecycle quarantine and group creation. systemd is staged and
   analyzed separately rather than booted as PID 1 in that container matrix. The
@@ -231,7 +241,7 @@ establish the properties of another.
   full tmpfiles create/relabel declaration was applied twice in the pinned
   Tumbleweed container; exact root ownership/modes and idempotence passed. These
   are packaging/unit-fixture results, not a systemd boot or packet-filtering run.
-- The TUI suite covers all 31 locale resources with 183 messages each and
+- The TUI suite covers all 31 locale resources with 225 messages each and
   verifies exact key, placeholder, and newline parity. No non-English value is
   exactly equal to its English counterpart. A second regression checks every
   unordered locale pair and, after excluding placeholders and common protocol
@@ -247,8 +257,9 @@ establish the properties of another.
 - `tests/e2e/server-learning-enforcing.sh` defines separate disposable nftables
   and iptables workflows for observation authorization, Learning, application
   attribution, Enforcing, coexistence, inbound allow, shutdown quarantine, and
-  restart. Final Rust 1.98.0 release runs passed for both backends on Debian
-  Bookworm and the pinned openSUSE Tumbleweed snapshot and printed:
+  restart. The v0.1.29 Rust 1.98.0 release daemon passed both backends on Debian
+  Bookworm x86-64. The equivalent pinned openSUSE Tumbleweed evidence remains
+  historical v0.1.28. The successful scenarios printed:
 
   ```text
   PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
@@ -259,6 +270,43 @@ establish the properties of another.
   runs omitted `nft` and selected the fallback. These were local, isolated
   Docker network/container-namespace tests. They did not exercise or modify the
   host firewall and are not production certification.
+- `tests/perf` and the release `performance` job define a bounded, isolated
+  host-firewall load gate after all functional E2E jobs. The exact release
+  daemon is compared with a no-daemon baseline for nftables and, when available,
+  the iptables/ip6tables fallback, covering `Learning` and `Enforcing`,
+  network-only rules, application TCP, and application UDP. Baseline and policy
+  cases use identical offered parameters and a policy-independent deterministic
+  trace seed, with conntrack flushed for every load point. Each phase has a new
+  client process; established TCP fast-path behavior is therefore demonstrated
+  by multiple keep-alive operations inside that phase, not by carrying sockets
+  between phases. The real `/var/lib/openshield` directory is stored in the
+  container's writable overlay, exercises atomic rename and `fsync`, retains
+  learned state for the backend topology, and is discarded at cleanup. Formal
+  validity checks invalidate generator or peer/server
+  saturation and propagate an invalid baseline to its pair. Separate capacity
+  and safety checks cover target attainment, latency, loss/retransmits,
+  daemon CPU/RSS, NIC and NFQUEUE errors, expected NFQUEUE path shape,
+  wrong-executable probes, and verified `BlockAll` quarantine. Invalid points
+  cannot become capacity maxima. Daemon-observed queue failures use deltas of
+  the typed, process-lifetime `status.data.nfqueue` counters as authoritative
+  gate evidence; throttled log messages are retained only as diagnostic lower
+  bounds. The CI smoke has three short steady repetitions
+  and is path/safety evidence, not a maximum-capacity result; the production
+  profile also requires three longer repetitions. Softirq deltas are host-wide, include unrelated host
+  work, and are meaningful only relative to the paired baseline on a quiet
+  runner. A separate, non-capacity overload gate uses `SIGSTOP`/`SIGCONT` around
+  the NFQUEUE consumer while real application TCP and UDP fill the bounded
+  queue. It requires the configured minimum combined kernel/userspace NFQUEUE
+  drops, an explicit pressure-client ready/start barrier, same-transport
+  network-only liveness round trips around every wrong-executable probe, and no
+  successful wrong-executable round trip during or after the stall. Generator,
+  peer, or canary saturation and socket/NIC errors invalidate this evidence.
+  Recovery must either be error-free in `Enforcing` or enter an independently
+  verified kernel `BlockAll` quarantine. A reported quarantine also requires
+  bracketed real TCP and UDP negative probes while out-of-band loopback round
+  trips inside the canary container prove both peer servers healthy. This
+  item describes the implemented gates; benchmark numbers are evidence only
+  when the corresponding JSON report is retained.
 - The v0.1.18 procfs optimization was measured in the same SHA-256-pinned
   Tumbleweed container image with `--network none`, private PID/network
   namespaces, no privileged mode, and only the daemon's four packaged

@@ -17,6 +17,7 @@ Validation
     -> Install Matrix
     -> Container Tests
     -> Firewall E2E
+    -> Performance Smoke
     -> Release Evidence
     -> Publish
 ```
@@ -46,7 +47,12 @@ The stages have the following responsibilities:
    twice for each of the 37 runtime-tested distribution/platform rows: once with
    nftables preferred and once in an iptables-only fallback environment (74
    jobs in total).
-8. **Release Evidence** collects the source revision, matrix revision, image and
+8. **Performance Smoke** starts only after all 74 functional E2E jobs succeed.
+   One openSUSE Tumbleweed `linux/amd64` stand runs a bounded nftables/iptables
+   profile against the exact release `binary-tumbleweed-amd64` daemon in
+   disposable Docker namespaces and validates the generated machine-readable
+   and human-readable reports.
+9. **Release Evidence** collects the source revision, matrix revision, image and
    platform identities, artifact hashes, the 37 package-install results, the 74
    backend-test results, and the expected inventory of all 43 binary archives
    and 43 packages. Evidence completeness is checked against the authoritative
@@ -54,9 +60,10 @@ The stages have the following responsibilities:
    ZIP transport normalizes raw files to `0644`; those ELF copies are verified
    as transport bytes, while exact `0755` executable modes and matching content
    are required inside each publishable `tar.xz` archive.
-9. **Publish** is reachable only when every required evidence record and release
-   asset is present and consistent. Publication remains resumable, but an
-   existing asset is never silently replaced with different bytes.
+10. **Publish** is reachable only when the performance gate has passed and every
+   required evidence record and release asset is present and consistent.
+   Publication remains resumable, but an existing asset is never silently
+   replaced with different bytes.
 
 Validation and the Quality Gate therefore precede every release compilation;
 package installation and firewall testing consume packages produced during the
@@ -161,6 +168,113 @@ IPv6 xtables tool set must be available, and the daemon must select
 `iptables/ip6tables`. This proves preference and fallback rather than merely
 forcing a backend label.
 
+## Bounded performance release gate
+
+The performance job belongs only to the tag/`workflow_dispatch` release
+workflow; the ordinary pull-request workflow does not run it. Its direct
+dependency on the complete `e2e` matrix makes functional correctness a strict
+precondition. The single openSUSE Tumbleweed `linux/amd64` job downloads
+`binary-tumbleweed-amd64` from the same run, restores the daemon's executable
+mode in a private runner directory, verifies its version, and passes that
+absolute path to the performance harness. It does not rebuild the daemon or
+expand into a distribution/architecture performance matrix.
+
+`tests/perf/ci-smoke.sh` accepts only a local Unix-socket Docker context. The
+harness uses a disposable DUT, pressure peer, independent canary peer, and two
+internal networks; only the DUT receives the capabilities required for its
+private firewall namespace. The wrapper limits the harness to 900 seconds, the
+workflow limits the complete job to 20 minutes, and report/log sizes are
+bounded. Neither the wrapper nor the harness runs `sudo`, `nft`, or `iptables`
+against the runner host.
+
+The canary network has two distinct same-transport endpoints on the same veth:
+an application-bound target for wrong-executable probes and a network-only
+liveness target. A liveness exchange must succeed immediately before and after
+each blocked probe, so a broken canary path cannot masquerade as fail-closed.
+
+The wrapper generates a fresh 128-bit run token and passes it to the harness;
+every disposable container and network receives that exact Docker label. On a
+normal exit, `TERM`, `INT`, or hard timeout, cleanup lists resources by the
+label and then re-inspects every immutable ID before removal. It never prunes
+Docker globally or selects resources by a shared name prefix. The Python runner
+also turns cooperative termination signals into an exception so the current
+backend's `finally` cleanup runs before the wrapper's bounded fallback cleanup.
+
+The checked-in `tests/perf/config/ci-smoke.json` profile is a short regression
+smoke, not a statistically portable benchmark. It retains every backend,
+mode, policy path, and workload profile, with one half-load ramp followed by
+three one-second steady windows. Offered rates are sized to produce hundreds
+of operations in each steady window instead of deriving percentiles from
+single-digit samples. Every repeated window must pass. A pass requires all of
+the following:
+
+- the runner exits successfully before the hard timeout;
+- `report.json` uses schema `openshield.perf.report.v1`, sets both `valid` and
+  `passed` to `true`, contains results, and reports nftables as `passed`;
+- iptables is also `passed`; an `unsupported` result is neutral only for a
+  profile that explicitly sets `allow_unsupported_iptables` to `true`, which
+  the release smoke profile does not do;
+- generator, pressure-peer, or canary resource saturation, socket-queue or NIC
+  errors, an invalid sample, a failed configured ceiling in a required
+  steady/burst window, a missing backend, or a missing/malformed report fails
+  the job;
+- in steady and burst windows, the release profile blocks publication when
+  paired throughput or DUT PPS falls by more than 10%, or paired p50/p95/p99
+  request or TCP-connect p50/p95/p99 latency, or DUT-cgroup CPU grows by more
+  than 10%; the longer production-like profile tightens all relative limits to
+  5%;
+- burst windows additionally remain mandatory capacity and safety checks;
+  explicit fail-open behavior is proven by the independent canary during the
+  separate controlled-overload test, outside the paired performance workload;
+- the overload pressure client must publish readiness and wait at its explicit
+  start barrier before the authenticated daemon process is stopped; the fixed
+  saturation window must then show the configured NFQUEUE drop evidence, and a
+  same-transport network-only liveness exchange must succeed immediately on
+  both sides of every wrong-executable probe;
+- a reported `BlockAll` quarantine additionally requires daemon status and
+  canonical kernel snapshots bracketing real TCP and UDP negative probes, plus
+  successful canary-container loopback round trips immediately before and
+  after each negative probe;
+- ordinary measurement windows require zero application loss/errors, TCP
+  retransmits, NIC drops/errors, and NFQUEUE drops/errors;
+  NFQUEUE drops are expected only in the explicitly controlled overload proof,
+  where observed saturation and every canary probe must still remain
+  fail-closed;
+- UDP drain acknowledgements count only after the server proves the exact
+  contiguous per-flow sequence prefix within its fixed reordering bound; the
+  gate never assumes UDP delivery order;
+- daemon-observed NFQUEUE failures are gated on deltas of the typed,
+  process-lifetime `status.data.nfqueue` counters; throttled daemon logs remain
+  diagnostic lower bounds and are not authoritative pass evidence;
+- `report.json` contains the exact unique set of backend/profile/policy/mode/
+  load/phase windows derived from the checked-in profile; `report.csv` and
+  `overload.csv` have their expected schemas and matching row counts; and all
+  four report files are nonempty bounded regular files.
+
+For each backend, `report.json` also records the content-addressed Docker image
+ID, exact `x86_64` machine, parsed openSUSE Tumbleweed `/etc/os-release`, bounded
+`uname`, `repo-oss/repomd.xml` SHA-256, and the exact sorted RPM NEVRA inventory.
+Image, OS, machine/kernel, and repository metadata must match. RPM inventories
+remain separate: the nftables topology must show its expected exclusive
+`nftables` package, while any other dependency delta is retained as evidence
+rather than requiring false full-manifest equality. Tumbleweed repository
+metadata is signed, but the repository remains live: the evidence records the
+selected package set without making it immutable across runs.
+
+On success, the four report files are uploaded together as a 30-day GitHub Actions
+artifact and the Markdown report is written to the job summary. On failure, a
+seven-day diagnostic artifact contains the wrapper error plus whichever report
+and run-log files are available and pass the wrapper's regular-file and size
+checks. The performance job is a publication prerequisite, but its reports are
+diagnostic workflow artifacts rather than published release assets.
+Hosted-runner measurements are suitable for catching gross regressions against
+conservative absolute ceilings only; they do not establish comparative
+throughput, latency, hardware, distribution, or non-amd64 support claims.
+Publication-grade performance numbers require a prebuilt performance image
+pinned by digest, a dedicated runner, and retained environment and run
+evidence. CI completion alone is not evidence of a successful full performance
+run or a publishable numerical result.
+
 ## Pinned inputs and release evidence
 
 Actions, downloaded build tools, Cross/QEMU environments, release-matrix
@@ -186,5 +300,6 @@ partial repository update cannot be misreported as missing dependencies.
 
 The evidence stage fails closed for missing, duplicate, unexpected, or
 contradictory rows and assets. `SHA256SUMS` covers all published packages and
-binary archives. Publication depends on that verified inventory and cannot run
-directly after only the build or package stages.
+binary archives. Publication depends on both the successful performance gate
+and that verified inventory; it cannot run directly after only the build or
+package stages.

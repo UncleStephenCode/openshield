@@ -16,8 +16,9 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Group, getegid, geteuid, getgroups};
 use openshield_core::{Event, MAX_RULES, Mode, Rule, Snapshot};
 use openshield_protocol::{
-    Ack, CONTROL_SOCKET_PATH, ControlRequest, FrameError, MAX_RULES_PER_PAGE, OBSERVE_GROUP_NAME,
-    OBSERVE_SOCKET_PATH, ReadRequest, Request, Response, read_response, write_request,
+    Ack, CONTROL_SOCKET_PATH, ControlRequest, FirewallBackendKind, FrameError, MAX_RULES_PER_PAGE,
+    OBSERVE_GROUP_NAME, OBSERVE_SOCKET_PATH, ReadRequest, Request, Response, read_response,
+    write_request,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -169,8 +170,14 @@ pub enum ObserverUpdate {
     Disconnected(String),
     TelemetryConnected,
     TelemetryDisconnected(String),
-    Snapshot(Snapshot),
-    Restarted(Snapshot),
+    Snapshot {
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+    },
+    Restarted {
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+    },
     Event(Box<Event>),
     Dropped(u64),
 }
@@ -202,6 +209,7 @@ struct RevisionEpoch {
     generation: u64,
     mode: Option<Mode>,
     rule_count: Option<u32>,
+    backend: Option<FirewallBackendKind>,
     resync_required: bool,
     restart_update_pending: bool,
 }
@@ -213,6 +221,7 @@ impl Default for RevisionEpoch {
             generation: 0,
             mode: None,
             rule_count: None,
+            backend: None,
             resync_required: true,
             restart_update_pending: false,
         }
@@ -224,6 +233,7 @@ struct PolicyStatus {
     revision: u64,
     mode: Mode,
     rule_count: u32,
+    backend: FirewallBackendKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -591,7 +601,7 @@ fn refresh_snapshot(
     };
     if first.revision >= known_revision {
         let snapshot = fetch_consistent_snapshot_from_status(&mut stream, first)?;
-        return enqueue_snapshot(sender, revision, dropped, snapshot, false);
+        return enqueue_snapshot(sender, revision, dropped, snapshot, first.backend, false);
     }
 
     // A lower first read can be a harmless race with an event received after
@@ -604,7 +614,14 @@ fn refresh_snapshot(
         return Ok(None);
     }
     let snapshot = fetch_consistent_snapshot_from_status(&mut stream, confirmed)?;
-    enqueue_snapshot(sender, revision, dropped, snapshot, restarted)
+    enqueue_snapshot(
+        sender,
+        revision,
+        dropped,
+        snapshot,
+        confirmed.backend,
+        restarted,
+    )
 }
 
 fn enqueue_snapshot(
@@ -612,11 +629,17 @@ fn enqueue_snapshot(
     revision: &Mutex<RevisionEpoch>,
     dropped: &DroppedCounter,
     snapshot: Snapshot,
-    restarted: bool,
+    backend: FirewallBackendKind,
+    restart_confirmed: bool,
 ) -> Result<Option<OfferOutcome>, IpcError> {
     let rule_count = u32::try_from(snapshot.rules.len())
         .map_err(|_| IpcError::InvalidSnapshot("rule count does not fit u32".to_owned()))?;
     let mut cursor = lock_revision_epoch(revision)?;
+    // `AutoBackend` is immutable for one daemon lifetime. A changed backend
+    // therefore proves that this snapshot belongs to a new daemon epoch even
+    // when the persisted policy revision did not move backwards. Treat it as
+    // a restart so an event worker attached to the old daemon is invalidated.
+    let restarted = restart_confirmed || cursor.backend.is_some_and(|current| current != backend);
     if restarted {
         cursor.generation = cursor
             .generation
@@ -625,6 +648,7 @@ fn enqueue_snapshot(
         cursor.revision = snapshot.revision;
         cursor.mode = Some(snapshot.mode);
         cursor.rule_count = Some(rule_count);
+        cursor.backend = Some(backend);
         cursor.resync_required = true;
         cursor.restart_update_pending = true;
     } else if snapshot.revision < cursor.revision && !cursor.restart_update_pending {
@@ -633,13 +657,14 @@ fn enqueue_snapshot(
         cursor.revision = cursor.revision.max(snapshot.revision);
         cursor.mode = Some(snapshot.mode);
         cursor.rule_count = Some(rule_count);
+        cursor.backend = Some(backend);
     }
 
     let is_restart_update = cursor.restart_update_pending;
     let update = if is_restart_update {
-        ObserverUpdate::Restarted(snapshot)
+        ObserverUpdate::Restarted { snapshot, backend }
     } else {
-        ObserverUpdate::Snapshot(snapshot)
+        ObserverUpdate::Snapshot { snapshot, backend }
     };
     let outcome = offer_update(sender, dropped, update);
     match outcome {
@@ -688,6 +713,7 @@ fn status_is_unchanged(cursor: &RevisionEpoch, status: PolicyStatus) -> bool {
         && cursor.revision == status.revision
         && cursor.mode == Some(status.mode)
         && cursor.rule_count == Some(status.rule_count)
+        && cursor.backend == Some(status.backend)
 }
 
 fn shared_status_is_unchanged(
@@ -786,10 +812,13 @@ fn fetch_status(stream: &mut UnixStream) -> Result<PolicyStatus, IpcError> {
             revision,
             mode,
             rule_count,
+            backend,
+            ..
         } => Ok(PolicyStatus {
             revision,
             mode,
             rule_count,
+            backend,
         }),
         Response::Error(error) => Err(IpcError::Rejected {
             code: error.code,
@@ -1276,7 +1305,10 @@ mod tests {
 
         sender.try_send(ObserverUpdate::Connected)?;
         sender.try_send(ObserverUpdate::TelemetryConnected)?;
-        sender.try_send(ObserverUpdate::Snapshot(empty_snapshot(1)))?;
+        sender.try_send(ObserverUpdate::Snapshot {
+            snapshot: empty_snapshot(1),
+            backend: FirewallBackendKind::Unknown,
+        })?;
         sender.try_send(ObserverUpdate::Event(Box::new(counter_event(1))))?;
         for revision in 2..=u64::try_from(LEARNING_BURST + 1)? {
             assert_eq!(
@@ -1302,10 +1334,23 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(8);
 
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                false,
+            )?,
             Some(OfferOutcome::Delivered)
         );
-        assert!(matches!(receiver.recv()?, ObserverUpdate::Snapshot(_)));
+        assert!(matches!(
+            receiver.recv()?,
+            ObserverUpdate::Snapshot {
+                backend: FirewallBackendKind::Unknown,
+                ..
+            }
+        ));
         let (_, old_generation) = subscription_cursor(&revision)?;
 
         assert_eq!(
@@ -1323,7 +1368,14 @@ mod tests {
         // A merely stale snapshot must not rewind a cursor advanced by a
         // concurrent event from the same daemon epoch.
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                false,
+            )?,
             None
         );
         assert_eq!(subscription_cursor(&revision)?, (11, old_generation));
@@ -1331,10 +1383,23 @@ mod tests {
         // A second, confirmed lower read starts a new epoch and is delivered
         // explicitly so App does not reject it as stale.
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(3), true,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(3),
+                FirewallBackendKind::Iptables,
+                true,
+            )?,
             Some(OfferOutcome::Delivered)
         );
-        assert!(matches!(receiver.recv()?, ObserverUpdate::Restarted(_)));
+        assert!(matches!(
+            receiver.recv()?,
+            ObserverUpdate::Restarted {
+                backend: FirewallBackendKind::Iptables,
+                ..
+            }
+        ));
         let (current_revision, new_generation) = subscription_cursor(&revision)?;
         assert_eq!(current_revision, 3);
         assert_eq!(new_generation, old_generation + 1);
@@ -1363,13 +1428,21 @@ mod tests {
         let dropped = DroppedCounter::new();
         let (sender, _receiver) = mpsc::sync_channel(1);
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                false,
+            )?,
             Some(OfferOutcome::Delivered)
         );
         let unchanged = PolicyStatus {
             revision: 10,
             mode: Mode::BlockAll,
             rule_count: 0,
+            backend: FirewallBackendKind::Unknown,
         };
         assert!(shared_status_is_unchanged(&revision, unchanged)?);
         assert!(!shared_status_is_unchanged(
@@ -1383,6 +1456,13 @@ mod tests {
             &revision,
             PolicyStatus {
                 mode: Mode::Learning,
+                ..unchanged
+            }
+        )?);
+        assert!(!shared_status_is_unchanged(
+            &revision,
+            PolicyStatus {
+                backend: FirewallBackendKind::Nftables,
                 ..unchanged
             }
         )?);
@@ -1403,12 +1483,79 @@ mod tests {
     }
 
     #[test]
+    fn backend_change_starts_a_new_epoch_and_invalidates_old_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let revision = Mutex::new(RevisionEpoch::default());
+        let dropped = DroppedCounter::new();
+        let (sender, receiver) = mpsc::sync_channel(2);
+
+        assert_eq!(
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                false,
+            )?,
+            Some(OfferOutcome::Delivered)
+        );
+        let _initial = receiver.recv()?;
+        let (_, old_generation) = subscription_cursor(&revision)?;
+
+        let changed = PolicyStatus {
+            revision: 10,
+            mode: Mode::BlockAll,
+            rule_count: 0,
+            backend: FirewallBackendKind::Nftables,
+        };
+        assert!(!shared_status_is_unchanged(&revision, changed)?);
+        assert_eq!(
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                changed.backend,
+                false,
+            )?,
+            Some(OfferOutcome::Delivered)
+        );
+        assert!(matches!(
+            receiver.recv()?,
+            ObserverUpdate::Restarted {
+                snapshot: Snapshot { revision: 10, .. },
+                backend: FirewallBackendKind::Nftables,
+            }
+        ));
+        assert!(shared_status_is_unchanged(&revision, changed)?);
+        let (_, new_generation) = subscription_cursor(&revision)?;
+        assert_eq!(new_generation, old_generation + 1);
+        assert_eq!(
+            enqueue_event(
+                &sender,
+                &revision,
+                &dropped,
+                old_generation,
+                counter_event(11),
+            )?,
+            EventEnqueueOutcome::GenerationChanged
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn explicit_conflict_resync_invalidates_an_unchanged_status() -> Result<(), IpcError> {
         let revision = Mutex::new(RevisionEpoch {
             revision: 10,
             generation: 0,
             mode: Some(Mode::BlockAll),
             rule_count: Some(0),
+            backend: Some(FirewallBackendKind::Unknown),
             resync_required: false,
             restart_update_pending: false,
         });
@@ -1416,6 +1563,7 @@ mod tests {
             revision: 10,
             mode: Mode::BlockAll,
             rule_count: 0,
+            backend: FirewallBackendKind::Unknown,
         };
         assert!(shared_status_is_unchanged(&revision, unchanged)?);
         mark_resync_required(&revision)?;

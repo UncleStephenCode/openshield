@@ -34,6 +34,7 @@ Validation
     -> Install Matrix
     -> Container Tests
     -> Firewall E2E
+    -> Performance Smoke
     -> Release Evidence
     -> Publish
 ```
@@ -43,6 +44,11 @@ documented in [the release CI guide](../../.github/README-CI.md). Compilation is
 allowed only after Validation and the Quality Gate. Publication is allowed only
 after the evidence stage has reconciled every required matrix row and release
 asset.
+
+The single openSUSE Tumbleweed `linux/amd64` performance smoke begins only after
+the entire functional E2E matrix succeeds. It is a bounded release regression
+gate and does not add architecture or distribution support evidence to this
+compatibility matrix.
 
 The 37 runtime rows cover Debian 12/13, Ubuntu 22.04/24.04/26.04, Fedora 43/44,
 Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0, Tumbleweed, Alpine

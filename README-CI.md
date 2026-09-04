@@ -17,9 +17,48 @@ Validation
     -> 37 distribution/platform installations for 19 package variants
     -> pinned init-system container tests
     -> 74 firewall E2E jobs
+    -> bounded nftables/iptables performance smoke
     -> sealed release candidate and evidence
     -> publication
 ```
+
+Only after all 74 functional firewall jobs pass, one bounded performance smoke
+uses the exact `binary-tumbleweed-amd64` daemon from the release run on one
+openSUSE Tumbleweed `linux/amd64` stand. It exercises nftables and iptables in
+disposable Docker namespaces, has a 900-second harness limit and a 20-minute job
+limit, and uploads validated JSON, CSV, and Markdown reports. The checked-in
+release profile requires both backends to pass and rejects invalid or saturated
+measurements. Its paired 10% relative gate applies to all three one-second
+steady windows and burst; every window must pass, and burst also remains a
+mandatory capacity and safety check. Explicit fail-open behavior is proven by
+the separate controlled-overload canary. This release-only smoke is not run by
+the pull-request workflow and is not a portable benchmark or a support claim
+for every architecture.
+
+The overload pressure client uses an explicit ready/start barrier before the
+daemon is stopped. On the same canary veth, a separate same-transport
+network-only liveness endpoint must succeed immediately before and after every
+application-bound wrong-executable probe. Generator, pressure-peer, or canary
+resource saturation and socket/NIC errors invalidate the proof. UDP drain ACKs
+are emitted only after a bounded exact contiguous per-flow sequence prefix is
+proved; no UDP ordering guarantee is assumed.
+
+If the daemon reports a `BlockAll` quarantine, canonical kernel snapshots and
+daemon status bracket real TCP and UDP negative probes. A real loopback round
+trip inside the canary container must also succeed immediately before and after
+each negative probe, so a dead peer cannot be mistaken for quarantine.
+
+Each backend records the pinned Docker image ID, exact `x86_64` machine,
+openSUSE Tumbleweed `/etc/os-release`, `uname`, `repo-oss` metadata SHA-256,
+and exact sorted RPM NEVRA inventory. Image, OS, machine/kernel, and repository
+metadata must match across the two topology runs. RPM manifests are retained
+separately: the nftables topology must have the expected exclusive `nftables`
+package, while all other dependency differences remain explicit evidence and
+are not silently treated as equality. This makes a run auditable, but a signed
+live Tumbleweed repository is still mutable across runs. Publication-grade
+numbers require a prebuilt digest-pinned performance image, a dedicated runner,
+and retained evidence; CI success by itself is not a claim that a full
+publishable performance run succeeded.
 
 The runtime matrix contains 37 pinned distribution/platform rows: 16 `amd64`,
 15 `arm64`, and 6 `386`. Every row executes both the nftables-preference and

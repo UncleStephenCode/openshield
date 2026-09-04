@@ -142,6 +142,41 @@ bounded worker and subscription queues, rate limits, server-side pagination,
 and optimistic policy revisions. A stale mutation returns `Conflict`; the TUI
 reloads state and never retries an unconfirmed change automatically.
 
+## TUI rule workflow
+
+The TUI has five top-level tabs: `1` Status, `2` Outbound, `3` Inbound,
+`4` Events, and `5` Help. `Tab` advances to the next tab. The Status tab reports
+the firewall implementation that the daemon actually selected (`nftables` or
+the `iptables`/`ip6tables` fallback), separately from policy and telemetry
+connection health.
+
+The Outbound tab presents rules as a two-pane view. The left pane groups them by
+the first available identity in this fixed priority order:
+
+1. exact unified-cgroup-v2 path;
+2. exact validated executable path, without command-line arguments;
+3. destination IP network (including a distinct "any destination" group).
+
+Only that one value is the group key. The right pane retains the individual
+rules and shows their protocol, destination, port or range, interface, command
+line, UID, executable file-version identity, origin, enabled state, UUID, and
+timestamps. Grouping is a presentation operation only: it never combines
+rules, changes their AND matching semantics, or turns a single-rule action into
+a group-wide policy change. `Up`/`Down` select a group and `Left`/`Right`
+select an individual rule in that group. `PageUp`/`PageDown` scroll the full
+detail pane without truncating bounded selectors. `n` creates a rule for the current
+direction, `e` edits the selected rule, `d` deletes it, and `Space` toggles only
+that selected rule.
+
+The Inbound tab is intentionally separate. It creates explicit inbound allow
+rules scoped by source network, local port or range, interface, and protocol;
+application selectors are not valid for inbound rules. Outside Block All,
+traffic not matched by an enabled inbound allow remains denied; Block All
+overrides every rule. `m` opens the mode selector from any
+tab. Mode changes and every rule mutation require root. A non-root member of
+the `openshield` group can use the same navigation for read-only monitoring,
+but receives server-redacted application identity and cannot mutate policy.
+
 ## Building
 
 Build as an unprivileged user with the pinned lock file:
@@ -170,6 +205,24 @@ of these backend sets:
 Executables are selected only from compiled absolute-path allowlists, checked
 for safe metadata, invoked with typed arguments and a cleared environment, and
 never passed through a shell.
+
+## Performance and capacity testing
+
+[`tests/perf`](tests/perf/README.md) provides a reproducible,
+container-isolated host-firewall benchmark for nftables and the iptables
+fallback. It compares a paired no-daemon baseline with network-only,
+application-bound TCP, and application-bound UDP policies in `Enforcing` and
+`Learning`. Real processes and sockets cross veth interfaces, exercising
+NFQUEUE, conntrack, and `/proc` attribution rather than simulated TCP packets.
+
+Production-like profiles cover incoming HTTP/1.1 keep-alive and short
+connections, mixed response sizes, outbound application traffic, large UDP
+streams, and many-flow high-PPS UDP. Reports include observed PPS/Mbps, CPS,
+concurrency, latency percentiles, loss/retransmits, daemon CPU/RSS, softirq,
+conntrack, NIC/NFQUEUE evidence, fail-closed probes, paired overhead, and
+sustainable points. Generator or peer saturation invalidates a result. The
+bounded release smoke runs only after functional firewall E2E; it validates
+paths and safety but is not a portable capacity claim.
 
 ## Installation and init systems
 
@@ -285,16 +338,20 @@ arbitrary privileged ruleset editors.
 Compatibility claims are intentionally scoped:
 
 - final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 263 tests: 55 core,
-  145 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
+  all-target checks, clippy with warnings denied, and all 283 tests: 55 core,
+  147 daemon, 13 protocol, and 68 TUI tests. These are component tests, not a
   live-firewall end-to-end result;
-- both final static-PIE musl binaries completed a no-network, read-only,
+- the v0.1.29 x86-64 release daemon passed the isolated Debian Bookworm
+  Learning-to-Enforcing scenario with both nftables and the iptables fallback,
+  including application attribution, inbound default deny and explicit allow,
+  fail-closed shutdown, and restart with the persisted policy;
+- both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
   `tests/compat/distros.tsv`;
-- all six service layouts passed static validation; dedicated container
+- for v0.1.28, all six service layouts passed static validation; dedicated container
   supervisor checks passed for OpenRC, SysVinit, runit, s6, and dinit, while
   systemd is checked separately rather than booted as PID 1 in that matrix;
-- `cargo check --workspace --all-targets --locked` passed for all 23 stable Rust
+- for v0.1.28, `cargo check --workspace --all-targets --locked` passed for all 23 stable Rust
   Linux targets covering x86, x86_64/amd64, ARMv5/6/7 (soft- and hard-float
   variants where Rust provides them), arm64/aarch64, and RISC-V 64 with the
   listed GNU or musl environments;
@@ -335,7 +392,7 @@ and are not production or native-hardware certification.
 
 ## TUI localization
 
-The TUI embeds 31 separate JSON resources with 183 messages each: the original
+The TUI embeds 31 separate JSON resources with 225 messages each: the original
 20 locales plus 11 additions. Each non-English resource is loaded as a complete
 map without merging or falling back to English. Tests verify exact key,
 placeholder, and newline parity for every compiled resource; no non-English

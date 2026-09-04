@@ -23,6 +23,7 @@ use openshield_core::{
     LEARNED_TCP_V6_SET, LEARNED_UDP_V4_SET, LEARNED_UDP_V6_SET, LearnedEndpoint, PortRange,
     TransportProtocol,
 };
+use openshield_protocol::FirewallBackendKind;
 use serde_json::Value;
 
 const NFT_CANDIDATES: [&str; 3] = ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft"];
@@ -82,6 +83,14 @@ pub trait FirewallObserver: Send {
 }
 
 pub trait FirewallBackend: FirewallObserver {
+    /// Identifies the active production firewall implementation.
+    ///
+    /// Test or third-party backends remain `Unknown` unless they explicitly
+    /// provide a trustworthy identity.
+    fn kind(&self) -> FirewallBackendKind {
+        FirewallBackendKind::Unknown
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()>;
     fn fail_closed(&mut self) -> Result<()>;
 }
@@ -254,6 +263,10 @@ impl NftBackend {
 }
 
 impl FirewallBackend for NftBackend {
+    fn kind(&self) -> FirewallBackendKind {
+        FirewallBackendKind::Nftables
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
         let policy = NftablesCompiler::compile(snapshot).context("failed to compile nft policy")?;
         self.checked_apply(policy.as_bytes())
@@ -330,6 +343,13 @@ impl AutoBackend {
 }
 
 impl FirewallBackend for AutoBackend {
+    fn kind(&self) -> FirewallBackendKind {
+        match self {
+            Self::Nft(_) => FirewallBackendKind::Nftables,
+            Self::Iptables(_) => FirewallBackendKind::Iptables,
+        }
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
         match self {
             Self::Nft(backend) => backend.apply(snapshot),
@@ -825,6 +845,10 @@ impl IptablesBackend {
 }
 
 impl FirewallBackend for IptablesBackend {
+    fn kind(&self) -> FirewallBackendKind {
+        FirewallBackendKind::Iptables
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
         let policy = IptablesCompiler::compile(snapshot)
             .context("failed to compile iptables compatibility policy")?;
@@ -2753,21 +2777,57 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::{
-        FirewallCounters, InterfaceName, LearnedEndpoint, PortRange, TransportProtocol,
-        XtablesBundle, XtablesIdentity, XtablesTools, XtablesWorld, XtablesWorldInspection,
-        add_firewall_counters, attempt_both_families, ensure_xtables_identity_unchanged,
-        inspect_xtables_world, is_expected_covered_legacy_warning, is_proven_absent_legacy_backend,
-        parse_counters, parse_learned_endpoints, parse_xtables_save, parse_xtables_world_save,
+        AutoBackend, FirewallBackend, FirewallCounters, InterfaceName, IptablesBackend,
+        LearnedEndpoint, MemoryBackend, NftBackend, PortRange, TransportProtocol, XtablesBundle,
+        XtablesIdentity, XtablesTools, XtablesWorld, XtablesWorldInspection, add_firewall_counters,
+        attempt_both_families, ensure_xtables_identity_unchanged, inspect_xtables_world,
+        is_expected_covered_legacy_warning, is_proven_absent_legacy_backend, parse_counters,
+        parse_learned_endpoints, parse_xtables_save, parse_xtables_world_save,
         parse_xtables_world_version, selected_xtables_save_args, verify_base_chains, verify_table,
         xtables_save_inspection_args, xtables_world_is_covered,
     };
     use anyhow::Result;
+    use openshield_protocol::FirewallBackendKind;
     use serde_json::{Value, json};
     use std::{
         cell::RefCell,
         collections::HashSet,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        path::PathBuf as TestPathBuf,
+        sync::{Arc, Mutex},
     };
+
+    fn inert_xtables_tools(family: &str) -> XtablesTools {
+        XtablesTools {
+            command: TestPathBuf::from(format!("/{family}tables")),
+            restore: TestPathBuf::from(format!("/{family}tables-restore")),
+            save: TestPathBuf::from(format!("/{family}tables-save")),
+        }
+    }
+
+    #[test]
+    fn production_backends_report_explicit_kinds_and_test_backend_defaults_unknown() {
+        let nft = NftBackend {
+            binary: TestPathBuf::from("/nft"),
+        };
+        let iptables = IptablesBackend {
+            ipv4: inert_xtables_tools("ip"),
+            ipv6: inert_xtables_tools("ip6"),
+            expected: Arc::new(Mutex::new(super::ExpectedXtablesPolicy::default())),
+        };
+
+        assert_eq!(nft.kind(), FirewallBackendKind::Nftables);
+        assert_eq!(iptables.kind(), FirewallBackendKind::Iptables);
+        assert_eq!(AutoBackend::Nft(nft).kind(), FirewallBackendKind::Nftables);
+        assert_eq!(
+            AutoBackend::Iptables(iptables).kind(),
+            FirewallBackendKind::Iptables
+        );
+        assert_eq!(
+            MemoryBackend::default().kind(),
+            FirewallBackendKind::Unknown
+        );
+    }
 
     fn learning_set(name: &str, data_types: &[&str], elements: Option<Value>) -> Value {
         let mut object = json!({"set": {
