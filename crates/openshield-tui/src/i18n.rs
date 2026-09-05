@@ -544,6 +544,22 @@ mod tests {
     }
 
     #[test]
+    fn emergency_quarantine_has_a_distinct_translation_in_every_locale() -> Result<(), LocaleError>
+    {
+        for &locale in Locale::SUPPORTED {
+            let i18n = I18n::load(locale)?;
+            let emergency = i18n.tr("compatibility.reason_emergency_block_all");
+            assert_ne!(emergency, i18n.tr("compatibility.reason_block_all"));
+            assert!(
+                emergency.chars().count() >= 16,
+                "{}: {emergency}",
+                locale.code()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn no_locale_pair_contains_bulk_copied_messages() -> Result<(), LocaleError> {
         let resources = Locale::SUPPORTED
             .iter()

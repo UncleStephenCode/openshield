@@ -2,6 +2,7 @@
 
 mod application;
 mod backend;
+mod compatibility;
 mod engine;
 mod learning;
 mod nfqueue;
@@ -261,7 +262,16 @@ where
     let startup_activation = engine
         .lock()
         .map_err(|_| anyhow::anyhow!("policy engine mutex is poisoned during startup"))
-        .and_then(|mut engine| engine.activate_startup_policy());
+        .and_then(|mut engine| {
+            engine.activate_startup_policy()?;
+            let compatibility = engine.runtime_compatibility();
+            info!(
+                compatibility_level = ?compatibility.level,
+                compatibility_reason = ?compatibility.reason,
+                "selected runtime compatibility"
+            );
+            Ok(())
+        });
     if let Err(error) = startup_activation {
         return Err(clean_up_failed_startup(
             error.context(

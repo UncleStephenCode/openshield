@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
 };
 use std::time::Duration;
@@ -14,14 +16,18 @@ use openshield_core::{
     FirewallCounters, LearnedApplicationEndpoint, MAX_FLOW_GENERATION, MAX_RULES, Mode, Rule,
     RuleOrigin, Snapshot, State, StateStore,
 };
+#[cfg(test)]
+use openshield_protocol::FirewallBackendKind;
 use openshield_protocol::{
-    Ack, ControlRequest, ErrorCode, ProtocolError, Response, clamp_page_limit,
+    Ack, CompatibilityLevel, CompatibilityReason, ControlRequest, ErrorCode, NfqueueCounters,
+    ProtocolError, Response, RuntimeCompatibility, clamp_page_limit,
 };
 use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::application::{ApplicationDecisionPolicy, pin_rule_application};
 use crate::backend::FirewallBackend;
+use crate::compatibility::select_runtime_compatibility;
 
 pub const MAX_EVENT_SUBSCRIBERS: usize = 64;
 // One learning poll can publish 256 structural events while the engine lock
@@ -32,6 +38,108 @@ pub const EVENT_QUEUE_CAPACITY: usize = 512;
 const MAX_LEARNED_RULES_PER_POLL: usize = 256;
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
+
+/// Process-lifetime NFQUEUE counters shared by the packet workers and the
+/// status path. Targets with native 64-bit atomics use relaxed ordering
+/// because these values carry no synchronization payload. The `ARMv5` fallback
+/// serializes each full-width value with a mutex.
+#[derive(Debug, Default)]
+struct SaturatingCounter {
+    #[cfg(target_has_atomic = "64")]
+    value: AtomicU64,
+    // Rust supports OpenShield's ARMv5 target, but that target has no native
+    // 64-bit atomics. Keep the full u64 contract there instead of silently
+    // narrowing or making the target fail to compile.
+    #[cfg(not(target_has_atomic = "64"))]
+    value: Mutex<u64>,
+}
+
+impl SaturatingCounter {
+    #[cfg(target_has_atomic = "64")]
+    fn increment(&self) {
+        // Returning `Some` makes this update infallible. Saturation is
+        // intentional: wrapping a long-running daemon's telemetry to zero
+        // could make a release gate mistake an error for a clean interval.
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            });
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn increment(&self) {
+        let mut value = match self.value.lock() {
+            Ok(value) => value,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *value = value.saturating_add(1);
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    fn load(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(target_has_atomic = "64"))]
+    fn load(&self) -> u64 {
+        let value = match self.value.lock() {
+            Ok(value) => value,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *value
+    }
+
+    #[cfg(test)]
+    fn set_for_test(&self, value: u64) {
+        #[cfg(target_has_atomic = "64")]
+        self.value.store(value, Ordering::Relaxed);
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            let mut current = match self.value.lock() {
+                Ok(current) => current,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *current = value;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct NfqueueRuntimeCounters {
+    queue_overflow: SaturatingCounter,
+    attribution_timeout: SaturatingCounter,
+    terminal_queue_error: SaturatingCounter,
+    denied: SaturatingCounter,
+}
+
+impl NfqueueRuntimeCounters {
+    pub(crate) fn record_queue_overflow(&self) {
+        self.queue_overflow.increment();
+    }
+
+    pub(crate) fn record_attribution_timeout(&self) {
+        self.attribution_timeout.increment();
+    }
+
+    pub(crate) fn record_terminal_queue_error(&self) {
+        self.terminal_queue_error.increment();
+    }
+
+    pub(crate) fn record_denied(&self) {
+        self.denied.increment();
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> NfqueueCounters {
+        NfqueueCounters {
+            queue_overflow: self.queue_overflow.load(),
+            attribution_timeout: self.attribution_timeout.load(),
+            terminal_queue_error: self.terminal_queue_error.load(),
+            denied: self.denied.load(),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct EventBusState {
@@ -158,14 +266,20 @@ pub struct Engine {
     state: State,
     application_policy: Arc<ApplicationDecisionPolicy>,
     application_learning_admission: Arc<ApplicationLearningAdmissionIndex>,
+    pending_application_learning_admission: Option<Arc<ApplicationLearningAdmissionIndex>>,
+    pending_application_learning_candidate: Option<Arc<State>>,
+    pending_application_learning_events: Vec<Event>,
     backend: Box<dyn FirewallBackend>,
-    store: Box<dyn StateStore>,
+    persistence: Arc<PersistenceCoordinator>,
     events: EventBus,
+    nfqueue_counters: Arc<NfqueueRuntimeCounters>,
     poisoned: bool,
     fatal: bool,
     restart_required: bool,
     startup_policy: StartupPolicy,
     learning_persistence: LearningPersistence,
+    next_learning_transaction: u64,
+    superseded_learning_transaction: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +291,7 @@ enum StartupPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LearningPersistence {
     Active,
+    InFlight(u64),
     Paused,
 }
 
@@ -194,6 +309,199 @@ enum PersistedStateAfterFailure {
     CandidateOrUnknown,
 }
 
+#[derive(Debug, Default)]
+struct PersistenceCoordinatorState {
+    learning_reservation: Option<u64>,
+}
+
+/// Serializes the durable state file without making packet verdicts wait for
+/// file I/O.
+///
+/// A learning transaction reserves its place while the engine mutex is held,
+/// then performs the actual write after releasing that mutex. Exclusive
+/// writers (control rollback and emergency quarantine) wait for the reserved
+/// write and therefore always persist after it. This ordering prevents a slow
+/// learning write from overwriting a newer emergency `BlockAll` state.
+#[derive(Debug)]
+struct PersistenceCoordinator {
+    store: Arc<dyn StateStore>,
+    state: Mutex<PersistenceCoordinatorState>,
+    idle: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LearningStoreOutcome {
+    Saved,
+    PreviousRetained,
+    Unsafe,
+}
+
+impl PersistenceCoordinator {
+    fn new(store: Box<dyn StateStore>) -> Self {
+        Self {
+            store: Arc::from(store),
+            state: Mutex::new(PersistenceCoordinatorState::default()),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn coordinator_error() -> openshield_core::StorageError {
+        openshield_core::StorageError::InvalidJson(
+            "state persistence coordinator is poisoned".to_owned(),
+        )
+    }
+
+    fn wait_until_exclusive(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, PersistenceCoordinatorState>, openshield_core::StorageError>
+    {
+        let mut state = self.state.lock().map_err(|_| Self::coordinator_error())?;
+        while state.learning_reservation.is_some() {
+            state = self
+                .idle
+                .wait(state)
+                .map_err(|_| Self::coordinator_error())?;
+        }
+        Ok(state)
+    }
+
+    fn load_exclusive(&self) -> Result<Option<State>, openshield_core::StorageError> {
+        let _state = self.wait_until_exclusive()?;
+        self.store.load()
+    }
+
+    fn save_exclusive(&self, state: &State) -> Result<(), openshield_core::StorageError> {
+        let _coordinator = self.wait_until_exclusive()?;
+        self.store.save(state)
+    }
+
+    fn reserve_learning(
+        self: &Arc<Self>,
+        token: u64,
+    ) -> Result<LearningReservation, ProtocolError> {
+        let mut state = self.state.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "state persistence coordinator is poisoned",
+            )
+        })?;
+        if state.learning_reservation.is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "another automatic-learning transaction is already being persisted",
+            ));
+        }
+        state.learning_reservation = Some(token);
+        Ok(LearningReservation {
+            token,
+            persistence: Arc::clone(self),
+        })
+    }
+
+    fn cancel_learning_reservation(&self, token: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.learning_reservation == Some(token) {
+            state.learning_reservation = None;
+            self.idle.notify_all();
+        }
+    }
+
+    fn persist_learning(
+        &self,
+        token: u64,
+        previous: &State,
+        candidate: &State,
+    ) -> LearningStoreOutcome {
+        {
+            let Ok(coordinator) = self.state.lock() else {
+                return LearningStoreOutcome::Unsafe;
+            };
+            if coordinator.learning_reservation != Some(token) {
+                return LearningStoreOutcome::Unsafe;
+            }
+        }
+
+        // The reservation, rather than this mutex guard, excludes other
+        // writers. Do not hold a poisonable synchronization primitive across
+        // StateStore code: if an unexpected store panic unwinds this call, the
+        // transaction's RAII reservation can still wake an emergency writer.
+        let outcome = match self.store.save(candidate) {
+            Ok(()) => LearningStoreOutcome::Saved,
+            Err(save_error) => {
+                error!(
+                    error = %save_error,
+                    "learned-state persistence failed; checking the authoritative state file"
+                );
+                if persisted_state_after_failed_save(self.store.as_ref(), previous, candidate)
+                    == PersistedStateAfterFailure::CandidateOrUnknown
+                {
+                    match self.store.save(previous) {
+                        Ok(()) => LearningStoreOutcome::PreviousRetained,
+                        Err(rollback_error) => {
+                            error!(
+                                error = %rollback_error,
+                                "learned-state storage rollback failed"
+                            );
+                            LearningStoreOutcome::Unsafe
+                        }
+                    }
+                } else {
+                    LearningStoreOutcome::PreviousRetained
+                }
+            }
+        };
+
+        self.cancel_learning_reservation(token);
+        outcome
+    }
+}
+
+#[derive(Debug)]
+struct LearningReservation {
+    token: u64,
+    persistence: Arc<PersistenceCoordinator>,
+}
+
+impl Drop for LearningReservation {
+    fn drop(&mut self) {
+        // Preparing a transaction must never leave emergency persistence
+        // waiting forever if its owner exits before calling persist().
+        self.persistence.cancel_learning_reservation(self.token);
+    }
+}
+
+pub(crate) struct ApplicationLearningTransaction {
+    reservation: LearningReservation,
+    previous: State,
+    candidate: Arc<State>,
+    events: Vec<Event>,
+}
+
+pub(crate) struct PersistedApplicationLearning {
+    transaction: ApplicationLearningTransaction,
+    outcome: LearningStoreOutcome,
+}
+
+impl ApplicationLearningTransaction {
+    pub(crate) fn persist(self) -> PersistedApplicationLearning {
+        let outcome = self.reservation.persistence.persist_learning(
+            self.reservation.token,
+            &self.previous,
+            self.candidate.as_ref(),
+        );
+        PersistedApplicationLearning {
+            transaction: self,
+            outcome,
+        }
+    }
+
+    const fn token(&self) -> u64 {
+        self.reservation.token
+    }
+}
+
 impl std::fmt::Debug for Engine {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -207,8 +515,9 @@ impl std::fmt::Debug for Engine {
                 "application_learning_revision",
                 &self.application_learning_admission.revision(),
             )
-            .field("store", &self.store)
+            .field("persistence", &self.persistence)
             .field("events", &self.events)
+            .field("nfqueue_counters", &self.nfqueue_counters.snapshot())
             .field("poisoned", &self.poisoned)
             .field("fatal", &self.fatal)
             .field("restart_required", &self.restart_required)
@@ -255,12 +564,51 @@ fn build_application_learning_admission(state: &State) -> ApplicationLearningAdm
     state.application_learning_admission_index()
 }
 
+fn validate_application_learning_transition(
+    previous: &State,
+    candidate: &State,
+    events: &[Event],
+) -> bool {
+    if candidate.mode() != Mode::Learning
+        || candidate.flow_generation() != previous.flow_generation()
+        || candidate.rules().len() != previous.rules().len().saturating_add(events.len())
+        || previous
+            .rules()
+            .any(|rule| candidate.rule(rule.id) != Some(rule))
+    {
+        return false;
+    }
+
+    let mut expected_revision = previous.revision();
+    for event in events {
+        let Some(next_revision) = expected_revision.checked_add(1) else {
+            return false;
+        };
+        let EventKind::RuleCreated { rule } = &event.kind else {
+            return false;
+        };
+        if event.revision != next_revision
+            || rule.spec.origin != RuleOrigin::Learned
+            || rule.spec.direction != openshield_core::Direction::Outbound
+            || !rule.spec.enabled
+            || rule.spec.application.is_none()
+            || previous.rule(rule.id).is_some()
+            || candidate.rule(rule.id) != Some(rule)
+        {
+            return false;
+        }
+        expected_revision = next_revision;
+    }
+    candidate.revision() == expected_revision
+}
+
 impl Engine {
     pub fn load(
         mut backend: Box<dyn FirewallBackend>,
         store: Box<dyn StateStore>,
         events: EventBus,
     ) -> Result<Self> {
+        let persistence = Arc::new(PersistenceCoordinator::new(store));
         // Do not leave a policy from an earlier daemon instance active while
         // persisted state is loaded and re-epoched. This also makes direct
         // invocation safe when the systemd ExecStartPre helper was not used.
@@ -268,10 +616,10 @@ impl Engine {
             .fail_closed()
             .context("cannot establish the startup BlockAll quarantine")?;
 
-        let state = match store.load() {
+        let state = match persistence.load_exclusive() {
             Ok(Some(mut state)) => {
                 rotate_startup_flow_generation(&mut state)?;
-                if let Err(save_error) = store.save(&state) {
+                if let Err(save_error) = persistence.save_exclusive(&state) {
                     let fail_closed = backend.fail_closed();
                     return match fail_closed {
                         Ok(()) => Err(save_error).context(
@@ -290,7 +638,7 @@ impl Engine {
                     .set_mode(Mode::Learning)
                     .context("cannot construct the initial Learning policy")?;
                 rotate_startup_flow_generation(&mut state)?;
-                store.save(&state).context(
+                persistence.save_exclusive(&state).context(
                     "cannot persist the initial Learning policy; BlockAll remains active",
                 )?;
                 state
@@ -314,14 +662,20 @@ impl Engine {
             state,
             application_policy,
             application_learning_admission,
+            pending_application_learning_admission: None,
+            pending_application_learning_candidate: None,
+            pending_application_learning_events: Vec::new(),
             backend,
-            store,
+            persistence,
             events,
+            nfqueue_counters: Arc::new(NfqueueRuntimeCounters::default()),
             poisoned: false,
             fatal: false,
             restart_required: false,
             startup_policy: StartupPolicy::Pending,
             learning_persistence: LearningPersistence::Active,
+            next_learning_transaction: 0,
+            superseded_learning_transaction: None,
         })
     }
 
@@ -354,6 +708,11 @@ impl Engine {
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.state.mode()
+    }
+
+    #[must_use]
+    pub(crate) fn nfqueue_counters(&self) -> Arc<NfqueueRuntimeCounters> {
+        Arc::clone(&self.nfqueue_counters)
     }
 
     #[must_use]
@@ -439,8 +798,21 @@ impl Engine {
         if self.learning_persistence == LearningPersistence::Paused {
             return Ok(LearningQueueAdmission::PersistencePaused);
         }
-        match self
-            .application_learning_admission
+        let admission = match self.learning_persistence {
+            LearningPersistence::InFlight(_) => self
+                .pending_application_learning_admission
+                .as_deref()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "application learning transaction has no pending admission index",
+                    )
+                })?,
+            LearningPersistence::Active | LearningPersistence::Paused => {
+                self.application_learning_admission.as_ref()
+            }
+        };
+        match admission
             .classify(endpoint)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?
         {
@@ -460,7 +832,45 @@ impl Engine {
             revision: self.state.revision(),
             mode: self.state.mode(),
             rule_count,
+            backend: self.backend.kind(),
+            nfqueue: self.nfqueue_counters.snapshot(),
         }
+    }
+
+    /// Returns status with an explicit, typed description of the effective
+    /// packet-processing path. The legacy response remains unchanged and is
+    /// still served for `ReadRequest::Status`.
+    #[must_use]
+    pub fn status_v2_response(&self) -> Response {
+        if self.fatal {
+            return Response::Error(fatal_protocol_error());
+        }
+        let rule_count = u32::try_from(self.state.rules().len()).unwrap_or(u32::MAX);
+        let backend = self.backend.kind();
+        let runtime_compatibility = self.runtime_compatibility();
+        Response::StatusV2 {
+            revision: self.state.revision(),
+            mode: self.state.mode(),
+            rule_count,
+            backend,
+            nfqueue: self.nfqueue_counters.snapshot(),
+            runtime_compatibility,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn runtime_compatibility(&self) -> RuntimeCompatibility {
+        if self.poisoned && self.state.mode() == Mode::BlockAll {
+            return RuntimeCompatibility {
+                level: CompatibilityLevel::KernelNative,
+                reason: CompatibilityReason::EmergencyBlockAll,
+            };
+        }
+        select_runtime_compatibility(
+            self.backend.kind(),
+            self.state.mode(),
+            self.state.application_interception(),
+        )
     }
 
     #[must_use]
@@ -497,6 +907,23 @@ impl Engine {
                 format!(
                     "policy revision changed: expected {expected_revision}, current {current_revision}; reload before retrying"
                 ),
+            ));
+        }
+
+        if let LearningPersistence::InFlight(token) = self.learning_persistence {
+            if matches!(
+                &request,
+                ControlRequest::SetMode {
+                    mode: Mode::BlockAll,
+                    ..
+                }
+            ) {
+                let revision = self.commit_block_all_during_learning(token)?;
+                return Ok(Ack::new(revision, None));
+            }
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "automatic learning is being persisted; retry the privileged change",
             ));
         }
 
@@ -566,6 +993,72 @@ impl Engine {
         Ok(Ack::new(revision, affected_rule))
     }
 
+    /// Applies an operator-requested `BlockAll` before waiting for a pending
+    /// learning write. The combined state (including the already prepared
+    /// learned rules) is then persisted after that write, so the emergency
+    /// policy is both immediate in the kernel and last on disk.
+    fn commit_block_all_during_learning(&mut self, token: u64) -> Result<u64, ProtocolError> {
+        let pending = self
+            .pending_application_learning_candidate
+            .as_deref()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "application learning transaction has no pending candidate",
+                )
+            })?;
+        let mut blocked = pending.clone();
+        let event = blocked
+            .set_mode(Mode::BlockAll)
+            .map_err(|error| core_protocol_error(&error))?;
+        blocked
+            .validate()
+            .map_err(|error| core_protocol_error(&error))?;
+        let revision = blocked.revision();
+        let pending_events = self.pending_application_learning_events.clone();
+
+        if let Err(error) = self.backend.fail_closed() {
+            error!(
+                error = %format_args!("{error:#}"),
+                "operator BlockAll could not be installed while learning persistence was active"
+            );
+            self.poisoned = true;
+            self.fatal = true;
+            self.restart_required = true;
+            self.learning_persistence = LearningPersistence::Paused;
+            return Err(fatal_protocol_error());
+        }
+
+        // Do not roll the kernel back to Learning if persistence fails. A
+        // second save resolves an error reported after an atomic rename; if it
+        // also fails, retain resident BlockAll and require storage repair.
+        let persisted = self.persistence.save_exclusive(&blocked).or_else(|error| {
+            warn!(%error, "retrying persistence of operator BlockAll after an ambiguous save");
+            self.persistence.save_exclusive(&blocked)
+        });
+
+        self.replace_state(blocked);
+        self.superseded_learning_transaction = Some(token);
+        if let Err(error) = persisted {
+            error!(
+                %error,
+                "operator BlockAll is active but could not be persisted; daemon remains quarantined"
+            );
+            self.poisoned = true;
+            self.learning_persistence = LearningPersistence::Paused;
+            self.restart_required = false;
+            return Err(self.emergency_protocol_error());
+        }
+
+        self.learning_persistence = LearningPersistence::Active;
+        self.events.clear_counter_snapshot();
+        for pending_event in &pending_events {
+            self.events.publish(pending_event);
+        }
+        self.events.publish(&event);
+        Ok(revision)
+    }
+
     #[cfg(test)]
     pub fn harvest_learning(
         &mut self,
@@ -573,7 +1066,7 @@ impl Engine {
         endpoints: Vec<LearnedEndpoint>,
     ) -> Result<usize, ProtocolError> {
         if self.poisoned
-            || self.learning_persistence == LearningPersistence::Paused
+            || self.learning_persistence != LearningPersistence::Active
             || self.state.mode() != Mode::Learning
             || self.state.revision() != expected_revision
             || self.state.rules().len() >= MAX_RULES
@@ -616,20 +1109,21 @@ impl Engine {
         Ok(events.len())
     }
 
-    pub fn harvest_application_learning(
+    pub(crate) fn prepare_application_learning(
         &mut self,
         expected_flow_generation: u32,
         endpoints: Vec<LearnedApplicationEndpoint>,
-    ) -> Result<usize, ProtocolError> {
+    ) -> Result<Option<ApplicationLearningTransaction>, ProtocolError> {
         if self.poisoned
-            || self.learning_persistence == LearningPersistence::Paused
+            || self.learning_persistence != LearningPersistence::Active
             || self.state.mode() != Mode::Learning
             || self.state.flow_generation() != expected_flow_generation
             || self.state.rules().len() >= MAX_RULES
         {
-            return Ok(0);
+            return Ok(None);
         }
 
+        let previous = self.state.clone();
         let mut candidate = self.state.clone();
         let valid_endpoints = endpoints.into_iter().take(MAX_RULES).filter(|endpoint| {
             if let Err(error) = endpoint.validate() {
@@ -647,22 +1141,123 @@ impl Engine {
             .filter_map(|outcome| outcome.event)
             .collect();
         if events.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         if let Err(error) = candidate.validate() {
             if matches!(error, CoreError::StateSizeLimitReached(_)) {
                 self.learning_persistence = LearningPersistence::Paused;
                 warn!(%error, "application learning stopped at the persisted-state byte limit");
-                return Ok(0);
+                return Ok(None);
             }
             return Err(core_protocol_error(&error));
         }
 
-        if !self.commit_learning(candidate, &events)? {
+        if !validate_application_learning_transition(&previous, &candidate, &events) {
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                "automatic learning produced an invalid policy transition",
+            ));
+        }
+
+        let token = self
+            .next_learning_transaction
+            .checked_add(1)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "automatic-learning transaction counter is exhausted",
+                )
+            })?;
+        let reservation = self.persistence.reserve_learning(token)?;
+        self.next_learning_transaction = token;
+        let candidate = Arc::new(candidate);
+        self.pending_application_learning_admission = Some(Arc::new(
+            build_application_learning_admission(candidate.as_ref()),
+        ));
+        self.pending_application_learning_candidate = Some(Arc::clone(&candidate));
+        self.pending_application_learning_events.clone_from(&events);
+        self.learning_persistence = LearningPersistence::InFlight(token);
+
+        Ok(Some(ApplicationLearningTransaction {
+            reservation,
+            previous,
+            candidate,
+            events,
+        }))
+    }
+
+    pub(crate) fn finalize_application_learning(
+        &mut self,
+        persisted: PersistedApplicationLearning,
+    ) -> Result<usize, ProtocolError> {
+        let PersistedApplicationLearning {
+            transaction,
+            outcome,
+        } = persisted;
+
+        let token = transaction.token();
+        if self.superseded_learning_transaction == Some(token) {
+            self.superseded_learning_transaction = None;
             return Ok(0);
         }
-        Ok(events.len())
+        if self.fatal || self.poisoned {
+            return Err(self.emergency_protocol_error());
+        }
+        if self.learning_persistence != LearningPersistence::InFlight(token)
+            || self.state != transaction.previous
+        {
+            error!(
+                token,
+                "automatic-learning transaction lost its base-state identity"
+            );
+            self.enter_emergency_fail_closed(
+                self.state.revision().max(transaction.candidate.revision()),
+            );
+            return Err(self.emergency_protocol_error());
+        }
+
+        match outcome {
+            LearningStoreOutcome::Saved => {
+                let count = transaction.events.len();
+                self.replace_state(Arc::unwrap_or_clone(transaction.candidate));
+                self.learning_persistence = LearningPersistence::Active;
+                self.events.clear_counter_snapshot();
+                for event in &transaction.events {
+                    self.events.publish(event);
+                }
+                Ok(count)
+            }
+            LearningStoreOutcome::PreviousRetained => {
+                self.clear_pending_application_learning();
+                self.learning_persistence = LearningPersistence::Paused;
+                warn!(
+                    "automatic learning paused after a recoverable persistence failure; previous state retained"
+                );
+                Ok(0)
+            }
+            LearningStoreOutcome::Unsafe => {
+                self.enter_emergency_fail_closed(
+                    self.state.revision().max(transaction.candidate.revision()),
+                );
+                Err(self.emergency_protocol_error())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn harvest_application_learning(
+        &mut self,
+        expected_flow_generation: u32,
+        endpoints: Vec<LearnedApplicationEndpoint>,
+    ) -> Result<usize, ProtocolError> {
+        let Some(transaction) =
+            self.prepare_application_learning(expected_flow_generation, endpoints)?
+        else {
+            return Ok(0);
+        };
+        let persisted = transaction.persist();
+        self.finalize_application_learning(persisted)
     }
 
     pub fn publish_counters_if_current(
@@ -736,6 +1331,26 @@ impl Engine {
         }
     }
 
+    /// Installs kernel `BlockAll` without trusting or persisting an `Engine` value
+    /// recovered from a poisoned outer mutex.
+    ///
+    /// A panic may have interrupted an in-memory mutation at an arbitrary
+    /// point. The last durable state remains the only restart authority; the
+    /// recovered object is used solely to reach its already-owned backend.
+    pub(crate) fn quarantine_after_engine_poison(&mut self) {
+        self.poisoned = true;
+        self.fatal = true;
+        self.restart_required = true;
+        self.learning_persistence = LearningPersistence::Paused;
+        self.events.clear_counter_snapshot();
+        if let Err(error) = self.backend.fail_closed() {
+            error!(
+                error = %format_args!("{error:#}"),
+                "cannot install BlockAll after policy-engine mutex poisoning"
+            );
+        }
+    }
+
     /// Replaces the live kernel policy with `BlockAll` during a normal stop,
     /// while deliberately leaving the persisted user-selected mode intact for
     /// the next supervised start.
@@ -782,13 +1397,15 @@ impl Engine {
             }
         }
 
-        if let Err(save_error) = self.store.save(&candidate) {
+        if let Err(save_error) = self.persistence.save_exclusive(&candidate) {
             error!(error = %save_error, "state persistence failed; rolling policy back");
             let backend_rollback = self.backend.apply(&previous.snapshot());
             let storage_rollback =
                 match self.persisted_state_after_failed_save(&previous, &candidate) {
                     PersistedStateAfterFailure::Previous => Ok(()),
-                    PersistedStateAfterFailure::CandidateOrUnknown => self.store.save(&previous),
+                    PersistedStateAfterFailure::CandidateOrUnknown => {
+                        self.persistence.save_exclusive(&previous)
+                    }
                 };
             if backend_rollback.is_err() || storage_rollback.is_err() {
                 if let Err(error) = &backend_rollback {
@@ -815,6 +1432,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn commit_learning(
         &mut self,
         candidate: State,
@@ -825,14 +1443,14 @@ impl Engine {
         // outbound allows do not change the active kernel decision until a
         // later Enforcing transaction, so rebuilding nftables here would only
         // discard dynamic sets and reset live counters.
-        if let Err(save_error) = self.store.save(&candidate) {
+        if let Err(save_error) = self.persistence.save_exclusive(&candidate) {
             error!(
                 error = %save_error,
                 "learned-state persistence failed; checking the authoritative state file"
             );
             if self.persisted_state_after_failed_save(&previous, &candidate)
                 == PersistedStateAfterFailure::CandidateOrUnknown
-                && let Err(rollback_error) = self.store.save(&previous)
+                && let Err(rollback_error) = self.persistence.save_exclusive(&previous)
             {
                 error!(
                     error = %rollback_error,
@@ -866,17 +1484,9 @@ impl Engine {
         previous: &State,
         candidate: &State,
     ) -> PersistedStateAfterFailure {
-        match self.store.load() {
-            Ok(Some(persisted)) if &persisted == previous => PersistedStateAfterFailure::Previous,
-            Ok(Some(persisted)) if &persisted == candidate => {
-                warn!(
-                    "failed save replaced the state file before reporting an error; rollback is required"
-                );
-                PersistedStateAfterFailure::CandidateOrUnknown
-            }
-            Ok(_) => {
-                error!("state file is absent or differs after a failed save");
-                PersistedStateAfterFailure::CandidateOrUnknown
+        match self.persistence.load_exclusive() {
+            Ok(persisted) => {
+                persisted_state_after_failed_save_result(persisted, previous, candidate)
             }
             Err(error) => {
                 error!(%error, "cannot validate state file after a failed save");
@@ -886,6 +1496,12 @@ impl Engine {
     }
 
     fn enter_emergency_fail_closed(&mut self, revision_floor: u64) {
+        let retained_state = self
+            .pending_application_learning_candidate
+            .as_deref()
+            .unwrap_or(&self.state)
+            .clone();
+        let revision_floor = revision_floor.max(retained_state.revision());
         self.poisoned = true;
         self.learning_persistence = LearningPersistence::Paused;
         self.restart_required = false;
@@ -893,12 +1509,12 @@ impl Engine {
             Ok(()) => {
                 let fail_closed = match State::from_snapshot(Snapshot {
                     revision: revision_floor.saturating_add(1),
-                    flow_generation: self.state.flow_generation(),
+                    flow_generation: retained_state.flow_generation(),
                     mode: Mode::BlockAll,
                     // BlockAll has no accept path regardless of stored rules.
                     // Retain the last validated policy so a transient runtime
                     // failure cannot become destructive policy data loss.
-                    rules: self.state.snapshot().rules,
+                    rules: retained_state.snapshot().rules,
                 }) {
                     Ok(state) => state,
                     Err(error) => {
@@ -910,7 +1526,7 @@ impl Engine {
                 };
                 self.replace_state(fail_closed.clone());
                 self.events.clear_counter_snapshot();
-                match self.store.save(&fail_closed) {
+                match self.persistence.save_exclusive(&fail_closed) {
                     Ok(()) => self.restart_required = true,
                     Err(error) => {
                         // Exiting now could reload an ambiguous candidate or
@@ -955,6 +1571,47 @@ impl Engine {
         self.state = state;
         self.application_policy = application_policy;
         self.application_learning_admission = application_learning_admission;
+        self.clear_pending_application_learning();
+    }
+
+    fn clear_pending_application_learning(&mut self) {
+        self.pending_application_learning_admission = None;
+        self.pending_application_learning_candidate = None;
+        self.pending_application_learning_events.clear();
+    }
+}
+
+fn persisted_state_after_failed_save(
+    store: &dyn StateStore,
+    previous: &State,
+    candidate: &State,
+) -> PersistedStateAfterFailure {
+    match store.load() {
+        Ok(persisted) => persisted_state_after_failed_save_result(persisted, previous, candidate),
+        Err(error) => {
+            error!(%error, "cannot validate state file after a failed save");
+            PersistedStateAfterFailure::CandidateOrUnknown
+        }
+    }
+}
+
+fn persisted_state_after_failed_save_result(
+    persisted: Option<State>,
+    previous: &State,
+    candidate: &State,
+) -> PersistedStateAfterFailure {
+    match persisted {
+        Some(persisted) if &persisted == previous => PersistedStateAfterFailure::Previous,
+        Some(persisted) if &persisted == candidate => {
+            warn!(
+                "failed save replaced the state file before reporting an error; rollback is required"
+            );
+            PersistedStateAfterFailure::CandidateOrUnknown
+        }
+        _ => {
+            error!("state file is absent or differs after a failed save");
+            PersistedStateAfterFailure::CandidateOrUnknown
+        }
     }
 }
 
@@ -996,18 +1653,21 @@ fn core_protocol_error(error: &CoreError) -> ProtocolError {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
 
     use anyhow::{Result as AnyResult, bail};
     use openshield_core::{
         ApplicationPath, ApplicationSelector, Direction, ExecutableFileId, InterfaceName,
         PortRange, RuleName, RuleSpec, Snapshot, StorageError, TransportProtocol,
     };
+    use openshield_protocol::{CompatibilityLevel, CompatibilityReason, RuntimeCompatibility};
 
     use super::*;
     use crate::backend::FirewallObserver;
 
     #[derive(Clone, Debug, Default)]
     struct BackendProbe {
+        kind: FirewallBackendKind,
         applied: Arc<Mutex<Vec<Snapshot>>>,
         fail_next: Arc<AtomicBool>,
         error_after_apply: Arc<AtomicBool>,
@@ -1021,6 +1681,10 @@ mod tests {
     }
 
     impl FirewallBackend for BackendProbe {
+        fn kind(&self) -> FirewallBackendKind {
+            self.kind
+        }
+
         fn apply(&mut self, snapshot: &Snapshot) -> AnyResult<()> {
             let scripted_failure = self
                 .failure_script
@@ -1103,6 +1767,155 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct PanickingStore {
+        inner: StoreProbe,
+        panic_next_save: Arc<AtomicBool>,
+    }
+
+    impl PanickingStore {
+        fn new(state: State) -> Self {
+            Self {
+                inner: StoreProbe::new(state),
+                panic_next_save: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl StateStore for PanickingStore {
+        fn load(&self) -> Result<Option<State>, StorageError> {
+            self.inner.load()
+        }
+
+        fn save(&self, state: &State) -> Result<(), StorageError> {
+            assert!(
+                !self.panic_next_save.swap(false, Ordering::SeqCst),
+                "injected state-store panic"
+            );
+            self.inner.save(state)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingStoreState {
+        state: Option<State>,
+        block_next_save: bool,
+        entered_save: bool,
+        release_save: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockingStore {
+        inner: Arc<(Mutex<BlockingStoreState>, Condvar)>,
+    }
+
+    impl BlockingStore {
+        fn new(state: State) -> Self {
+            Self {
+                inner: Arc::new((
+                    Mutex::new(BlockingStoreState {
+                        state: Some(state),
+                        block_next_save: false,
+                        entered_save: false,
+                        release_save: false,
+                    }),
+                    Condvar::new(),
+                )),
+            }
+        }
+
+        fn arm_next_save(&self) -> AnyResult<BlockingStoreRelease> {
+            let (state, _) = &*self.inner;
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("blocking store poisoned"))?;
+            state.block_next_save = true;
+            state.entered_save = false;
+            state.release_save = false;
+            Ok(BlockingStoreRelease {
+                store: self.clone(),
+            })
+        }
+
+        fn wait_until_save_is_blocked(&self) -> AnyResult<()> {
+            let (state, changed) = &*self.inner;
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("blocking store poisoned"))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !state.entered_save {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!("timed out waiting for blocked state save");
+                }
+                let (next, timeout) = changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| anyhow!("blocking store poisoned"))?;
+                state = next;
+                if timeout.timed_out() && !state.entered_save {
+                    bail!("timed out waiting for blocked state save");
+                }
+            }
+            Ok(())
+        }
+
+        fn release(&self) {
+            let (state, changed) = &*self.inner;
+            if let Ok(mut state) = state.lock() {
+                state.release_save = true;
+                changed.notify_all();
+            }
+        }
+
+        fn persisted_state(&self) -> AnyResult<Option<State>> {
+            let (state, _) = &*self.inner;
+            state
+                .lock()
+                .map(|state| state.state.clone())
+                .map_err(|_| anyhow!("blocking store poisoned"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingStoreRelease {
+        store: BlockingStore,
+    }
+
+    impl Drop for BlockingStoreRelease {
+        fn drop(&mut self) {
+            self.store.release();
+        }
+    }
+
+    impl StateStore for BlockingStore {
+        fn load(&self) -> Result<Option<State>, StorageError> {
+            let (state, _) = &*self.inner;
+            state
+                .lock()
+                .map(|state| state.state.clone())
+                .map_err(|_| StorageError::InvalidJson("blocking store poisoned".to_owned()))
+        }
+
+        fn save(&self, candidate: &State) -> Result<(), StorageError> {
+            let (state, changed) = &*self.inner;
+            let mut state = state
+                .lock()
+                .map_err(|_| StorageError::InvalidJson("blocking store poisoned".to_owned()))?;
+            if state.block_next_save {
+                state.block_next_save = false;
+                state.entered_save = true;
+                changed.notify_all();
+                while !state.release_save {
+                    state = changed.wait(state).map_err(|_| {
+                        StorageError::InvalidJson("blocking store poisoned".to_owned())
+                    })?;
+                }
+            }
+            state.state = Some(candidate.clone());
+            Ok(())
+        }
+    }
+
     fn manual_rule(name: &str) -> AnyResult<RuleSpec> {
         Ok(RuleSpec::new(
             RuleName::new(name)?,
@@ -1166,6 +1979,193 @@ mod tests {
             .map_err(|_| anyhow!("backend probe poisoned"))?
             .clear();
         Ok((engine, backend, store, events))
+    }
+
+    fn spawn_application_learning(
+        engine: &SharedEngine,
+        generation: u32,
+        endpoints: Vec<LearnedApplicationEndpoint>,
+    ) -> thread::JoinHandle<Result<usize, ProtocolError>> {
+        let engine = Arc::clone(engine);
+        thread::spawn(move || {
+            let transaction = engine
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(ErrorCode::Internal, "policy engine mutex poisoned")
+                })?
+                .prepare_application_learning(generation, endpoints)?
+                .ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::Internal, "learning transaction was not prepared")
+                })?;
+            let persisted = transaction.persist();
+            engine
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(ErrorCode::Internal, "policy engine mutex poisoned")
+                })?
+                .finalize_application_learning(persisted)
+        })
+    }
+
+    fn application_learning_admission(
+        engine: &Engine,
+        generation: u32,
+        endpoint: &LearnedApplicationEndpoint,
+    ) -> AnyResult<LearningQueueAdmission> {
+        engine
+            .application_learning_queue_admission(Mode::Learning, generation, endpoint)
+            .map_err(|error| anyhow!(error.message))
+    }
+
+    fn backend_was_not_rebuilt(backend: &BackendProbe) -> AnyResult<bool> {
+        backend
+            .applied
+            .lock()
+            .map(|applied| applied.is_empty())
+            .map_err(|_| anyhow!("backend probe poisoned"))
+    }
+
+    #[test]
+    fn status_reports_the_backend_owned_by_the_engine() -> AnyResult<()> {
+        let backend = BackendProbe {
+            kind: FirewallBackendKind::Nftables,
+            ..BackendProbe::default()
+        };
+        let store = StoreProbe::new(State::new());
+        let engine = Engine::load(Box::new(backend), Box::new(store), EventBus::new())?;
+
+        assert!(matches!(
+            engine.status_response(),
+            Response::Status {
+                backend: FirewallBackendKind::Nftables,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn status_v2_reports_the_effective_runtime_compatibility() -> AnyResult<()> {
+        let backend = BackendProbe {
+            kind: FirewallBackendKind::Nftables,
+            ..BackendProbe::default()
+        };
+        let store = StoreProbe::new(State::new());
+        let engine = Engine::load(Box::new(backend), Box::new(store), EventBus::new())?;
+
+        assert!(matches!(
+            engine.status_v2_response(),
+            Response::StatusV2 {
+                backend: FirewallBackendKind::Nftables,
+                runtime_compatibility: RuntimeCompatibility {
+                    level: CompatibilityLevel::KernelNative,
+                    reason: CompatibilityReason::BlockAll,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(engine.status_response(), Response::Status { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn status_v2_never_attests_a_test_backend() -> AnyResult<()> {
+        let store = StoreProbe::new(State::new());
+        let engine = Engine::load(
+            Box::new(BackendProbe::default()),
+            Box::new(store),
+            EventBus::new(),
+        )?;
+
+        assert!(matches!(
+            engine.status_v2_response(),
+            Response::StatusV2 {
+                backend: FirewallBackendKind::Unknown,
+                runtime_compatibility: RuntimeCompatibility {
+                    level: CompatibilityLevel::Unknown,
+                    reason: CompatibilityReason::Unknown,
+                },
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn status_v2_distinguishes_emergency_quarantine_from_operator_block_all() -> AnyResult<()> {
+        let backend = BackendProbe {
+            kind: FirewallBackendKind::Nftables,
+            ..BackendProbe::default()
+        };
+        let store = StoreProbe::new(State::new());
+        let mut engine = Engine::load(Box::new(backend), Box::new(store), EventBus::new())?;
+        engine.poisoned = true;
+
+        assert!(matches!(
+            engine.status_v2_response(),
+            Response::StatusV2 {
+                mode: Mode::BlockAll,
+                runtime_compatibility: RuntimeCompatibility {
+                    level: CompatibilityLevel::KernelNative,
+                    reason: CompatibilityReason::EmergencyBlockAll,
+                },
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_a_typed_nfqueue_counter_snapshot() -> AnyResult<()> {
+        let store = StoreProbe::new(State::new());
+        let engine = Engine::load(
+            Box::new(BackendProbe::default()),
+            Box::new(store),
+            EventBus::new(),
+        )?;
+        let counters = engine.nfqueue_counters();
+        counters.record_queue_overflow();
+        counters.record_attribution_timeout();
+        counters.record_terminal_queue_error();
+        counters.record_denied();
+
+        assert!(matches!(
+            engine.status_response(),
+            Response::Status {
+                nfqueue: NfqueueCounters {
+                    queue_overflow: 1,
+                    attribution_timeout: 1,
+                    terminal_queue_error: 1,
+                    denied: 1,
+                },
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn nfqueue_counters_saturate_instead_of_wrapping() {
+        let counters = NfqueueRuntimeCounters::default();
+        counters.queue_overflow.set_for_test(u64::MAX);
+        counters.attribution_timeout.set_for_test(u64::MAX);
+        counters.terminal_queue_error.set_for_test(u64::MAX);
+        counters.denied.set_for_test(u64::MAX);
+
+        counters.record_queue_overflow();
+        counters.record_attribution_timeout();
+        counters.record_terminal_queue_error();
+        counters.record_denied();
+
+        assert_eq!(
+            counters.snapshot(),
+            NfqueueCounters {
+                queue_overflow: u64::MAX,
+                attribution_timeout: u64::MAX,
+                terminal_queue_error: u64::MAX,
+                denied: u64::MAX,
+            }
+        );
     }
 
     #[test]
@@ -1281,6 +2281,332 @@ mod tests {
                 .application_learning_queue_admission(Mode::Learning, generation, &later)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn slow_learning_save_does_not_block_packet_decisions_or_duplicate_rules() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let backend = BackendProbe::default();
+        let store = BlockingStore::new(state);
+        let events = EventBus::new();
+        let subscription = events
+            .subscribe()
+            .map_err(|_| anyhow!("subscribe failed"))?;
+        let mut engine = Engine::load(Box::new(backend.clone()), Box::new(store.clone()), events)?;
+        engine.activate_startup_policy()?;
+        backend
+            .applied
+            .lock()
+            .map_err(|_| anyhow!("backend probe poisoned"))?
+            .clear();
+
+        let generation = engine.state.flow_generation();
+        let endpoint = learned_application_endpoint(700, 2_000, 70)?;
+        let second_endpoint = learned_application_endpoint(701, 2_001, 71)?;
+        let later = learned_application_endpoint(702, 2_002, 72)?;
+        let release = store.arm_next_save()?;
+        let shared = Arc::new(Mutex::new(engine));
+        let worker = spawn_application_learning(
+            &shared,
+            generation,
+            vec![endpoint.clone(), second_endpoint.clone()],
+        );
+
+        store.wait_until_save_is_blocked()?;
+        let mut packet_guard = shared
+            .try_lock()
+            .map_err(|error| anyhow!("packet path blocked by state save: {error}"))?;
+        let snapshot = packet_guard
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(snapshot.mode, Mode::Learning);
+        assert_eq!(
+            packet_guard
+                .application_decision_identity()
+                .map_err(|error| anyhow!(error.message))?,
+            (Mode::Learning, generation)
+        );
+        assert_eq!(
+            application_learning_admission(&packet_guard, generation, &endpoint)?,
+            LearningQueueAdmission::AlreadyKnown,
+            "the in-flight endpoint must not refill the bounded learning queue"
+        );
+        assert_eq!(
+            application_learning_admission(&packet_guard, generation, &second_endpoint)?,
+            LearningQueueAdmission::AlreadyKnown,
+            "every endpoint in a multi-rule candidate must use the pending admission index"
+        );
+        assert_eq!(
+            application_learning_admission(&packet_guard, generation, &later)?,
+            LearningQueueAdmission::Enqueue
+        );
+        let expected_revision = packet_guard.revision();
+        assert!(matches!(
+            packet_guard.handle_control(ControlRequest::SetMode {
+                expected_revision,
+                mode: Mode::Enforcing,
+            }),
+            Err(ProtocolError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        assert!(
+            backend_was_not_rebuilt(&backend)?,
+            "a conflicting control transaction must not reach the kernel backend"
+        );
+        assert!(matches!(
+            subscription.recv_timeout(Duration::from_millis(1)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        drop(packet_guard);
+
+        drop(release);
+        let learned = worker
+            .join()
+            .map_err(|_| anyhow!("learning worker panicked"))?
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(learned, 2);
+        for _ in 0..2 {
+            let event = subscription.recv_timeout(Duration::from_millis(50))?;
+            assert!(matches!(event.kind, EventKind::RuleCreated { .. }));
+        }
+
+        let mut engine = shared
+            .lock()
+            .map_err(|_| anyhow!("policy engine mutex poisoned"))?;
+        let persisted = store
+            .persisted_state()?
+            .ok_or_else(|| anyhow!("learning candidate was not persisted"))?;
+        assert_eq!(persisted, engine.state);
+        assert_eq!(persisted.rules().len(), 2);
+        assert_eq!(
+            engine
+                .harvest_application_learning(generation, vec![endpoint, second_endpoint])
+                .map_err(|error| anyhow!(error.message))?,
+            0
+        );
+        assert_eq!(engine.state.rules().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn operator_block_all_preempts_slow_learning_and_is_persisted_last() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let backend = BackendProbe::default();
+        let store = BlockingStore::new(state);
+        let events = EventBus::new();
+        let subscription = events
+            .subscribe()
+            .map_err(|_| anyhow!("subscribe failed"))?;
+        let mut engine = Engine::load(Box::new(backend.clone()), Box::new(store.clone()), events)?;
+        engine.activate_startup_policy()?;
+        backend
+            .applied
+            .lock()
+            .map_err(|_| anyhow!("backend probe poisoned"))?
+            .clear();
+        let generation = engine.state.flow_generation();
+        let base_revision = engine.revision();
+        let endpoint = learned_application_endpoint(800, 3_000, 80)?;
+        let release = store.arm_next_save()?;
+        let shared = Arc::new(Mutex::new(engine));
+        let learning = spawn_application_learning(&shared, generation, vec![endpoint]);
+        store.wait_until_save_is_blocked()?;
+
+        let control_engine = Arc::clone(&shared);
+        let control = thread::spawn(move || {
+            control_engine
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(ErrorCode::Internal, "policy engine mutex poisoned")
+                })?
+                .handle_control(ControlRequest::SetMode {
+                    expected_revision: base_revision,
+                    mode: Mode::BlockAll,
+                })
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let applied = backend
+                .applied
+                .lock()
+                .map_err(|_| anyhow!("backend probe poisoned"))?;
+            if let Some(snapshot) = applied.last() {
+                assert_eq!(snapshot.mode, Mode::BlockAll);
+                break;
+            }
+            drop(applied);
+            if std::time::Instant::now() >= deadline {
+                bail!("operator BlockAll did not reach the kernel before storage was released");
+            }
+            thread::yield_now();
+        }
+
+        drop(release);
+        let ack = control
+            .join()
+            .map_err(|_| anyhow!("control worker panicked"))?
+            .map_err(|error| anyhow!(error.message))?;
+        assert_eq!(
+            learning
+                .join()
+                .map_err(|_| anyhow!("learning worker panicked"))?
+                .map_err(|error| anyhow!(error.message))?,
+            0,
+            "the superseded learning finalize must not restore Learning mode"
+        );
+
+        let engine = shared
+            .lock()
+            .map_err(|_| anyhow!("policy engine mutex poisoned"))?;
+        let persisted = store
+            .persisted_state()?
+            .ok_or_else(|| anyhow!("BlockAll state was not persisted"))?;
+        assert_eq!(engine.mode(), Mode::BlockAll);
+        assert_eq!(persisted, engine.state);
+        assert_eq!(persisted.revision(), ack.revision);
+        assert_eq!(persisted.rules().len(), 1);
+        let learned_event = subscription.recv_timeout(Duration::from_millis(50))?;
+        let mode_event = subscription.recv_timeout(Duration::from_millis(50))?;
+        assert!(matches!(learned_event.kind, EventKind::RuleCreated { .. }));
+        assert!(matches!(mode_event.kind, EventKind::ModeChanged { .. }));
+        assert!(learned_event.revision < mode_event.revision);
+        Ok(())
+    }
+
+    #[test]
+    fn recoverable_application_learning_failure_clears_pending_state_and_pauses() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let (mut engine, backend, store, _events) = engine_with_state(state)?;
+        let generation = engine.state.flow_generation();
+        let endpoint = learned_application_endpoint(900, 4_000, 90)?;
+        store.fail_next.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            engine
+                .harvest_application_learning(generation, vec![endpoint.clone()])
+                .map_err(|error| anyhow!(error.message))?,
+            0
+        );
+        assert_eq!(engine.learning_persistence, LearningPersistence::Paused);
+        assert!(engine.pending_application_learning_admission.is_none());
+        assert!(engine.pending_application_learning_candidate.is_none());
+        assert!(engine.pending_application_learning_events.is_empty());
+        assert_eq!(
+            engine
+                .application_learning_queue_admission(Mode::Learning, generation, &endpoint)
+                .map_err(|error| anyhow!(error.message))?,
+            LearningQueueAdmission::PersistencePaused
+        );
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .map_err(|_| anyhow!("store probe poisoned"))?
+                .as_ref(),
+            Some(&engine.state)
+        );
+        assert!(backend_was_not_rebuilt(&backend)?);
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_learning_transaction_releases_persistence_for_emergency_block_all() -> AnyResult<()>
+    {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let (mut engine, _backend, store, _events) = engine_with_state(state)?;
+        let generation = engine.state.flow_generation();
+        let endpoint = learned_application_endpoint(950, 4_500, 95)?;
+        let transaction = engine
+            .prepare_application_learning(generation, vec![endpoint])
+            .map_err(|error| anyhow!(error.message))?
+            .ok_or_else(|| anyhow!("learning transaction was not prepared"))?;
+
+        assert!(
+            engine
+                .persistence
+                .state
+                .lock()
+                .map_err(|_| anyhow!("persistence coordinator poisoned"))?
+                .learning_reservation
+                .is_some()
+        );
+        drop(transaction);
+        assert!(
+            engine
+                .persistence
+                .state
+                .lock()
+                .map_err(|_| anyhow!("persistence coordinator poisoned"))?
+                .learning_reservation
+                .is_none()
+        );
+
+        engine.quarantine_after_runtime_failure();
+        assert_eq!(engine.mode(), Mode::BlockAll);
+        assert!(engine.restart_required());
+        let persisted = store
+            .state
+            .lock()
+            .map_err(|_| anyhow!("store probe poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow!("emergency state was not persisted"))?;
+        assert_eq!(persisted, engine.state);
+        assert_eq!(persisted.rules().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn panicking_learning_store_does_not_poison_or_block_emergency_persistence() -> AnyResult<()> {
+        let mut state = State::new();
+        state.set_mode(Mode::Learning)?;
+        let backend = BackendProbe::default();
+        let store = PanickingStore::new(state);
+        let persisted = store.inner.clone();
+        let events = EventBus::new();
+        let mut engine = Engine::load(Box::new(backend), Box::new(store.clone()), events)?;
+        engine.activate_startup_policy()?;
+        let generation = engine.state.flow_generation();
+        let endpoint = learned_application_endpoint(951, 4_501, 96)?;
+        let transaction = engine
+            .prepare_application_learning(generation, vec![endpoint])
+            .map_err(|error| anyhow!(error.message))?
+            .ok_or_else(|| anyhow!("learning transaction was not prepared"))?;
+        store.panic_next_save.store(true, Ordering::SeqCst);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _persisted = transaction.persist();
+        }));
+        assert!(panic.is_err());
+        assert!(
+            engine
+                .persistence
+                .state
+                .lock()
+                .map_err(|_| anyhow!("persistence coordinator poisoned"))?
+                .learning_reservation
+                .is_none(),
+            "transaction unwind must release its persistence reservation"
+        );
+
+        engine.quarantine_after_runtime_failure();
+        assert_eq!(engine.mode(), Mode::BlockAll);
+        assert!(engine.restart_required());
+        let persisted = persisted
+            .state
+            .lock()
+            .map_err(|_| anyhow!("store probe poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow!("emergency state was not persisted"))?;
+        assert_eq!(persisted, engine.state);
+        assert_eq!(persisted.rules().len(), 1);
         Ok(())
     }
 
@@ -1829,7 +3155,9 @@ mod tests {
                 revision,
                 mode: Mode::BlockAll,
                 rule_count: 1,
-            } if revision == engine.revision()
+                backend: FirewallBackendKind::Unknown,
+                nfqueue,
+            } if revision == engine.revision() && nfqueue == NfqueueCounters::default()
         ));
         Ok(())
     }

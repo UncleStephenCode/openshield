@@ -23,12 +23,16 @@ use openshield_core::{
     LEARNED_TCP_V6_SET, LEARNED_UDP_V4_SET, LEARNED_UDP_V6_SET, LearnedEndpoint, PortRange,
     TransportProtocol,
 };
+use openshield_protocol::FirewallBackendKind;
 use serde_json::Value;
 
 const NFT_CANDIDATES: [&str; 3] = ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft"];
 const NFT_TABLE_QUERY: [&str; 4] = ["-j", "list", "tables", "inet"];
-const NFT_CHAIN_QUERY: [&str; 4] = ["-j", "list", "chains", "inet"];
 const NFT_COUNTER_QUERY: [&str; 4] = ["-j", "list", "counters", "inet"];
+const NFT_OBSERVATION_QUERY: [&str; 2] = [
+    "-j",
+    "list tables inet; list chains inet; list counters inet",
+];
 #[cfg(test)]
 const NFT_SET_QUERY_PREFIX: [&str; 5] = ["-j", "list", "set", "inet", "openshield"];
 #[cfg(test)]
@@ -42,6 +46,7 @@ const LEARNING_SET_NAMES: [&str; 6] = [
 ];
 const NFT_TIMEOUT: Duration = Duration::from_secs(5);
 const NFT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const NFT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(6);
 const WAIT_INTERVAL: Duration = Duration::from_millis(10);
 // A maximum-size validated state can expand when rendered as nft syntax.  Keep
 // the execution input bounded while leaving headroom for all 10,000 rules.
@@ -82,6 +87,14 @@ pub trait FirewallObserver: Send {
 }
 
 pub trait FirewallBackend: FirewallObserver {
+    /// Identifies the active production firewall implementation.
+    ///
+    /// Test or third-party backends remain `Unknown` unless they explicitly
+    /// provide a trustworthy identity.
+    fn kind(&self) -> FirewallBackendKind {
+        FirewallBackendKind::Unknown
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()>;
     fn fail_closed(&mut self) -> Result<()>;
 }
@@ -141,6 +154,23 @@ impl NftBackend {
     }
 
     fn probe(&self) -> Result<()> {
+        ensure!(
+            !active_xtables_artifacts()?,
+            "OpenShield artifacts from an xtables backend are still active"
+        );
+        self.ensure_owned_table_or_absent()
+            .context("nftables ownership preflight failed")?;
+
+        // Runtime integrity monitoring depends on all three bounded JSON
+        // queries. Exercise their exact single-process command form before
+        // selecting this backend, even when no OpenShield table exists yet.
+        // nft 1.0.6 accepts semicolon-separated commands as one literal argv
+        // value and emits one JSON document per command.
+        let observation = self
+            .capture_observation()
+            .context("nftables batched observation preflight failed")?;
+        parse_nft_observation_documents(&observation)?;
+
         let mut state = openshield_core::State::new();
         state
             .set_mode(openshield_core::Mode::Learning)
@@ -189,6 +219,15 @@ impl NftBackend {
     }
 
     fn capture(&self, args: &[&str]) -> Result<Vec<u8>> {
+        self.capture_bounded(args, NFT_QUERY_TIMEOUT, MAX_NFT_OUTPUT_BYTES)
+    }
+
+    fn capture_bounded(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+        maximum_output: usize,
+    ) -> Result<Vec<u8>> {
         let mut child = self
             .command(args)
             .stdout(Stdio::piped())
@@ -212,7 +251,7 @@ impl NftBackend {
                     if read == 0 {
                         break;
                     }
-                    let remaining = MAX_NFT_OUTPUT_BYTES.saturating_sub(captured.len());
+                    let remaining = maximum_output.saturating_sub(captured.len());
                     let keep = remaining.min(read);
                     captured.extend_from_slice(&chunk[..keep]);
                     overflow |= keep != read;
@@ -226,18 +265,23 @@ impl NftBackend {
             }
         };
 
-        let status_result = wait_with_timeout(&mut child, NFT_QUERY_TIMEOUT);
+        let status_result = wait_with_timeout(&mut child, timeout);
         let output_result = reader
             .join()
             .map_err(|_| anyhow!("nft output reader terminated unexpectedly"))?;
         let status = status_result?;
         let (output, overflow) = output_result?;
         ensure!(status.success(), "nft exited with status {status}");
-        ensure!(
-            !overflow,
-            "nft output exceeded {MAX_NFT_OUTPUT_BYTES} bytes"
-        );
+        ensure!(!overflow, "nft output exceeded {maximum_output} bytes");
         Ok(output)
+    }
+
+    fn capture_observation(&self) -> Result<Vec<u8>> {
+        self.capture_bounded(
+            &NFT_OBSERVATION_QUERY,
+            NFT_OBSERVATION_TIMEOUT,
+            MAX_NFT_OUTPUT_BYTES.saturating_mul(3),
+        )
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -254,6 +298,10 @@ impl NftBackend {
 }
 
 impl FirewallBackend for NftBackend {
+    fn kind(&self) -> FirewallBackendKind {
+        FirewallBackendKind::Nftables
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
         let policy = NftablesCompiler::compile(snapshot).context("failed to compile nft policy")?;
         self.checked_apply(policy.as_bytes())
@@ -277,18 +325,16 @@ impl FirewallObserver for NftBackend {
         // verdict while retaining that metadata. Root is trusted by the threat
         // model; detecting such mutation would require listing up to 10,000
         // rules on every observation interval or a different table topology.
-        let tables = self.capture(&NFT_TABLE_QUERY)?;
-        verify_table(&tables)?;
-        let chains = self.capture(&NFT_CHAIN_QUERY)?;
-        verify_base_chains(&chains)?;
-        let counters = self.capture(&NFT_COUNTER_QUERY)?;
-        parse_counters(&counters)
+        // Preserve the exact table/chain/counter checks and their one-second
+        // cadence while avoiding three fork/exec cycles per observation.
+        parse_nft_policy_observation(&self.capture_observation()?)
     }
 }
 
-/// Deterministic firewall backend selection. A fully usable nftables backend
-/// is always preferred. The compatibility backend is considered only when
-/// nft validation against the running kernel fails.
+/// Deterministic firewall backend selection. A safely preflighted nftables
+/// backend is always preferred. The compatibility backend is considered when
+/// any read-only nftables ownership, observation, coexistence, or kernel
+/// capability check fails.
 #[derive(Clone, Debug)]
 pub enum AutoBackend {
     Nft(NftBackend),
@@ -297,14 +343,29 @@ pub enum AutoBackend {
 
 impl AutoBackend {
     pub fn discover() -> Result<Self> {
-        let nft_error = match NftBackend::discover() {
-            Ok(backend) => match backend.probe() {
-                Ok(()) => return Ok(Self::Nft(backend)),
-                Err(error) => error,
+        Self::discover_with(
+            || {
+                let backend = NftBackend::discover()?;
+                backend.probe()?;
+                Ok(backend)
             },
+            IptablesBackend::discover,
+        )
+    }
+
+    fn discover_with<Nft, Iptables>(
+        discover_usable_nft: Nft,
+        discover_usable_iptables: Iptables,
+    ) -> Result<Self>
+    where
+        Nft: FnOnce() -> Result<NftBackend>,
+        Iptables: FnOnce() -> Result<IptablesBackend>,
+    {
+        let nft_error = match discover_usable_nft() {
+            Ok(backend) => return Ok(Self::Nft(backend)),
             Err(error) => error,
         };
-        match IptablesBackend::discover() {
+        match discover_usable_iptables() {
             Ok(backend) => Ok(Self::Iptables(backend)),
             Err(iptables_error) => Err(anyhow!(
                 "neither firewall backend is safely usable: nftables: {nft_error:#}; iptables fallback: {iptables_error:#}"
@@ -330,6 +391,13 @@ impl AutoBackend {
 }
 
 impl FirewallBackend for AutoBackend {
+    fn kind(&self) -> FirewallBackendKind {
+        match self {
+            Self::Nft(_) => FirewallBackendKind::Nftables,
+            Self::Iptables(_) => FirewallBackendKind::Iptables,
+        }
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
         match self {
             Self::Nft(backend) => backend.apply(snapshot),
@@ -825,6 +893,10 @@ impl IptablesBackend {
 }
 
 impl FirewallBackend for IptablesBackend {
+    fn kind(&self) -> FirewallBackendKind {
+        FirewallBackendKind::Iptables
+    }
+
     fn apply(&mut self, snapshot: &Snapshot) -> Result<()> {
         let policy = IptablesCompiler::compile(snapshot)
             .context("failed to compile iptables compatibility policy")?;
@@ -2570,6 +2642,7 @@ fn learned_endpoint_key(endpoint: &LearnedEndpoint) -> (std::net::IpAddr, u8, u1
     (endpoint.address, protocol, port_start, port_end, interface)
 }
 
+#[cfg(test)]
 fn parse_counters(input: &[u8]) -> Result<FirewallCounters> {
     let document: Value = serde_json::from_slice(input).context("invalid nft counter JSON")?;
     parse_counters_document(&document)
@@ -2583,9 +2656,86 @@ fn nft_objects(document: &Value) -> Result<&[Value]> {
         .ok_or_else(|| anyhow!("nft JSON has no nftables array"))
 }
 
-fn verify_table(input: &[u8]) -> Result<()> {
+fn parse_nft_observation_documents(input: &[u8]) -> Result<()> {
+    visit_nft_observation_documents_bounded(input, MAX_NFT_OUTPUT_BYTES, |_, _| Ok(()))
+}
+
+fn visit_nft_observation_documents_bounded(
+    input: &[u8],
+    maximum_document_bytes: usize,
+    mut visitor: impl FnMut(&Value, &str) -> Result<()>,
+) -> Result<()> {
     ensure!(
-        openshield_table_count(input)? == 1,
+        maximum_document_bytes > 0,
+        "batched nft observation document bound is zero"
+    );
+    let maximum_batch_bytes = maximum_document_bytes
+        .checked_mul(3)
+        .ok_or_else(|| anyhow!("batched nft observation byte bound overflowed"))?;
+    ensure!(
+        input.len() <= maximum_batch_bytes,
+        "batched nft observation exceeded {maximum_batch_bytes} bytes"
+    );
+
+    let mut offset = 0_usize;
+    for kind in ["table", "chain", "counter"] {
+        let bounded_end = offset
+            .saturating_add(maximum_document_bytes)
+            .min(input.len());
+        let mut stream =
+            serde_json::Deserializer::from_slice(&input[offset..bounded_end]).into_iter::<Value>();
+        let document = stream
+            .next()
+            .ok_or_else(|| anyhow!("batched nft observation omitted the {kind} document"))?
+            .with_context(|| format!("invalid nft {kind} document in observation batch"))?;
+        let document_bytes = stream.byte_offset();
+        ensure!(
+            document_bytes > 0 && document_bytes <= maximum_document_bytes,
+            "nft {kind} observation document exceeded {maximum_document_bytes} bytes"
+        );
+        let _objects = nft_objects(&document)
+            .with_context(|| format!("invalid nft {kind} document in observation batch"))?;
+        visitor(&document, kind)?;
+        offset = offset
+            .checked_add(document_bytes)
+            .ok_or_else(|| anyhow!("batched nft observation offset overflowed"))?;
+    }
+    ensure!(
+        input[offset..]
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
+        "batched nft observation returned more than 3 JSON documents"
+    );
+    Ok(())
+}
+
+fn parse_nft_policy_observation(input: &[u8]) -> Result<FirewallCounters> {
+    let mut counters = None;
+    visit_nft_observation_documents_bounded(
+        input,
+        MAX_NFT_OUTPUT_BYTES,
+        |document, kind| match kind {
+            "table" => verify_table_document(document),
+            "chain" => verify_base_chains_document(document),
+            "counter" => {
+                counters = Some(parse_counters_document(document)?);
+                Ok(())
+            }
+            _ => bail!("unexpected nft observation document kind"),
+        },
+    )?;
+    counters.ok_or_else(|| anyhow!("batched nft observation omitted parsed counters"))
+}
+
+#[cfg(test)]
+fn verify_table(input: &[u8]) -> Result<()> {
+    let document: Value = serde_json::from_slice(input).context("invalid nft table JSON")?;
+    verify_table_document(&document)
+}
+
+fn verify_table_document(document: &Value) -> Result<()> {
+    ensure!(
+        openshield_table_count_document(document)? == 1,
         "OpenShield table declaration is missing or duplicated"
     );
     Ok(())
@@ -2593,7 +2743,11 @@ fn verify_table(input: &[u8]) -> Result<()> {
 
 fn openshield_table_count(input: &[u8]) -> Result<usize> {
     let document: Value = serde_json::from_slice(input).context("invalid nft table JSON")?;
-    let objects = nft_objects(&document)?;
+    openshield_table_count_document(&document)
+}
+
+fn openshield_table_count_document(document: &Value) -> Result<usize> {
+    let objects = nft_objects(document)?;
     Ok(objects
         .iter()
         .filter_map(|object| object.get("table"))
@@ -2628,9 +2782,14 @@ fn verify_nft_ownership_counter(input: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_base_chains(input: &[u8]) -> Result<()> {
     let document: Value = serde_json::from_slice(input).context("invalid nft chain JSON")?;
-    let objects = nft_objects(&document)?;
+    verify_base_chains_document(&document)
+}
+
+fn verify_base_chains_document(document: &Value) -> Result<()> {
+    let objects = nft_objects(document)?;
     let required_chains = [
         ("input", "input", 0, "drop"),
         ("output_sanitize", "output", -1, "accept"),
@@ -2753,21 +2912,110 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::{
-        FirewallCounters, InterfaceName, LearnedEndpoint, PortRange, TransportProtocol,
-        XtablesBundle, XtablesIdentity, XtablesTools, XtablesWorld, XtablesWorldInspection,
-        add_firewall_counters, attempt_both_families, ensure_xtables_identity_unchanged,
-        inspect_xtables_world, is_expected_covered_legacy_warning, is_proven_absent_legacy_backend,
-        parse_counters, parse_learned_endpoints, parse_xtables_save, parse_xtables_world_save,
+        AutoBackend, FirewallBackend, FirewallCounters, InterfaceName, IptablesBackend,
+        LearnedEndpoint, MemoryBackend, NftBackend, PortRange, TransportProtocol, XtablesBundle,
+        XtablesIdentity, XtablesTools, XtablesWorld, XtablesWorldInspection, add_firewall_counters,
+        attempt_both_families, ensure_xtables_identity_unchanged, inspect_xtables_world,
+        is_expected_covered_legacy_warning, is_proven_absent_legacy_backend, parse_counters,
+        parse_learned_endpoints, parse_xtables_save, parse_xtables_world_save,
         parse_xtables_world_version, selected_xtables_save_args, verify_base_chains, verify_table,
         xtables_save_inspection_args, xtables_world_is_covered,
     };
     use anyhow::Result;
+    use openshield_protocol::FirewallBackendKind;
     use serde_json::{Value, json};
     use std::{
         cell::RefCell,
         collections::HashSet,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        path::PathBuf as TestPathBuf,
+        sync::{Arc, Mutex},
     };
+
+    fn inert_xtables_tools(family: &str) -> XtablesTools {
+        XtablesTools {
+            command: TestPathBuf::from(format!("/{family}tables")),
+            restore: TestPathBuf::from(format!("/{family}tables-restore")),
+            save: TestPathBuf::from(format!("/{family}tables-save")),
+        }
+    }
+
+    #[test]
+    fn production_backends_report_explicit_kinds_and_test_backend_defaults_unknown() {
+        let nft = NftBackend {
+            binary: TestPathBuf::from("/nft"),
+        };
+        let iptables = IptablesBackend {
+            ipv4: inert_xtables_tools("ip"),
+            ipv6: inert_xtables_tools("ip6"),
+            expected: Arc::new(Mutex::new(super::ExpectedXtablesPolicy::default())),
+        };
+
+        assert_eq!(nft.kind(), FirewallBackendKind::Nftables);
+        assert_eq!(iptables.kind(), FirewallBackendKind::Iptables);
+        assert_eq!(AutoBackend::Nft(nft).kind(), FirewallBackendKind::Nftables);
+        assert_eq!(
+            AutoBackend::Iptables(iptables).kind(),
+            FirewallBackendKind::Iptables
+        );
+        assert_eq!(
+            MemoryBackend::default().kind(),
+            FirewallBackendKind::Unknown
+        );
+    }
+
+    #[test]
+    fn automatic_backend_discovery_prefers_nft_and_falls_back_in_order() -> Result<()> {
+        let calls = RefCell::new(Vec::new());
+        let selected = AutoBackend::discover_with(
+            || {
+                calls.borrow_mut().push("nftables");
+                Ok(NftBackend {
+                    binary: TestPathBuf::from("/nft"),
+                })
+            },
+            || -> Result<IptablesBackend> {
+                calls.borrow_mut().push("iptables");
+                anyhow::bail!("iptables must not be probed after nftables succeeds")
+            },
+        )?;
+        assert!(matches!(selected, AutoBackend::Nft(_)));
+        assert_eq!(*calls.borrow(), ["nftables"]);
+
+        let calls = RefCell::new(Vec::new());
+        let selected = AutoBackend::discover_with(
+            || {
+                calls.borrow_mut().push("nftables");
+                anyhow::bail!("nft probe failed")
+            },
+            || {
+                calls.borrow_mut().push("iptables");
+                Ok(IptablesBackend {
+                    ipv4: inert_xtables_tools("ip"),
+                    ipv6: inert_xtables_tools("ip6"),
+                    expected: Arc::new(Mutex::new(super::ExpectedXtablesPolicy::default())),
+                })
+            },
+        )?;
+        assert!(matches!(selected, AutoBackend::Iptables(_)));
+        assert_eq!(*calls.borrow(), ["nftables", "iptables"]);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_backend_discovery_reports_both_probe_failures() -> Result<()> {
+        let result = AutoBackend::discover_with(
+            || anyhow::bail!("nft capability rejected"),
+            || anyhow::bail!("xtables capability rejected"),
+        );
+        let error = result
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("both rejected backends must fail discovery"))?;
+        let message = format!("{error:#}");
+        assert!(message.contains("nft capability rejected"), "{message}");
+        assert!(message.contains("xtables capability rejected"), "{message}");
+        Ok(())
+    }
 
     fn learning_set(name: &str, data_types: &[&str], elements: Option<Value>) -> Value {
         let mut object = json!({"set": {
@@ -2892,6 +3140,56 @@ mod tests {
     }
 
     #[test]
+    fn nft_query_preflight_requires_three_well_formed_json_documents() -> Result<()> {
+        let empty = r#"{"nftables":[]}"#;
+        super::parse_nft_observation_documents(format!("{empty}\n{empty}\n{empty}\n").as_bytes())?;
+        assert!(
+            super::parse_nft_observation_documents(format!("{empty}\n{empty}\n").as_bytes())
+                .is_err()
+        );
+        assert!(super::parse_nft_observation_documents(b"{}\n{}\n{}\n").is_err());
+        assert!(
+            super::parse_nft_observation_documents(
+                format!("{empty}\nnot-json\n{empty}\n").as_bytes()
+            )
+            .is_err()
+        );
+        assert!(
+            super::parse_nft_observation_documents(
+                format!("{empty}\n{empty}\n{empty}\n{empty}\n").as_bytes()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nft_observation_preserves_the_original_per_document_byte_bound() -> Result<()> {
+        const TEST_DOCUMENT_BOUND: usize = 64;
+        let bounded = r#"{"nftables":[],"padding":"12345678"}"#;
+        super::visit_nft_observation_documents_bounded(
+            format!("{bounded}\n{bounded}\n{bounded}\n").as_bytes(),
+            TEST_DOCUMENT_BOUND,
+            |_, _| Ok(()),
+        )?;
+
+        let oversized = format!(
+            "{{\"nftables\":[],\"padding\":\"{}\"}}\n{bounded}\n{bounded}\n",
+            "x".repeat(48)
+        );
+        assert!(oversized.len() <= TEST_DOCUMENT_BOUND * 3);
+        assert!(
+            super::visit_nft_observation_documents_bounded(
+                oversized.as_bytes(),
+                TEST_DOCUMENT_BOUND,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parses_only_fixed_table_counters() -> Result<()> {
         let input = br#"{"nftables":[
           {"metainfo":{"json_schema_version":1}},
@@ -2961,8 +3259,14 @@ mod tests {
     #[test]
     fn observation_queries_use_nft_1_0_6_compatible_grammar() {
         assert_eq!(super::NFT_TABLE_QUERY, ["-j", "list", "tables", "inet"]);
-        assert_eq!(super::NFT_CHAIN_QUERY, ["-j", "list", "chains", "inet"]);
         assert_eq!(super::NFT_COUNTER_QUERY, ["-j", "list", "counters", "inet"]);
+        assert_eq!(
+            super::NFT_OBSERVATION_QUERY,
+            [
+                "-j",
+                "list tables inet; list chains inet; list counters inet"
+            ]
+        );
         assert_eq!(
             super::NFT_SET_QUERY_PREFIX,
             ["-j", "list", "set", "inet", "openshield"]
@@ -3003,6 +3307,35 @@ mod tests {
         ]}"#;
         verify_table(complete)?;
         verify_base_chains(complete)?;
+
+        let document: Value = serde_json::from_slice(complete)?;
+        let objects = super::nft_objects(&document)?;
+        let select = |kind: &str| {
+            json!({
+                "nftables": objects
+                    .iter()
+                    .filter(|object| object.get(kind).is_some())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let tables = select("table");
+        let chains = select("chain");
+        let counters = select("counter");
+        let observation = format!("{tables}\n{chains}\n{counters}\n");
+        assert_eq!(
+            super::parse_nft_policy_observation(observation.as_bytes())?,
+            parse_counters(complete)?
+        );
+        assert!(
+            super::parse_nft_policy_observation(
+                format!("{chains}\n{tables}\n{counters}\n").as_bytes()
+            )
+            .is_err()
+        );
+        assert!(
+            super::parse_nft_policy_observation(format!("{tables}\n{chains}\n").as_bytes())
+                .is_err()
+        );
 
         let missing_forward_hook = br#"{"nftables":[
           {"table":{"family":"inet","name":"openshield"}},

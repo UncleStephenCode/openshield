@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use openshield_core::{
     CounterValue, Direction, Event, EventKind, Mode, Rule, RuleOrigin, TransportProtocol,
 };
+use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -13,9 +14,11 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap,
     },
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, CommandMode, ConnectionState, FormField, Overlay, RuleForm, View, peer_label,
+    App, CommandMode, ConnectionState, FormField, OutboundGroupKey, Overlay, RuleForm, View,
+    peer_label,
 };
 use crate::i18n::I18n;
 
@@ -36,7 +39,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, observe_path: &Path, control_path:
     draw_tabs(frame, app, areas[0]);
     match app.view {
         View::Status => draw_status(frame, app, observe_path, control_path, areas[1]),
-        View::Rules => draw_rules(frame, app, areas[1]),
+        View::Outbound => draw_outbound_rules(frame, app, areas[1]),
+        View::Inbound => draw_inbound_rules(frame, app, areas[1]),
         View::Events => draw_events(frame, app, areas[1]),
         View::Help => draw_help(frame, app, areas[1]),
     }
@@ -45,15 +49,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, observe_path: &Path, control_path:
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let titles = [View::Status, View::Rules, View::Events, View::Help]
-        .into_iter()
-        .map(|view| Line::from(view.title(&app.i18n)))
-        .collect::<Vec<_>>();
+    let titles = [
+        View::Status,
+        View::Outbound,
+        View::Inbound,
+        View::Events,
+        View::Help,
+    ]
+    .into_iter()
+    .map(|view| Line::from(view.title(&app.i18n)))
+    .collect::<Vec<_>>();
     let selected = match app.view {
         View::Status => 0,
-        View::Rules => 1,
-        View::Events => 2,
-        View::Help => 3,
+        View::Outbound => 1,
+        View::Inbound => 2,
+        View::Events => 3,
+        View::Help => 4,
     };
     let tabs = Tabs::new(titles)
         .select(selected)
@@ -81,6 +92,11 @@ fn draw_status(
     let connection = policy_health_span(&app.connection, i18n);
     let telemetry = telemetry_health_span(app, now, counters_age, i18n);
     let access = access_span(app.read_only, i18n);
+    let backend = match app.backend {
+        Some(openshield_protocol::FirewallBackendKind::Nftables) => "nftables",
+        Some(openshield_protocol::FirewallBackendKind::Iptables) => "iptables/ip6tables",
+        Some(openshield_protocol::FirewallBackendKind::Unknown) | None => i18n.tr("common.unknown"),
+    };
     let (mode, revision, rule_count, inbound_count) = app.snapshot.as_ref().map_or_else(
         || (i18n.tr("common.unknown").to_owned(), 0, 0, 0),
         |snapshot| {
@@ -105,12 +121,51 @@ fn draw_status(
     let inbound_count = inbound_count.to_string();
     let mut lines = vec![
         Line::from(vec![Span::raw(i18n.tr("status.policy")), connection]),
-        Line::from(vec![Span::raw(i18n.tr("status.telemetry")), telemetry]),
-        Line::from(vec![Span::raw(i18n.tr("status.access")), access]),
+        Line::from(vec![
+            Span::raw(i18n.tr("status.backend")),
+            Span::styled(backend.to_owned(), Style::default().fg(Color::Cyan)),
+        ]),
         Line::from(vec![
             Span::raw(i18n.tr("status.mode")),
             Span::styled(mode, mode_style.add_modifier(Modifier::BOLD)),
         ]),
+        Line::from(vec![
+            Span::styled(
+                i18n.tr("status.compatibility_level"),
+                compatibility_reason_style(app.runtime_compatibility.reason),
+            ),
+            Span::styled(
+                compatibility_level_label(app.runtime_compatibility.level, i18n),
+                compatibility_level_style(
+                    app.runtime_compatibility.level,
+                    app.runtime_compatibility.reason,
+                )
+                .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                i18n.tr("status.compatibility_reason"),
+                compatibility_reason_style(app.runtime_compatibility.reason),
+            ),
+            Span::styled(
+                compatibility_reason_label(app.runtime_compatibility.reason, i18n),
+                compatibility_reason_style(app.runtime_compatibility.reason),
+            ),
+        ]),
+    ];
+    // The compact 80x24 layout keeps the attested backend, mode, level and
+    // reason ahead of all optional detail. The explanatory scope is omitted
+    // there because it can wrap to several rows in translated interfaces.
+    if area.height >= 24 {
+        lines.push(Line::from(Span::styled(
+            i18n.tr("status.compatibility_scope"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.extend([
+        Line::from(vec![Span::raw(i18n.tr("status.telemetry")), telemetry]),
+        Line::from(vec![Span::raw(i18n.tr("status.access")), access]),
         Line::from(i18n.format("status.revision", &[("revision", revision.as_str())])),
         Line::from(i18n.format(
             "status.rule_counts",
@@ -125,7 +180,7 @@ fn draw_status(
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
-    ];
+    ]);
     if let Some(counters) = &app.counters {
         let age = counters_age.map_or_else(
             || i18n.tr("status.age_unknown").to_owned(),
@@ -226,11 +281,11 @@ fn telemetry_health_span(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Some(_) if counters_age.is_some() => Span::styled(
-                    i18n.tr("health.subscription_active").to_owned(),
+                    i18n.tr("health.connected").to_owned(),
                     Style::default().fg(Color::Green),
                 ),
                 _ => Span::styled(
-                    i18n.tr("health.subscription_waiting").to_owned(),
+                    i18n.tr("health.connected").to_owned(),
                     Style::default().fg(Color::Yellow),
                 ),
             }
@@ -263,102 +318,444 @@ fn access_span(read_only: bool, i18n: &I18n) -> Span<'static> {
     }
 }
 
-fn draw_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_outbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let i18n = &app.i18n;
-    let rows = app.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
-        snapshot
-            .rules
-            .iter()
-            .map(|rule| {
-                let port = rule.spec.port.map_or_else(
-                    || "—".to_owned(),
-                    |range| {
-                        if range.start() == range.end() {
-                            range.start().to_string()
-                        } else {
-                            format!("{}-{}", range.start(), range.end())
-                        }
-                    },
-                );
-                let interface = rule
-                    .spec
-                    .interface
-                    .as_ref()
-                    .map_or("—", |interface| interface.as_str());
-                let origin = match rule.spec.origin {
-                    RuleOrigin::Manual => i18n.tr("common.manual"),
-                    RuleOrigin::Learned => i18n.tr("common.learned"),
-                };
-                let style = if rule.spec.enabled {
-                    Style::default()
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                Row::new(vec![
-                    Cell::from(if rule.spec.enabled { "●" } else { "○" }),
-                    Cell::from(direction_label(rule.spec.direction, i18n)),
-                    Cell::from(protocol_label(rule.spec.protocol, i18n)),
-                    Cell::from(peer_label(rule, i18n)),
-                    Cell::from(port),
-                    Cell::from(interface.to_owned()),
-                    Cell::from(application_label(rule, i18n)),
-                    Cell::from(rule.spec.name.to_string()),
-                    Cell::from(origin),
-                ])
-                .style(style)
-            })
-            .collect::<Vec<_>>()
-    });
-
-    let header = Row::new([
+    let areas = Layout::default()
+        .direction(LayoutDirection::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(area);
+    let groups = app.outbound_groups();
+    let group_rows = groups
+        .iter()
+        .map(|group| {
+            let active = group.rules.iter().filter(|rule| rule.spec.enabled).count();
+            let state = if active == group.rules.len() {
+                "●"
+            } else if active == 0 {
+                "○"
+            } else {
+                "◐"
+            };
+            Row::new([
+                Cell::from(state),
+                Cell::from(group_kind_label(&group.key, i18n)),
+                Cell::from(group_value_label(&group.key, i18n)),
+                Cell::from(group.rules.len().to_string()),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let group_header = styled_header([
         i18n.tr("rules.column_enabled"),
-        i18n.tr("rules.column_direction"),
+        i18n.tr("rules.column_group"),
+        "",
+        i18n.tr("rules.column_count"),
+    ]);
+    let group_table = Table::new(
+        group_rows,
+        [
+            Constraint::Length(4),
+            Constraint::Length(11),
+            Constraint::Min(12),
+            Constraint::Length(6),
+        ],
+    )
+    .header(group_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(i18n.tr("rules.outbound_groups_title")),
+    )
+    .row_highlight_style(selected_style())
+    .highlight_symbol("▶ ");
+    let mut group_state = TableState::default()
+        .with_selected((!groups.is_empty()).then_some(app.selected_outbound_group_index()));
+    frame.render_stateful_widget(group_table, areas[0], &mut group_state);
+
+    let right = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(areas[1]);
+    let selected_group = groups.get(app.selected_outbound_group_index());
+    let members = selected_group.map_or(&[][..], |group| group.rules.as_slice());
+    draw_rule_table(
+        frame,
+        members,
+        (!members.is_empty()).then_some(app.selected_outbound_member_index()),
+        i18n.tr("rules.outbound_members_title"),
+        i18n.tr("editor.field_destination"),
+        right[0],
+        i18n,
+    );
+    let selected = members.get(app.selected_outbound_member_index()).copied();
+    draw_rule_details(
+        frame,
+        app,
+        selected,
+        i18n.tr("rules.empty_outbound"),
+        right[1],
+    );
+}
+
+fn draw_inbound_rules(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let i18n = &app.i18n;
+    let areas = Layout::default()
+        .direction(LayoutDirection::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    let rules = app.inbound_rules();
+    draw_rule_table(
+        frame,
+        &rules,
+        (!rules.is_empty()).then_some(app.selected_inbound_rule_index()),
+        i18n.tr("rules.inbound_title"),
+        i18n.tr("editor.field_source"),
+        areas[0],
+        i18n,
+    );
+    draw_rule_details(
+        frame,
+        app,
+        rules.get(app.selected_inbound_rule_index()).copied(),
+        i18n.tr("rules.empty_inbound"),
+        areas[1],
+    );
+}
+
+fn draw_rule_table(
+    frame: &mut Frame<'_>,
+    rules: &[&Rule],
+    selected: Option<usize>,
+    title: &str,
+    peer_header: &str,
+    area: Rect,
+    i18n: &I18n,
+) {
+    let rows = rules
+        .iter()
+        .map(|rule| rule_row(rule, i18n))
+        .collect::<Vec<_>>();
+    let header = styled_header([
+        i18n.tr("rules.column_enabled"),
         i18n.tr("rules.column_protocol"),
-        i18n.tr("rules.column_peer"),
+        peer_header,
         i18n.tr("rules.column_port"),
         i18n.tr("rules.column_interface"),
-        i18n.tr("rules.column_application"),
         i18n.tr("rules.column_name"),
-        i18n.tr("rules.column_origin"),
-    ])
-    .style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    ]);
     let table = Table::new(
         rows,
         [
             Constraint::Length(4),
             Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(20),
+            Constraint::Min(15),
             Constraint::Length(11),
             Constraint::Length(12),
-            Constraint::Length(24),
             Constraint::Min(14),
-            Constraint::Length(10),
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(i18n.tr("rules.title")),
-    )
-    .row_highlight_style(
+    .block(Block::default().borders(Borders::ALL).title(title))
+    .row_highlight_style(selected_style())
+    .highlight_symbol("▶ ");
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn rule_row(rule: &Rule, i18n: &I18n) -> Row<'static> {
+    let style = if rule.spec.enabled {
         Style::default()
-            .bg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Row::new([
+        Cell::from(if rule.spec.enabled { "●" } else { "○" }),
+        Cell::from(protocol_label(rule.spec.protocol, i18n).to_owned()),
+        Cell::from(peer_label(rule, i18n)),
+        Cell::from(port_label(rule)),
+        Cell::from(
+            rule.spec
+                .interface
+                .as_ref()
+                .map_or_else(|| "—".to_owned(), ToString::to_string),
+        ),
+        Cell::from(rule.spec.name.to_string()),
+    ])
+    .style(style)
+}
+
+fn draw_rule_details(
+    frame: &mut Frame<'_>,
+    app: &App,
+    rule: Option<&Rule>,
+    empty_message: &str,
+    area: Rect,
+) {
+    let i18n = &app.i18n;
+    let lines = rule.map_or_else(
+        || vec![Line::from(empty_message.to_owned())],
+        |rule| rule_detail_lines(rule, i18n),
+    );
+    let content_width = area.width.saturating_sub(2).max(1);
+    let lines = hard_wrap_lines(lines, content_width);
+    let content_height = lines.len();
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    let maximum = content_height.saturating_sub(visible_height);
+    let scroll = app.clamp_rule_details_scroll(maximum);
+    let title = if maximum == 0 {
+        i18n.tr("rules.details_rule_title").to_owned()
+    } else {
+        format!(
+            "{} [{}/{}]",
+            i18n.tr("rules.details_rule_title").trim(),
+            usize::from(scroll).saturating_add(1),
+            maximum.saturating_add(1)
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn rule_detail_lines(rule: &Rule, i18n: &I18n) -> Vec<Line<'static>> {
+    let origin = match rule.spec.origin {
+        RuleOrigin::Manual => i18n.tr("common.manual"),
+        RuleOrigin::Learned => i18n.tr("common.learned"),
+    };
+    let mut lines = vec![
+        detail_line(i18n.tr("rules.details_uuid"), rule.id.to_string()),
+        detail_line(i18n.tr("rules.details_name"), rule.spec.name.as_str()),
+        detail_parts(&[
+            (
+                i18n.tr("rules.details_enabled"),
+                i18n.tr(if rule.spec.enabled {
+                    "common.yes"
+                } else {
+                    "common.no"
+                }),
+            ),
+            (i18n.tr("rules.details_origin"), origin),
+            (
+                i18n.tr("rules.details_direction"),
+                direction_label(rule.spec.direction, i18n),
+            ),
+        ]),
+        detail_parts(&[
+            (
+                i18n.tr("rules.details_protocol"),
+                protocol_label(rule.spec.protocol, i18n),
+            ),
+            (
+                i18n.tr(if rule.spec.direction == Direction::Inbound {
+                    "editor.field_source"
+                } else {
+                    "editor.field_destination"
+                }),
+                peer_label(rule, i18n).as_str(),
+            ),
+            (i18n.tr("rules.details_port"), port_label(rule).as_str()),
+            (
+                i18n.tr("rules.details_interface"),
+                rule.spec
+                    .interface
+                    .as_ref()
+                    .map_or(i18n.tr("common.any"), |interface| interface.as_str()),
+            ),
+        ]),
+        detail_parts(&[
+            (
+                i18n.tr("rules.details_created"),
+                rule.created_at.to_rfc3339().as_str(),
+            ),
+            (
+                i18n.tr("rules.details_updated"),
+                rule.updated_at.to_rfc3339().as_str(),
+            ),
+        ]),
+    ];
+    let Some(application) = &rule.spec.application else {
+        lines.push(detail_line(
+            i18n.tr("rules.column_application"),
+            i18n.tr("rules.network_only"),
+        ));
+        return lines;
+    };
+    if application.metadata_redacted {
+        lines.push(detail_line(
+            i18n.tr("rules.details_metadata_redacted"),
+            i18n.tr("common.yes"),
+        ));
+        return lines;
+    }
+    lines.push(detail_line(
+        i18n.tr("rules.details_cgroup"),
+        application
+            .cgroup
+            .as_ref()
+            .map_or("—", |cgroup| cgroup.as_str()),
+    ));
+    lines.push(detail_line(
+        i18n.tr("rules.details_executable"),
+        application
+            .executable
+            .as_ref()
+            .map_or("—", |executable| executable.as_str()),
+    ));
+    let file_identity = application.executable_file.map_or_else(
+        || "—".to_owned(),
+        |file| {
+            let device = file.device.to_string();
+            let inode = file.inode.to_string();
+            let size = file.size.to_string();
+            let ctime = format!("{}.{:09}", file.ctime_seconds, file.ctime_nanoseconds);
+            i18n.format(
+                "rules.details_file_id",
+                &[
+                    ("device", device.as_str()),
+                    ("inode", inode.as_str()),
+                    ("size", size.as_str()),
+                    ("ctime", ctime.as_str()),
+                ],
+            )
+        },
+    );
+    lines.push(detail_line(
+        i18n.tr("rules.details_file_identity"),
+        file_identity,
+    ));
+    let (command_mode, arguments) = application.command_line.as_ref().map_or_else(
+        || (i18n.tr("editor.command_any").to_owned(), "—".to_owned()),
+        |command| {
+            let mode = match command.kind {
+                openshield_core::CommandLineMatch::Exact => i18n.tr("editor.command_exact"),
+                openshield_core::CommandLineMatch::Prefix => i18n.tr("editor.command_prefix"),
+            };
+            let values = command
+                .arguments
+                .iter()
+                .map(openshield_core::CommandArgument::as_str)
+                .collect::<Vec<_>>();
+            (
+                mode.to_owned(),
+                serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_owned()),
+            )
+        },
+    );
+    lines.push(detail_parts(&[
+        (i18n.tr("rules.details_command_mode"), command_mode.as_str()),
+        (i18n.tr("rules.details_arguments"), arguments.as_str()),
+    ]));
+    let uid = application
+        .uid
+        .map_or_else(|| "—".to_owned(), |uid| uid.to_string());
+    lines.push(detail_line(i18n.tr("rules.details_uid"), uid));
+    lines
+}
+
+fn detail_line(label: &str, value: impl AsRef<str>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{}: ", one_line(label)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(safe_rule_detail(value.as_ref())),
+    ])
+}
+
+fn detail_parts(parts: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(parts.len().saturating_mul(3));
+    for (index, (label, value)) in parts.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("; "));
+        }
+        spans.push(Span::styled(
+            format!("{}: ", one_line(label)),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw(safe_rule_detail(value)));
+    }
+    Line::from(spans)
+}
+
+fn hard_wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut wrapped = Vec::new();
+    for line in lines {
+        let mut current_spans = Vec::new();
+        let mut current_width = 0_usize;
+        for span in line.spans {
+            let style = span.style;
+            let mut current_text = String::new();
+            for character in span.content.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if current_width > 0 && current_width.saturating_add(character_width) > width {
+                    if !current_text.is_empty() {
+                        current_spans.push(Span::styled(std::mem::take(&mut current_text), style));
+                    }
+                    wrapped.push(Line::from(std::mem::take(&mut current_spans)));
+                    current_width = 0;
+                }
+                current_text.push(character);
+                current_width = current_width.saturating_add(character_width);
+            }
+            if !current_text.is_empty() {
+                current_spans.push(Span::styled(current_text, style));
+            }
+        }
+        if current_spans.is_empty() {
+            wrapped.push(Line::default());
+        } else {
+            wrapped.push(Line::from(current_spans));
+        }
+    }
+    wrapped
+}
+
+fn group_kind_label(key: &OutboundGroupKey<'_>, i18n: &I18n) -> String {
+    i18n.tr(match key {
+        OutboundGroupKey::Cgroup(_) => "rules.group_cgroup",
+        OutboundGroupKey::Executable(_) => "rules.group_executable",
+        OutboundGroupKey::Destination(_) => "rules.group_destination",
+    })
+    .to_owned()
+}
+
+fn group_value_label(key: &OutboundGroupKey<'_>, i18n: &I18n) -> String {
+    match key {
+        OutboundGroupKey::Cgroup(value) | OutboundGroupKey::Executable(value) => value.to_string(),
+        OutboundGroupKey::Destination(Some(value)) => value.to_string(),
+        OutboundGroupKey::Destination(None) => i18n.tr("rules.group_any_destination").to_owned(),
+    }
+}
+
+fn port_label(rule: &Rule) -> String {
+    rule.spec.port.map_or_else(
+        || "—".to_owned(),
+        |range| {
+            if range.start() == range.end() {
+                range.start().to_string()
+            } else {
+                format!("{}-{}", range.start(), range.end())
+            }
+        },
+    )
+}
+
+fn styled_header<const N: usize>(values: [&str; N]) -> Row<'_> {
+    Row::new(values).style(
+        Style::default()
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )
-    .highlight_symbol("▶ ");
-    let mut state = TableState::default().with_selected(
-        app.snapshot
-            .as_ref()
-            .filter(|snapshot| !snapshot.rules.is_empty())
-            .map(|_| app.selected_rule),
-    );
-    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn selected_style() -> Style {
+    Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn draw_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -379,22 +776,6 @@ fn draw_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
         List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
-}
-
-fn application_label(rule: &Rule, i18n: &I18n) -> String {
-    rule.spec.application.as_ref().map_or_else(
-        || i18n.tr("rules.network_only").to_owned(),
-        |selector| {
-            if selector.metadata_redacted {
-                i18n.tr("rules.application_redacted").to_owned()
-            } else {
-                selector
-                    .executable
-                    .as_ref()
-                    .map_or_else(|| i18n.tr("common.unknown").to_owned(), ToString::to_string)
-            }
-        },
-    )
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -440,8 +821,10 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let message = app.notice.as_deref().map_or_else(
         || match app.view {
             View::Status => i18n.tr("footer.status"),
-            View::Rules if app.read_only => i18n.tr("footer.rules_read_only"),
-            View::Rules => i18n.tr("footer.rules"),
+            View::Outbound if app.read_only => i18n.tr("footer.rules_read_only"),
+            View::Outbound => i18n.tr("footer.rules"),
+            View::Inbound if app.read_only => i18n.tr("footer.inbound_read_only"),
+            View::Inbound => i18n.tr("footer.inbound"),
             View::Events if matches!(app.telemetry, ConnectionState::Connected) => {
                 i18n.tr("footer.events_live")
             }
@@ -519,16 +902,11 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
 fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
     let area = centered_rect(86, 29, frame.area());
     frame.render_widget(Clear, area);
-    let fields = [
+    let mut fields = vec![
         (
             FormField::Name,
             i18n.tr("editor.field_name"),
             form.name.clone(),
-        ),
-        (
-            FormField::Direction,
-            i18n.tr("editor.field_direction"),
-            direction_label(form.direction, i18n).to_owned(),
         ),
         (
             FormField::Protocol,
@@ -537,7 +915,11 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
         ),
         (
             FormField::PeerNetwork,
-            i18n.tr("editor.field_peer"),
+            i18n.tr(if form.direction() == Direction::Inbound {
+                "editor.field_source"
+            } else {
+                "editor.field_destination"
+            }),
             form.peer_network.clone(),
         ),
         (
@@ -550,53 +932,57 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             i18n.tr("editor.field_interface"),
             form.interface.clone(),
         ),
-        (
-            FormField::Application,
-            i18n.tr("editor.field_application"),
-            if form.bind_application {
-                i18n.tr("common.yes")
-            } else {
-                i18n.tr("common.no")
-            }
-            .to_owned(),
-        ),
-        (
-            FormField::Executable,
-            i18n.tr("editor.field_executable"),
-            form.executable.clone(),
-        ),
-        (
-            FormField::CommandMode,
-            i18n.tr("editor.field_command_mode"),
-            command_mode_label(form.command_mode, i18n).to_owned(),
-        ),
-        (
-            FormField::Arguments,
-            i18n.tr("editor.field_arguments"),
-            form.arguments.clone(),
-        ),
-        (
-            FormField::Uid,
-            i18n.tr("editor.field_uid"),
-            form.uid.clone(),
-        ),
-        (
-            FormField::Cgroup,
-            i18n.tr("editor.field_cgroup"),
-            form.cgroup.clone(),
-        ),
-        (
-            FormField::Enabled,
-            i18n.tr("editor.field_enabled"),
-            if form.enabled {
-                i18n.tr("common.yes")
-            } else {
-                i18n.tr("common.no")
-            }
-            .to_owned(),
-        ),
     ];
-    let mut lines = Vec::with_capacity(fields.len() + 5);
+    if form.direction() == Direction::Outbound {
+        fields.extend([
+            (
+                FormField::Application,
+                i18n.tr("editor.field_application"),
+                if form.bind_application {
+                    i18n.tr("common.yes")
+                } else {
+                    i18n.tr("common.no")
+                }
+                .to_owned(),
+            ),
+            (
+                FormField::Executable,
+                i18n.tr("editor.field_executable"),
+                form.executable.clone(),
+            ),
+            (
+                FormField::CommandMode,
+                i18n.tr("editor.field_command_mode"),
+                command_mode_label(form.command_mode, i18n).to_owned(),
+            ),
+            (
+                FormField::Arguments,
+                i18n.tr("editor.field_arguments"),
+                form.arguments.clone(),
+            ),
+            (
+                FormField::Uid,
+                i18n.tr("editor.field_uid"),
+                form.uid.clone(),
+            ),
+            (
+                FormField::Cgroup,
+                i18n.tr("editor.field_cgroup"),
+                form.cgroup.clone(),
+            ),
+        ]);
+    }
+    fields.push((
+        FormField::Enabled,
+        i18n.tr("editor.field_enabled"),
+        if form.enabled {
+            i18n.tr("common.yes")
+        } else {
+            i18n.tr("common.no")
+        }
+        .to_owned(),
+    ));
+    let mut lines = Vec::with_capacity(fields.len() + 6);
     lines.push(Line::from(vec![
         Span::raw(format!("{:>20}: ", i18n.tr("editor.field_origin"))),
         Span::styled(
@@ -607,8 +993,18 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
             Style::default().fg(Color::DarkGray),
         ),
     ]));
+    lines.push(Line::from(vec![
+        Span::raw(format!("{:>20}: ", i18n.tr("editor.field_direction"))),
+        Span::styled(
+            direction_label(form.direction(), i18n),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    let value_width = usize::from(area.width.saturating_sub(25).max(4));
+    let mut focus_line = 0;
     for (field, label, value) in fields {
-        let style = if form.active_field == field {
+        let is_active = form.active_field == field;
+        let style = if is_active {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
@@ -621,27 +1017,40 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
                 if value.is_empty() {
                     "—".to_owned()
                 } else {
-                    value
+                    editor_value(&value, is_active, value_width)
                 },
                 style,
             ),
         ]));
+        if is_active {
+            focus_line = lines.len().saturating_sub(1);
+            if let Some(error) = &form.error {
+                lines.push(Line::from(Span::styled(
+                    safe_rule_detail(error),
+                    Style::default().fg(Color::Red),
+                )));
+                focus_line = lines.len().saturating_sub(1);
+            }
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        i18n.tr("editor.help"),
+        i18n.tr(if form.direction() == Direction::Inbound {
+            "editor.inbound_help"
+        } else {
+            "editor.outbound_help"
+        }),
         Style::default().fg(Color::DarkGray),
     )));
-    lines.push(Line::from(Span::styled(
-        i18n.tr("editor.application_help"),
-        Style::default().fg(Color::DarkGray),
-    )));
-    if let Some(error) = &form.error {
+    if form.direction() == Direction::Outbound {
         lines.push(Line::from(Span::styled(
-            one_line(error),
-            Style::default().fg(Color::Red),
+            i18n.tr("editor.application_help"),
+            Style::default().fg(Color::DarkGray),
         )));
     }
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    let scroll = focus_line.saturating_add(1).saturating_sub(visible_height);
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -649,13 +1058,35 @@ fn draw_editor(frame: &mut Frame<'_>, form: &RuleForm, i18n: &I18n) {
                     .borders(Borders::ALL)
                     .title(if form.id.is_some() {
                         i18n.tr("editor.edit_title")
+                    } else if form.direction() == Direction::Inbound {
+                        i18n.tr("editor.new_inbound_title")
                     } else {
-                        i18n.tr("editor.new_title")
+                        i18n.tr("editor.new_outbound_title")
                     }),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll, 0)),
         area,
     );
+}
+
+fn editor_value(value: &str, show_tail: bool, maximum_chars: usize) -> String {
+    let value = safe_rule_detail(value);
+    if !show_tail || value.width() <= maximum_chars {
+        return value;
+    }
+    let tail_width = maximum_chars.saturating_sub(1);
+    let mut used_width = 0_usize;
+    let mut tail = Vec::new();
+    for character in value.chars().rev() {
+        let character_width = character.width().unwrap_or(0);
+        if used_width.saturating_add(character_width) > tail_width {
+            break;
+        }
+        used_width = used_width.saturating_add(character_width);
+        tail.push(character);
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
 }
 
 fn draw_confirmation(frame: &mut Frame<'_>, title: &str, body: &str, color: Color) {
@@ -783,6 +1214,56 @@ pub fn mode_label(mode: Mode, i18n: &I18n) -> &str {
     }
 }
 
+fn compatibility_level_label(level: CompatibilityLevel, i18n: &I18n) -> &str {
+    match level {
+        CompatibilityLevel::Unknown => i18n.tr("compatibility.level_unknown"),
+        CompatibilityLevel::KernelNative => i18n.tr("compatibility.level_kernel_native"),
+        CompatibilityLevel::ConntrackHybrid => i18n.tr("compatibility.level_conntrack_hybrid"),
+        CompatibilityLevel::Nfqueue => i18n.tr("compatibility.level_nfqueue"),
+    }
+}
+
+fn compatibility_reason_label(reason: CompatibilityReason, i18n: &I18n) -> &str {
+    match reason {
+        CompatibilityReason::Unknown => i18n.tr("compatibility.reason_unknown"),
+        CompatibilityReason::BlockAll => i18n.tr("compatibility.reason_block_all"),
+        CompatibilityReason::EmergencyBlockAll => {
+            i18n.tr("compatibility.reason_emergency_block_all")
+        }
+        CompatibilityReason::NetworkOnly => i18n.tr("compatibility.reason_network_only"),
+        CompatibilityReason::Learning => i18n.tr("compatibility.reason_learning"),
+        CompatibilityReason::ApplicationTcp => i18n.tr("compatibility.reason_application_tcp"),
+        CompatibilityReason::ApplicationPerPacket => {
+            i18n.tr("compatibility.reason_application_per_packet")
+        }
+    }
+}
+
+const fn compatibility_level_style(
+    level: CompatibilityLevel,
+    reason: CompatibilityReason,
+) -> Style {
+    let color = if matches!(reason, CompatibilityReason::EmergencyBlockAll) {
+        Color::Red
+    } else {
+        match level {
+            CompatibilityLevel::Unknown => Color::DarkGray,
+            CompatibilityLevel::KernelNative => Color::Green,
+            CompatibilityLevel::ConntrackHybrid => Color::Yellow,
+            CompatibilityLevel::Nfqueue => Color::Cyan,
+        }
+    };
+    Style::new().fg(color)
+}
+
+fn compatibility_reason_style(reason: CompatibilityReason) -> Style {
+    if matches!(reason, CompatibilityReason::EmergencyBlockAll) {
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    }
+}
+
 const fn mode_style(mode: Mode) -> Style {
     Style::new().fg(mode_color(mode))
 }
@@ -850,6 +1331,22 @@ fn one_line(value: &str) -> String {
         .collect()
 }
 
+/// Rule fields are already bounded by the core model, so preserve the whole
+/// value for the scrollable details pane while neutralizing terminal-control
+/// and bidirectional-format characters defensively.
+fn safe_rule_detail(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if crate::i18n::is_unsafe_dynamic_character(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 fn safe_multiline(value: &str) -> String {
     value
         .chars()
@@ -867,4 +1364,359 @@ fn counter_line(label: &str, value: CounterValue) -> Line<'static> {
         "  {label:<16} {:>12} / {:>16}",
         value.packets, value.bytes
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use openshield_core::{ExecutableFileId, Snapshot};
+    use openshield_protocol::{
+        CompatibilityLevel, CompatibilityReason, FirewallBackendKind, RuntimeCompatibility,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+    use crate::i18n::Locale;
+
+    #[test]
+    fn status_renders_verified_backend_instead_of_subscription_wording()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::new(true, I18n::test_english());
+        app.set_observed_snapshot(
+            Snapshot {
+                revision: 4,
+                flow_generation: 1,
+                mode: Mode::Learning,
+                rules: Vec::new(),
+            },
+            FirewallBackendKind::Nftables,
+            RuntimeCompatibility {
+                level: CompatibilityLevel::ConntrackHybrid,
+                reason: CompatibilityReason::ApplicationTcp,
+            },
+        );
+        app.connection = ConnectionState::Connected;
+        app.set_telemetry_connected();
+        let mut terminal = Terminal::new(TestBackend::new(110, 32))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                &app,
+                Path::new("/run/openshield/observe.sock"),
+                Path::new("/run/openshield/control.sock"),
+            );
+        })?;
+        let screen = buffer_text(terminal.backend());
+        assert!(screen.contains("Firewall backend: nftables"), "{screen}");
+        assert!(
+            screen.contains("Active policy path: L2 — conntrack/NFQUEUE hybrid"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Selection reason: application-bound TCP attributes new flows"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("network-only packets always stay in the kernel"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Compatibility level:"), "{screen}");
+        assert!(!screen.to_ascii_lowercase().contains("ebpf"), "{screen}");
+        assert!(!screen.to_ascii_lowercase().contains("subscription"));
+        Ok(())
+    }
+
+    #[test]
+    fn emergency_quarantine_renders_level_and_reason_in_red()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::new(true, I18n::test_english());
+        app.set_observed_snapshot(
+            Snapshot {
+                revision: 9,
+                flow_generation: 1,
+                mode: Mode::BlockAll,
+                rules: Vec::new(),
+            },
+            FirewallBackendKind::Nftables,
+            RuntimeCompatibility {
+                level: CompatibilityLevel::KernelNative,
+                reason: CompatibilityReason::EmergencyBlockAll,
+            },
+        );
+        app.connection = ConnectionState::Connected;
+        let mut terminal = Terminal::new(TestBackend::new(110, 32))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                &app,
+                Path::new("/run/openshield/observe.sock"),
+                Path::new("/run/openshield/control.sock"),
+            );
+        })?;
+
+        let red_text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::Red)
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(red_text.contains("L3 — kernel native"), "{red_text}");
+        assert!(red_text.contains("Active policy path:"), "{red_text}");
+        assert!(red_text.contains("Selection reason:"), "{red_text}");
+        assert!(
+            red_text.contains("emergency fail-closed quarantine is active"),
+            "{red_text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_status_keeps_runtime_evidence_visible_in_every_locale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for &locale in Locale::SUPPORTED {
+            let i18n = I18n::load(locale)?;
+            let expected_mode = i18n.tr("mode.enforcing").to_owned();
+            let expected_level = i18n.tr("compatibility.level_kernel_native").to_owned();
+            let reason_prefix = i18n
+                .tr("compatibility.reason_network_only")
+                .chars()
+                .take(12)
+                .collect::<String>();
+            let scope = i18n.tr("status.compatibility_scope").to_owned();
+            let mut app = App::new(true, i18n);
+            app.set_observed_snapshot(
+                Snapshot {
+                    revision: 7,
+                    flow_generation: 1,
+                    mode: Mode::Enforcing,
+                    rules: Vec::new(),
+                },
+                FirewallBackendKind::Nftables,
+                RuntimeCompatibility {
+                    level: CompatibilityLevel::KernelNative,
+                    reason: CompatibilityReason::NetworkOnly,
+                },
+            );
+            app.connection = ConnectionState::Connected;
+            app.set_telemetry_connected();
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+            terminal.draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    Path::new("/run/openshield/observe.sock"),
+                    Path::new("/run/openshield/control.sock"),
+                );
+            })?;
+            let screen = buffer_text(terminal.backend());
+            let compact = |value: &str| {
+                value
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>()
+            };
+            let compact_screen = compact(&screen);
+            for expected in [
+                "nftables",
+                expected_mode.as_str(),
+                expected_level.as_str(),
+                app.i18n.tr("status.compatibility_reason"),
+                reason_prefix.as_str(),
+            ] {
+                let compact_expected = compact(expected);
+                assert!(
+                    compact_screen.contains(&compact_expected),
+                    "missing {expected:?} in {} compact status: {screen}",
+                    locale.code(),
+                );
+            }
+            assert!(
+                !compact_screen.contains(&compact(&scope)),
+                "scope must be omitted from {} compact status: {screen}",
+                locale.code(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_and_inbound_views_render_grouping_and_complete_selectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut outbound_form = RuleForm::default();
+        outbound_form.name = "package updater".to_owned();
+        outbound_form.protocol = TransportProtocol::Tcp;
+        outbound_form.peer_network = "203.0.113.0/24".to_owned();
+        outbound_form.port = "443".to_owned();
+        outbound_form.interface = "eth0".to_owned();
+        outbound_form.bind_application = true;
+        outbound_form.executable = "/usr/bin/updater".to_owned();
+        outbound_form.command_mode = CommandMode::Exact;
+        outbound_form.arguments = r#"["updater","--channel=stable"]"#.to_owned();
+        outbound_form.uid = "1000".to_owned();
+        outbound_form.cgroup = "/system.slice/updater.service".to_owned();
+        let mut outbound_spec = outbound_form
+            .to_rule_spec(&I18n::test_english())
+            .map_err(std::io::Error::other)?;
+        outbound_spec
+            .application
+            .as_mut()
+            .ok_or("missing application selector")?
+            .executable_file = Some(ExecutableFileId {
+            device: 8,
+            inode: 42,
+            size: 12_345,
+            ctime_seconds: 1_700_000_000,
+            ctime_nanoseconds: 123,
+        });
+        outbound_spec.validate()?;
+        let outbound = Rule::new(outbound_spec)?;
+        let mut inbound_form = RuleForm::for_direction(Direction::Inbound);
+        inbound_form.name = "https ingress".to_owned();
+        inbound_form.protocol = TransportProtocol::Tcp;
+        inbound_form.peer_network = "198.51.100.0/24".to_owned();
+        inbound_form.port = "8443".to_owned();
+        inbound_form.interface = "ens3".to_owned();
+        let inbound = Rule::new(
+            inbound_form
+                .to_rule_spec(&I18n::test_english())
+                .map_err(std::io::Error::other)?,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::Enforcing,
+            rules: vec![inbound, outbound],
+        });
+        app.view = View::Outbound;
+        let mut terminal = Terminal::new(TestBackend::new(180, 45))?;
+        terminal.draw(|frame| {
+            draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+        })?;
+        let outbound_screen = buffer_text(terminal.backend());
+        for expected in [
+            "/system.slice/updater.service",
+            "203.0.113.0/24",
+            "443",
+            "/usr/bin/updater",
+            "--channel=stable",
+            "12345 B",
+            "1000",
+        ] {
+            assert!(
+                outbound_screen.contains(expected),
+                "missing {expected}: {outbound_screen}"
+            );
+        }
+
+        app.view = View::Inbound;
+        terminal.draw(|frame| {
+            draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+        })?;
+        let inbound_screen = buffer_text(terminal.backend());
+        for expected in ["https ingress", "198.51.100.0/24", "8443", "ens3"] {
+            assert!(
+                inbound_screen.contains(expected),
+                "missing {expected}: {inbound_screen}"
+            );
+        }
+        assert!(!inbound_screen.contains("/usr/bin/updater"));
+        Ok(())
+    }
+
+    #[test]
+    fn long_rule_details_are_preserved_and_scroll_to_the_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut form = RuleForm::default();
+        form.name = "long command".to_owned();
+        form.protocol = TransportProtocol::Tcp;
+        form.peer_network = "203.0.113.7".to_owned();
+        form.bind_application = true;
+        form.executable = "/usr/bin/long-command".to_owned();
+        form.command_mode = CommandMode::Exact;
+        let mut arguments = (0..7)
+            .map(|index| format!("{index}-{}", "x".repeat(900)))
+            .collect::<Vec<_>>();
+        arguments.push(format!("7-{}ARGTAIL", "y".repeat(880)));
+        form.arguments = serde_json::to_string(&arguments)?;
+        let rule = Rule::new(
+            form.to_rule_spec(&I18n::test_english())
+                .map_err(std::io::Error::other)?,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Enforcing,
+            rules: vec![rule],
+        });
+        for _ in 0..1_000 {
+            app.scroll_rule_details(false);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| {
+            draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+        })?;
+        let screen = buffer_text(terminal.backend());
+        assert!(screen.contains("ARGTAIL"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn common_terminal_sizes_render_every_view_without_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (width, height) in [(80, 24), (40, 10)] {
+            let mut app = App::new(true, I18n::test_english());
+            for view in [
+                View::Status,
+                View::Outbound,
+                View::Inbound,
+                View::Events,
+                View::Help,
+            ] {
+                app.view = view;
+                let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+                terminal.draw(|frame| {
+                    draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn editor_keeps_active_value_tail_and_error_visible_in_small_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut form = RuleForm::default();
+        form.active_field = FormField::Executable;
+        form.bind_application = true;
+        form.executable = "/very/long/executable/path/whose/end/is/important/TAIL".to_owned();
+        form.error = Some("VALIDATION ERROR".to_owned());
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.overlay = Overlay::Editor(Box::new(form));
+        let mut terminal = Terminal::new(TestBackend::new(40, 10))?;
+        terminal.draw(|frame| {
+            draw(frame, &app, Path::new("/observe"), Path::new("/control"));
+        })?;
+        let screen = buffer_text(terminal.backend());
+        assert!(screen.contains("TAIL"), "{screen}");
+        assert!(screen.contains("VALIDATION ERROR"), "{screen}");
+        Ok(())
+    }
+
+    fn buffer_text(backend: &TestBackend) -> String {
+        backend
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
 }

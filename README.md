@@ -2,6 +2,8 @@
 
 # OpenShield
 
+Current source release: **v0.2.0**.
+
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
 daemon prefers nftables and automatically falls back to a complete
@@ -59,6 +61,60 @@ immutable current-policy admission index also keeps exact-known and saturated
 observations out of the 512-item persistence queue; only a new candidate consumes
 a queue slot.
 
+Application Learning uses a two-phase durable commit. Candidate preparation,
+admission reservation, and a pending-candidate admission index run under the
+engine lock; atomic save and file/directory `fsync` run after releasing it, so
+packet verdicts do not wait for storage latency. The pending index deduplicates
+exact observations already covered by the in-flight candidate. State and events
+are published only after the durable commit. Other privileged changes receive
+`Conflict` while it is in flight. Root `BlockAll` instead installs the kernel
+deny immediately and is serialized last, preventing the older learning write
+from restoring Learning. A recoverable save failure retains the previous state
+and pauses automatic persistence; an unsafe outcome enters fail-closed
+`BlockAll` quarantine.
+
+## Dynamic active-policy path
+
+Since OpenShield 0.1.31, the daemon reports a dynamically recomputed
+active-policy path classification in its `StatusV2` response. This is not kernel-capability
+attestation, compatibility negotiation, the policy mode, or the selected
+firewall backend. It identifies the most expensive active path required by the
+current policy. A lower-numbered value describes a more userspace-intensive
+path, not weaker enforcement and not a runtime fallback for the same policy:
+
+| Level | Reported name | Active policy path |
+| ---: | --- | --- |
+| L3 | `KernelNative` | `BlockAll`, or `Enforcing` without an enabled application-bound rule; filtering is compiled directly into the selected kernel firewall backend |
+| L2 | `ConntrackHybrid` | `Enforcing` with enabled application-bound TCP rules only; the first packet is attributed through NFQUEUE and established TCP uses the current conntrack-generation fast path |
+| L1 | `Nfqueue` | `Learning`, or `Enforcing` with an enabled application-bound UDP, ICMP, ICMPv6, or `Any` rule; otherwise-unmatched packets require per-packet userspace attribution |
+| — | `Unknown` | a legacy status response or an unverified runtime; the UI must not present it as an accelerated path |
+
+The level is deliberately a worst-case summary. Network-only packets continue
+to be handled by nftables or iptables in the kernel even when the reported
+level is L2 or L1. Rule and mode changes recompute the level from validated
+state; they do not turn a strict application selector into a broader network
+allow.
+
+An operator-selected `BlockAll` reports reason `BlockAll`. If an ambiguous
+backend or persistence outcome forces the live daemon into its read-only
+fail-closed quarantine, the same L3 kernel path is reported with the distinct
+reason `EmergencyBlockAll`; the TUI highlights it as an emergency rather than
+as a healthy accelerated state. Privileged mutations remain disabled until the
+documented recovery procedure is completed.
+
+Backend selection is a separate startup decision. The only automatic startup
+backend fallback is from nftables to the complete iptables/ip6tables bundle
+when nftables cannot be validated. Neither choice changes the active-path
+semantics. If the fail-closed NFQUEUE
+runtime cannot be made ready, startup retains `BlockAll` and exits; it never
+continues with a network-only approximation or a fail-open queue.
+
+This release does not enable an eBPF application data plane. It neither grants
+`CAP_BPF`, changes the boot command line, enrolls a MOK, nor requires a custom
+kernel module. Kernel eBPF/cgroup/LSM acceleration remains future work until its
+rule equivalence, lifecycle downgrade, packaging, and distribution-kernel tests
+can demonstrate the same fail-closed behavior.
+
 ## Application-bound outbound rules
 
 An application selector always includes a canonical executable path and a
@@ -95,6 +151,20 @@ owners, changing identity, or exhausted bounds. NFQUEUE number 1337 has no
 fail-open bypass flag. TCP authorization is tied to a persisted 30-bit policy
 generation that increases by one and is not reused before exhaustion; UDP and
 ICMP are re-attributed for every otherwise-unmatched outbound packet.
+
+Since v0.1.32, OpenShield can drain at most 32 already-ready NFQUEUE packets into one
+bounded attribution batch; it never waits to fill a batch. Each packet still
+gets an independent `SOCK_DIAG` socket lookup. Only the complete procfs owner
+enumerations are shared: one snapshot before identity capture and one after it.
+The entire batch has one absolute 250 ms deadline, and each shared snapshot has
+a global cap of 131,072 owner records across all targets. An identity may be
+reused only inside that batch for the same socket
+inode, socket UID, and capture requirements, and duplicate requests must agree
+on PID, process start time, executable path and complete file version, and UID.
+A typed timeout remains visible in NFQUEUE counters. Any ambiguity, changed
+owner snapshot, missed deadline, or exceeded bound denies the affected packet;
+there is no cross-batch identity or authorization cache, so unmatched UDP/ICMP
+traffic is attributed again in every later batch.
 
 These selectors identify observed process metadata, not all code executing in
 the process. The version pin detects ordinary in-place rewrites through size or
@@ -142,6 +212,43 @@ bounded worker and subscription queues, rate limits, server-side pagination,
 and optimistic policy revisions. A stale mutation returns `Conflict`; the TUI
 reloads state and never retries an unconfirmed change automatically.
 
+## TUI rule workflow
+
+The TUI has five top-level tabs: `1` Status, `2` Outbound, `3` Inbound,
+`4` Events, and `5` Help. `Tab` advances to the next tab. The Status tab reports
+the firewall implementation that the daemon actually selected (`nftables` or
+the `iptables`/`ip6tables` fallback), the policy mode, and the dynamically
+selected active policy path from `StatusV2`, separately from telemetry
+connection health. `Unknown` is shown explicitly for a legacy or unverified
+response; the label is not a claim about eBPF or distribution-kernel features.
+
+The Outbound tab presents rules as a two-pane view. The left pane groups them by
+the first available identity in this fixed priority order:
+
+1. exact unified-cgroup-v2 path;
+2. exact validated executable path, without command-line arguments;
+3. destination IP network (including a distinct "any destination" group).
+
+Only that one value is the group key. The right pane retains the individual
+rules and shows their protocol, destination, port or range, interface, command
+line, UID, executable file-version identity, origin, enabled state, UUID, and
+timestamps. Grouping is a presentation operation only: it never combines
+rules, changes their AND matching semantics, or turns a single-rule action into
+a group-wide policy change. `Up`/`Down` select a group and `Left`/`Right`
+select an individual rule in that group. `PageUp`/`PageDown` scroll the full
+detail pane without truncating bounded selectors. `n` creates a rule for the current
+direction, `e` edits the selected rule, `d` deletes it, and `Space` toggles only
+that selected rule.
+
+The Inbound tab is intentionally separate. It creates explicit inbound allow
+rules scoped by source network, local port or range, interface, and protocol;
+application selectors are not valid for inbound rules. Outside Block All,
+traffic not matched by an enabled inbound allow remains denied; Block All
+overrides every rule. `m` opens the mode selector from any
+tab. Mode changes and every rule mutation require root. A non-root member of
+the `openshield` group can use the same navigation for read-only monitoring,
+but receives server-redacted application identity and cannot mutate policy.
+
 ## Building
 
 Build as an unprivileged user with the pinned lock file:
@@ -170,6 +277,49 @@ of these backend sets:
 Executables are selected only from compiled absolute-path allowlists, checked
 for safe metadata, invoked with typed arguments and a cleared environment, and
 never passed through a shell.
+
+## Performance and capacity testing
+
+[`tests/perf`](tests/perf/README.md) provides a reproducible,
+container-isolated host-firewall benchmark for nftables and the iptables
+fallback. It compares a paired no-daemon baseline with network-only,
+application-bound TCP, and application-bound UDP policies in `Enforcing` and
+`Learning`. Real processes and sockets cross veth interfaces, exercising
+NFQUEUE, conntrack, and `/proc` attribution rather than simulated TCP packets.
+
+Production-like profiles cover incoming HTTP/1.1 keep-alive and short
+connections, mixed response sizes, outbound application traffic, large UDP
+streams, and many-flow high-PPS UDP. Reports include observed PPS/Mbps, CPS,
+concurrency, latency percentiles, loss/retransmits, daemon CPU/RSS, softirq,
+conntrack, NIC/NFQUEUE evidence, fail-closed probes, paired overhead, and
+sustainable points. Generator or peer saturation invalidates a result. The
+bounded release smoke runs only after functional firewall E2E; it validates
+paths and safety but is not a portable capacity claim. Configuration,
+synchronized metric documents, and pairing evidence use
+`openshield.perf.config.v2`, `openshield.perf.metrics.v3`, and
+`openshield.perf.baseline-pairing.v2`, respectively. Each exact comparison
+group uses three predetermined, independent, single-use baseline/protected
+pairs from separate pristine DUT generations. Pair order is balanced AB/BA,
+and the protected block may use only its uniquely identified adjacent
+baseline. The conservative comparison gap is the maximum separation across
+the authenticated workload interval and synchronized DUT and peer metric
+intervals; it is capped at 15 seconds for CI and 90 seconds for the
+production-like profile. Any executed invalid result row fails the report.
+
+The CI profile retains 10% relative thresholds and records every individual
+delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
+confidence bound. Under the current v0.2.0 CI policy, relative DUT-cgroup CPU
+and request/connect-latency crossings are explicitly advisory;
+relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
+p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
+safety also remain mandatory gates. The production-like profile keeps CPU and
+latency regressions blocking. A single burst has no confidence claim, but
+directly blocks throughput/PPS crossings; CPU/latency follows the profile's
+explicit action. The
+retained full v0.1.31 run was structurally valid but failed its performance
+gate. The retained full local v0.1.32 run passed its authenticated performance
+gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
+and report and is not silently promoted to v0.2.0.
 
 ## Installation and init systems
 
@@ -280,21 +430,45 @@ bits can invalidate either policy. The daemon's
 health checks are backend-specific but do not establish safe coexistence with
 arbitrary privileged ruleset editors.
 
+For nftables, the once-per-second health observation requests tables, chains,
+and counters in one fixed `nft` process and parses three ordered bounded JSON
+documents. This removes two process launches per observation without changing
+the cadence, table/base-chain/default-drop/counter checks, or fail-closed repair
+behavior. The iptables fallback retains its backend-specific full owned-chain
+comparison.
+
 ## Compatibility evidence
 
 Compatibility claims are intentionally scoped:
 
-- final Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and all 263 tests: 55 core,
-  145 daemon, 11 protocol, and 52 TUI tests. These are component tests, not a
-  live-firewall end-to-end result;
-- both final static-PIE musl binaries completed a no-network, read-only,
+- the current v0.2.0 source resolves all four workspace crates and their exact
+  internal dependency pins as `0.2.0`. The locked all-target Rust suite passed
+  350 tests with six environment-dependent live tests explicitly ignored;
+  formatting, all-target Clippy with warnings denied, and the release build
+  passed. Both local release executables report version `0.2.0`, and the release
+  matrix validates 43 binary builds, 43 packages, 86 declared platforms, 37
+  package-install jobs, and 74 firewall jobs. The GitHub release workflow for
+  v0.2.0 has not yet run;
+- local v0.1.32 verification on Rust 1.98.0 passed
+  `cargo fmt --all -- --check` and locked
+  workspace all-target clippy with warnings denied. The complete Rust suite in
+  a container passed 350 tests, with six live tests ignored by the normal run;
+  all six then passed in a separate live-test invocation. The Python
+  performance-harness suite passed 211 tests and reported one expected sandbox
+  socket skip. These are component results, not a performance-gate
+  result;
+- the locally built v0.1.32 x86-64 daemon passed the isolated openSUSE
+  Tumbleweed scenario with both nftables and the iptables fallback, including Learning,
+  TCP-only L2 and mixed UDP/TCP L1 application attribution, inbound default
+  deny and explicit allow, fail-closed shutdown, and restart with the persisted
+  policy. Both disposable container runs left the host firewall untouched;
+- both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
   `tests/compat/distros.tsv`;
-- all six service layouts passed static validation; dedicated container
+- for v0.1.28, all six service layouts passed static validation; dedicated container
   supervisor checks passed for OpenRC, SysVinit, runit, s6, and dinit, while
   systemd is checked separately rather than booted as PID 1 in that matrix;
-- `cargo check --workspace --all-targets --locked` passed for all 23 stable Rust
+- for v0.1.28, `cargo check --workspace --all-targets --locked` passed for all 23 stable Rust
   Linux targets covering x86, x86_64/amd64, ARMv5/6/7 (soft- and hard-float
   variants where Rust provides them), arm64/aarch64, and RISC-V 64 with the
   listed GNU or musl environments;
@@ -327,17 +501,21 @@ The release workflow now requires the isolated
 the 37 runtime-tested distribution/platform rows. The nftables scenario
 installs both frontends and requires nftables to win; the iptables scenario
 omits `nft` and requires the compatibility backend. Each run covers Learning,
-UDP/TCP Enforcing, application identity, an explicit inbound allow, and
-restart. These 74 configured publication gates must not be read as results
-until the corresponding workflow has completed. They run in disposable
-namespaces on a Unix-socket Docker engine, do not modify the host firewall,
-and are not production or native-hardware certification.
+TCP-only application `Enforcing` at L2 `ConntrackHybrid`, mixed UDP/TCP
+application `Enforcing` at L1 `Nfqueue`, an explicit inbound allow, and
+restart. The L2 check uses a real persistent TCP socket: its first exchange
+after the mode-generation change is attributed through NFQUEUE, then the
+daemon is paused while another exchange must complete through the established
+conntrack fast path. These 74 configured publication gates must not be read as
+results until the corresponding workflow has completed. They run in disposable
+namespaces on a Unix-socket Docker engine, do not modify the host firewall, and
+are not production or native-hardware certification.
 
 ## TUI localization
 
-The TUI embeds 31 separate JSON resources with 183 messages each: the original
-20 locales plus 11 additions. Each non-English resource is loaded as a complete
-map without merging or falling back to English. Tests verify exact key,
+The TUI embeds 31 separate JSON resources with one complete, identical key set:
+the original 20 locales plus 11 additions. Each non-English resource is loaded
+as a complete map without merging or falling back to English. Tests verify exact key,
 placeholder, and newline parity for every compiled resource; no non-English
 value is exactly equal to its English counterpart. An all-pairs regression also
 rejects bulk reuse of substantive messages across languages. The complete

@@ -23,6 +23,11 @@
 9. `BlockAll` denies forwarded traffic. `Learning` and `Enforcing` delegate it
    to the existing firewall without accepting it or providing forwarding-rule
    CRUD.
+10. Active-policy path reporting cannot turn an unverified or more expensive
+    application path into a claimed kernel fast path. Missing legacy status data
+    is `Unknown`, and an unavailable mandatory NFQUEUE runtime keeps `BlockAll`
+    active and stops startup. A live read-only emergency quarantine is reported
+    as `EmergencyBlockAll`, not as a healthy operator-selected `BlockAll`.
 
 ## Attacker model
 
@@ -83,13 +88,34 @@ are broader than firewall administration alone.
 - Network-only decisions remain in default-drop backend chains. Initial
   application decisions use the fixed NFQUEUE 1337 with no fail-open bypass flag, a
   maximum kernel queue length of 256 packets, and a 512-byte copy range.
+- `StatusV2` reports policy mode, firewall backend, and the dynamically
+  recomputed active-policy path classification as separate typed fields. It is
+  not kernel-capability attestation or fallback negotiation. The value is derived from committed
+  enabled rules: `KernelNative` only for `BlockAll` or application-free
+  `Enforcing`, `ConntrackHybrid` only for TCP-only application `Enforcing`, and
+  `Nfqueue` for `Learning` or any enabled per-packet application protocol.
+  Absent legacy data defaults to `Unknown`. This status is descriptive and
+  cannot broaden a rule. Network-only traffic stays in the kernel at every
+  known level. Failure to initialize mandatory NFQUEUE leaves the bootstrap
+  `BlockAll` policy installed and terminates the daemon instead of falling back
+  to a network-only or queue-bypass policy.
+  The only automatic startup backend fallback is nftables to the complete
+  iptables/ip6tables bundle when nftables cannot be validated.
 - The queue consumer accepts only successfully parsed TCP, UDP, ICMP echo, and
-  ICMPv6 echo traffic. It maps the kernel UID and network tuple to exactly one
-  socket inode and one owner, then repeats process start-time, socket-fd,
-  executable path, complete file-version, command-line, cgroup, and filesystem-UID
-  checks. Every attribution attempt that reaches owner resolution receives a
-  fresh bounded external PID/TID scan; there is no cross-packet process-identity
-  or authorization-result cache. The resolver scans a task's fd table only when
+  ICMPv6 echo traffic. It drains no more than 32 already-ready packets and never
+  waits to fill a batch. Every packet independently maps its kernel UID and
+  network tuple to a socket inode through `SOCK_DIAG`. One bounded external
+  PID/TID owner snapshot before identity capture and another after capture are
+  shared across the batch. One absolute 250 ms deadline covers the complete
+  operation, and each snapshot has one global cap of 131,072 owner records
+  across all targets. These bounds are not multiplied by packet count. Identity
+  capture is memoized only inside the batch for the
+  same inode, socket UID, and capture requirements. Requests sharing a socket
+  must agree on PID, process start time, executable path and complete file
+  version, and filesystem UID. The typed timeout marker is preserved for
+  NFQUEUE accounting. There is no cross-batch process-identity or
+  authorization-result cache; a later UDP/ICMP batch starts with new per-packet
+  `SOCK_DIAG` lookups and fresh owner snapshots. The resolver scans a task's fd table only when
   its filesystem UID equals the kernel socket UID; matching holders are grouped
   by TGID. When the UIDs match, the
   daemon's shared `/proc/<self>/fd` table is checked immediately before the
@@ -100,7 +126,7 @@ are broader than firewall administration alone.
   found for one task is tried first on later matching-UID tasks. Only an exact
   target link with a repeated UID check is accepted; a mismatch or read error
   falls back to a complete bounded fd-table scan, and the hint is not retained
-  across packets. The absence of a matching-UID holder, different matching TGIDs,
+  across batches. A changed before/after owner snapshot, the absence of a matching-UID holder, different matching TGIDs,
   an incomplete or unavailable live process/task scan, or candidate
   descriptor-bound exhaustion produces DROP. Sibling holder TIDs in one TGID
   count as one process only if their captured executable path/file version, argv,
@@ -112,7 +138,7 @@ are broader than firewall administration alone.
   on a TGID-leader fd table is skipped only after two bounded `stat` reads
   confirm stable zombie state `Z`; every other error, non-zombie state, or
   unconfirmed state produces DROP. Any remaining failure, ambiguity, configured
-  bound, or 250 ms procfs deadline also produces
+  bound, or the shared 250 ms procfs deadline also produces
   DROP. The policy generation is rechecked under the engine lock, which remains
   held through the backend-specific verdict and packet reinjection. nftables
   returns `NF_ACCEPT` and completes authorization in a later base chain;
@@ -168,7 +194,13 @@ are broader than firewall administration alone.
   the byte quota or a recoverable save failure discards that batch and pauses
   all automatic learning in the daemon process until a successful privileged
   mutation or restart, while retaining the previous state and active traffic
-  policy.
+  policy. Persistence is two-phase: preparation, reservation, and the pending
+  admission index run under the engine lock, while atomic save and `fsync` run
+  after releasing it. Exact pending matches are deduplicated; state and events
+  are published only after durable commit. Other privileged controls return
+  `Conflict`. Root `BlockAll` instead installs the kernel deny immediately and
+  is serialized last. Unsafe storage or base-state outcomes enter fail-closed
+  quarantine rather than publishing an uncommitted candidate.
 - Every daemon start first installs kernel `BlockAll`. Missing state is persisted
   as `Learning`; an existing saved mode is preserved. The engine increments the
   persisted nonzero 30-bit flow generation by exactly one, persists the new
@@ -208,6 +240,16 @@ are broader than firewall administration alone.
   `open_by_handle_at`.
 
 ## Residual risks
+
+- The dynamically recomputed active-policy path is a worst-case classification,
+  not a kernel feature attestation, runtime fallback negotiation for an
+  unchanged policy, or proof that every packet follows one path.
+  Since version 0.1.31, `KernelNative` means nftables/iptables policy evaluation; it
+  does not mean eBPF application attribution. This release ships no eBPF
+  application data plane and makes no `CAP_BPF`, boot-parameter, MOK, or kernel
+  module change. The procfs/NFQUEUE attribution risks below therefore remain.
+  The only automatic startup backend fallback is nftables to the complete
+  iptables/ip6tables bundle when nftables cannot be validated.
 
 - The packaged `RequiredBy=network-pre.target` relationship is created by
   `systemctl enable`; merely installing the unit does not activate it. A network
@@ -276,7 +318,9 @@ are broader than firewall administration alone.
   proportional to process/task enumeration plus the descriptor tables of tasks
   whose filesystem UID matches the socket UID. One directory walk inspects at
   most 4,096 fd entries per matching-UID task and fails if proof requires a later
-  entry; one scan admits at most 131,072 proc/task entries globally.
+  entry. Since v0.1.32, a batch performs two owner snapshots, each admitting at most
+  131,072 owner records globally across all of its targets; its single 250 ms
+  deadline bounds both scans and every intervening lookup and capture.
   Process/thread floods, a matching-UID fd flood, queue pressure, or the
   250 ms deadline can therefore deny legitimate traffic. This is an
   availability/denial-of-service risk, not a fail-open path. An incomplete live
@@ -293,6 +337,12 @@ are broader than firewall administration alone.
   PID/TID scan, introduce an authorization-result cache, or change the worst-case
   complexity. Sustained packet rates or hostile procfs cardinality can therefore
   still saturate the consumer and deny legitimate traffic.
+  The micro-batch introduced in v0.1.32 amortizes those two snapshots across at most 32
+  already-ready packets, but it deliberately retains per-packet `SOCK_DIAG`,
+  permits identity reuse only inside the current batch, and requires stable
+  before/after ownership plus mandatory-identity consensus. It reduces common-
+  case work; it is not an authorization cache and cannot remove the worst-case
+  fail-closed availability limit.
   The immutable application-policy cache removes a full-state clone from each
   packet and indexes enabled rules by complete executable file version. A lookup
   scans only the policy-ordered bucket for the observed version, rather than all
@@ -362,6 +412,10 @@ are broader than firewall administration alone.
   not complete rule bodies. A privileged targeted edit or additional allow rule
   can therefore evade detection. Such a `CAP_NET_ADMIN` peer is outside the
   unprivileged threat boundary and must not run concurrently.
+  On nftables, the three checks are requested from one fixed `nft` process and
+  parsed as ordered, bounded JSON documents. This reduces process-launch cost
+  but retains the same one-second cadence, validation coverage, and fail-closed
+  repair behavior; it does not strengthen the trust boundary against root.
 - Strict inbound filtering can block required ICMPv6 neighbour/router discovery.
   Version 0.1 has no ICMP type/code selector; operators must scope explicit
   ICMPv6 allows by link-local network and interface where possible. Application

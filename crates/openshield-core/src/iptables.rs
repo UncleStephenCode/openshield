@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use ipnet::IpNet;
 
 use crate::{
-    CompileError, Direction, MAX_FLOW_GENERATION, Mode, Rule, Snapshot, TransportProtocol,
-    application_flow_mark,
+    ApplicationInterception, CompileError, Direction, MAX_FLOW_GENERATION, Mode, Rule, Snapshot,
+    TransportProtocol, application_flow_mark,
 };
 
 pub const IPTABLES_INPUT_CHAIN: &str = "OPENSHIELD_IN";
@@ -60,9 +60,10 @@ impl IptablesCompiler {
     /// Returns [`CompileError`] when the snapshot violates a state invariant.
     pub fn compile(snapshot: &Snapshot) -> Result<IptablesPolicy, CompileError> {
         snapshot.validate()?;
+        let interception = snapshot.application_interception();
         Ok(IptablesPolicy {
-            ipv4: compile_family(snapshot, AddressFamily::Ipv4),
-            ipv6: compile_family(snapshot, AddressFamily::Ipv6),
+            ipv4: compile_family(snapshot, AddressFamily::Ipv4, interception),
+            ipv6: compile_family(snapshot, AddressFamily::Ipv6, interception),
         })
     }
 }
@@ -73,7 +74,11 @@ enum AddressFamily {
     Ipv6,
 }
 
-fn compile_family(snapshot: &Snapshot, family: AddressFamily) -> String {
+fn compile_family(
+    snapshot: &Snapshot,
+    family: AddressFamily,
+    interception: ApplicationInterception,
+) -> String {
     let mut script = String::from("*mangle\n");
     for chain in owned_mangle_chains() {
         let _infallible = writeln!(script, "-F {chain}");
@@ -98,9 +103,9 @@ fn compile_family(snapshot: &Snapshot, family: AddressFamily) -> String {
         );
     }
 
-    append_input_chain(&mut script, snapshot, family);
-    append_output_chain(&mut script, snapshot, family);
-    append_application_chains(&mut script, snapshot);
+    append_input_chain(&mut script, snapshot, family, interception);
+    append_output_chain(&mut script, snapshot, family, interception);
+    append_application_chains(&mut script, snapshot, interception);
     append_forward_chain(&mut script, snapshot.mode);
     script.push_str("COMMIT\n");
     script
@@ -130,13 +135,24 @@ pub const fn owned_mangle_chains() -> [&'static str; 1] {
     [IPTABLES_MARK_SANITIZE_CHAIN]
 }
 
-fn append_input_chain(script: &mut String, snapshot: &Snapshot, family: AddressFamily) {
+fn append_input_chain(
+    script: &mut String,
+    snapshot: &Snapshot,
+    family: AddressFamily,
+    interception: ApplicationInterception,
+) {
     if snapshot.mode != Mode::BlockAll {
         append_invalid_drop(script, IPTABLES_INPUT_CHAIN, "dropped_in");
 
-        if application_interception_required(snapshot) {
+        if interception != ApplicationInterception::None {
             let flow = application_flow_mark(snapshot.flow_generation);
-            for protocol in application_reply_protocols(family) {
+            let reply_protocols = application_reply_protocols(family);
+            let reply_protocols: &[&str] = match interception {
+                ApplicationInterception::None => &[],
+                ApplicationInterception::TcpInitial => &reply_protocols[..1],
+                ApplicationInterception::PerPacket => &reply_protocols,
+            };
+            for protocol in reply_protocols {
                 let _infallible = writeln!(
                     script,
                     "-A {IPTABLES_INPUT_CHAIN} -p {protocol} -m conntrack --ctstate ESTABLISHED --ctdir REPLY -m connmark --mark 0x{flow:08x}/0x{APPLICATION_CONNMARK_MASK:08x} -m comment --comment openshield:accepted_in -j RETURN"
@@ -150,9 +166,14 @@ fn append_input_chain(script: &mut String, snapshot: &Snapshot, family: AddressF
     append_counted_verdict(script, IPTABLES_INPUT_CHAIN, "dropped_in", "DROP");
 }
 
-fn append_output_chain(script: &mut String, snapshot: &Snapshot, family: AddressFamily) {
+fn append_output_chain(
+    script: &mut String,
+    snapshot: &Snapshot,
+    family: AddressFamily,
+    interception: ApplicationInterception,
+) {
     if snapshot.mode != Mode::BlockAll {
-        if application_interception_required(snapshot) {
+        if interception != ApplicationInterception::None {
             // iptables NF_ACCEPT terminates the current filter hook.  The
             // compatibility queue therefore returns NF_REPEAT with a
             // kernel-supplied handoff mark; these first rules consume it on
@@ -161,16 +182,18 @@ fn append_output_chain(script: &mut String, snapshot: &Snapshot, family: Address
                 script,
                 "-A {IPTABLES_OUTPUT_CHAIN} -p tcp -m mark --mark 0x{APPLICATION_HANDOFF_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x} -g {IPTABLES_APPLICATION_TCP_CHAIN}"
             );
-            for protocol in application_non_tcp_protocols(family) {
-                let _infallible = writeln!(
-                    script,
-                    "-A {IPTABLES_OUTPUT_CHAIN} -p {protocol} -m mark --mark 0x{APPLICATION_HANDOFF_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x} -g {IPTABLES_APPLICATION_PACKET_CHAIN}"
-                );
+            if interception == ApplicationInterception::PerPacket {
+                for protocol in application_non_tcp_protocols(family) {
+                    let _infallible = writeln!(
+                        script,
+                        "-A {IPTABLES_OUTPUT_CHAIN} -p {protocol} -m mark --mark 0x{APPLICATION_HANDOFF_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x} -g {IPTABLES_APPLICATION_PACKET_CHAIN}"
+                    );
+                }
             }
         }
         append_invalid_drop(script, IPTABLES_OUTPUT_CHAIN, "dropped_out");
 
-        if application_interception_required(snapshot) {
+        if interception != ApplicationInterception::None {
             let flow = application_flow_mark(snapshot.flow_generation);
             let _infallible = writeln!(
                 script,
@@ -182,34 +205,54 @@ fn append_output_chain(script: &mut String, snapshot: &Snapshot, family: Address
             // packet so another process cannot inherit a cached application
             // decision. The authenticated NFQUEUE handoff restores the
             // current generation for the corresponding inbound reply.
-            for protocol in application_non_tcp_protocols(family) {
-                let _infallible = writeln!(
-                    script,
-                    "-A {IPTABLES_OUTPUT_CHAIN} -p {protocol} -m conntrack --ctdir ORIGINAL -j CONNMARK --set-xmark 0x00000000/0x{APPLICATION_CONNMARK_MASK:08x}"
-                );
+            if interception == ApplicationInterception::PerPacket {
+                for protocol in application_non_tcp_protocols(family) {
+                    let _infallible = writeln!(
+                        script,
+                        "-A {IPTABLES_OUTPUT_CHAIN} -p {protocol} -m conntrack --ctdir ORIGINAL -j CONNMARK --set-xmark 0x00000000/0x{APPLICATION_CONNMARK_MASK:08x}"
+                    );
+                }
             }
         }
 
         append_direct_rules(script, snapshot, family, Direction::Outbound, false);
         append_reverse_rules(script, snapshot, family, Direction::Outbound);
 
-        if application_interception_required(snapshot) {
-            let _infallible = writeln!(
-                script,
-                "-A {IPTABLES_OUTPUT_CHAIN} -m conntrack --ctdir ORIGINAL -j MARK --set-xmark 0x{APPLICATION_PENDING_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x}"
-            );
-            let _infallible = writeln!(
-                script,
-                "-A {IPTABLES_OUTPUT_CHAIN} -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num {}",
-                crate::APPLICATION_QUEUE_NUMBER
-            );
+        match interception {
+            ApplicationInterception::None => {}
+            ApplicationInterception::TcpInitial => {
+                let _infallible = writeln!(
+                    script,
+                    "-A {IPTABLES_OUTPUT_CHAIN} -p tcp -m conntrack --ctdir ORIGINAL -j MARK --set-xmark 0x{APPLICATION_PENDING_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x}"
+                );
+                let _infallible = writeln!(
+                    script,
+                    "-A {IPTABLES_OUTPUT_CHAIN} -p tcp -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num {}",
+                    crate::APPLICATION_QUEUE_NUMBER
+                );
+            }
+            ApplicationInterception::PerPacket => {
+                let _infallible = writeln!(
+                    script,
+                    "-A {IPTABLES_OUTPUT_CHAIN} -m conntrack --ctdir ORIGINAL -j MARK --set-xmark 0x{APPLICATION_PENDING_DOMAIN:08x}/0x{APPLICATION_MARK_DOMAIN_MASK:08x}"
+                );
+                let _infallible = writeln!(
+                    script,
+                    "-A {IPTABLES_OUTPUT_CHAIN} -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num {}",
+                    crate::APPLICATION_QUEUE_NUMBER
+                );
+            }
         }
     }
     append_counted_verdict(script, IPTABLES_OUTPUT_CHAIN, "dropped_out", "DROP");
 }
 
-fn append_application_chains(script: &mut String, snapshot: &Snapshot) {
-    if application_interception_required(snapshot) && snapshot.mode != Mode::BlockAll {
+fn append_application_chains(
+    script: &mut String,
+    snapshot: &Snapshot,
+    interception: ApplicationInterception,
+) {
+    if interception != ApplicationInterception::None {
         let flow = application_flow_mark(snapshot.flow_generation & MAX_FLOW_GENERATION);
         let _infallible = writeln!(
             script,
@@ -218,12 +261,14 @@ fn append_application_chains(script: &mut String, snapshot: &Snapshot) {
         append_clear_reserved_mark(script, IPTABLES_APPLICATION_TCP_CHAIN);
         append_application_accept(script, IPTABLES_APPLICATION_TCP_CHAIN, snapshot.mode);
 
-        let _infallible = writeln!(
-            script,
-            "-A {IPTABLES_APPLICATION_PACKET_CHAIN} -j CONNMARK --set-xmark 0x{flow:08x}/0x{APPLICATION_CONNMARK_MASK:08x}"
-        );
-        append_clear_reserved_mark(script, IPTABLES_APPLICATION_PACKET_CHAIN);
-        append_application_accept(script, IPTABLES_APPLICATION_PACKET_CHAIN, snapshot.mode);
+        if interception == ApplicationInterception::PerPacket {
+            let _infallible = writeln!(
+                script,
+                "-A {IPTABLES_APPLICATION_PACKET_CHAIN} -j CONNMARK --set-xmark 0x{flow:08x}/0x{APPLICATION_CONNMARK_MASK:08x}"
+            );
+            append_clear_reserved_mark(script, IPTABLES_APPLICATION_PACKET_CHAIN);
+            append_application_accept(script, IPTABLES_APPLICATION_PACKET_CHAIN, snapshot.mode);
+        }
     }
 
     // Inactive application chains and any path which reaches their terminal
@@ -407,15 +452,6 @@ fn append_allow_rule(
     );
 }
 
-fn application_interception_required(snapshot: &Snapshot) -> bool {
-    snapshot.mode == Mode::Learning
-        || snapshot.rules.iter().any(|rule| {
-            rule.spec.enabled
-                && rule.spec.direction == Direction::Outbound
-                && rule.spec.application.is_some()
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -490,6 +526,53 @@ mod tests {
         Ok(())
     }
 
+    fn add_application_rule(
+        state: &mut State,
+        protocol: TransportProtocol,
+        enabled: bool,
+    ) -> Result<uuid::Uuid, Box<dyn Error>> {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .ok_or("invalid test time")?;
+        let port = match protocol {
+            TransportProtocol::Tcp => Some(PortRange::single(443)?),
+            TransportProtocol::Udp => Some(PortRange::single(53)?),
+            TransportProtocol::Any | TransportProtocol::Icmp | TransportProtocol::IcmpV6 => None,
+        };
+        let network = if protocol == TransportProtocol::IcmpV6 {
+            "2001:db8::7/128".parse()?
+        } else {
+            "203.0.113.7/32".parse()?
+        };
+        let mut spec = RuleSpec::new(
+            RuleName::new("application")?,
+            Direction::Outbound,
+            protocol,
+            Some(network),
+            port,
+            Some(InterfaceName::new("eth0")?),
+            RuleOrigin::Manual,
+            enabled,
+        )?;
+        spec.application = Some(ApplicationSelector::new(
+            Some(ApplicationPath::new("/usr/bin/openshield-iptables-test")?),
+            Some(ExecutableFileId {
+                device: 1,
+                inode: 2,
+                size: 3,
+                ctime_seconds: 4,
+                ctime_nanoseconds: 5,
+            }),
+            None,
+            Some(1_000),
+            None,
+        )?);
+        let id = uuid::Uuid::new_v4();
+        state.create_rule_at(id, spec, now)?;
+        Ok(id)
+    }
+
     #[test]
     fn block_all_has_only_terminal_drop_paths() -> Result<(), Box<dyn Error>> {
         let mut state = State::new();
@@ -532,6 +615,111 @@ mod tests {
                 .ok_or("missing application queue")?;
             assert!(handoff < queue);
             assert!(!script.contains("-m mark --mark 0x80000000/0xc0000000 -g OPENSHIELD_APP_TCP"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforcing_tcp_application_policy_has_no_non_tcp_nfqueue_path() -> Result<(), Box<dyn Error>>
+    {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.application_interception(),
+            ApplicationInterception::TcpInitial
+        );
+        let flow = application_flow_mark(snapshot.flow_generation);
+        let policy = IptablesCompiler::compile(&snapshot)?;
+
+        for (script, icmp) in [(policy.ipv4(), "icmp"), (policy.ipv6(), "ipv6-icmp")] {
+            assert_eq!(script.matches("-j NFQUEUE --queue-num 1337").count(), 1);
+            assert!(script.contains(
+                "-A OPENSHIELD_OUT -p tcp -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1337"
+            ));
+            assert!(!script.contains(
+                "-A OPENSHIELD_OUT -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1337"
+            ));
+            assert!(script.contains(&format!(
+                "-A OPENSHIELD_IN -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY -m connmark --mark 0x{flow:08x}/0x7fffffff"
+            )));
+            assert!(!script.contains(&format!(
+                "-A OPENSHIELD_IN -p udp -m conntrack --ctstate ESTABLISHED --ctdir REPLY -m connmark --mark 0x{flow:08x}/0x7fffffff"
+            )));
+            assert!(!script.contains(&format!(
+                "-A OPENSHIELD_IN -p {icmp} -m conntrack --ctstate ESTABLISHED --ctdir REPLY -m connmark --mark 0x{flow:08x}/0x7fffffff"
+            )));
+            assert!(!script.contains(
+                "-A OPENSHIELD_OUT -p udp -m mark --mark 0xc0000000/0xc0000000 -g OPENSHIELD_APP_PKT"
+            ));
+            assert!(!script.contains(&format!(
+                "-A OPENSHIELD_OUT -p {icmp} -m mark --mark 0xc0000000/0xc0000000 -g OPENSHIELD_APP_PKT"
+            )));
+            assert!(!script.contains(
+                "-A OPENSHIELD_OUT -p udp -m conntrack --ctdir ORIGINAL -j CONNMARK --set-xmark 0x00000000/0x7fffffff"
+            ));
+            assert!(script.contains(&format!(
+                "-A OPENSHIELD_APP_TCP -j CONNMARK --set-xmark 0x{flow:08x}/0x7fffffff"
+            )));
+            assert!(!script.contains(&format!(
+                "-A OPENSHIELD_APP_PKT -j CONNMARK --set-xmark 0x{flow:08x}/0x7fffffff"
+            )));
+            assert!(script.contains(
+                "-m mark ! --mark 0x00000000/0xc0000000 -j MARK --set-xmark 0x00000000/0xc0000000"
+            ));
+            assert!(script.contains(
+                "-A OPENSHIELD_APP_PKT -m comment --comment openshield:dropped_out -j DROP"
+            ));
+            assert!(!script.contains("queue-bypass"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_per_packet_rule_does_not_promote_mixed_policy_until_enabled()
+    -> Result<(), Box<dyn Error>> {
+        let mut state = State::new();
+        state.set_mode(Mode::Enforcing)?;
+        add_application_rule(&mut state, TransportProtocol::Tcp, true)?;
+        let disabled_udp = add_application_rule(&mut state, TransportProtocol::Udp, false)?;
+        add_udp_rule(&mut state, Direction::Outbound, "192.0.2.53/32")?;
+
+        let tcp_only = state.snapshot();
+        assert_eq!(
+            tcp_only.application_interception(),
+            ApplicationInterception::TcpInitial
+        );
+        let tcp_only_policy = IptablesCompiler::compile(&tcp_only)?;
+        for script in [tcp_only_policy.ipv4(), tcp_only_policy.ipv6()] {
+            assert!(script.contains(
+                "-A OPENSHIELD_OUT -p tcp -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1337"
+            ));
+            assert!(!script.contains(
+                "-A OPENSHIELD_OUT -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1337"
+            ));
+            assert!(!script.contains(
+                "-A OPENSHIELD_OUT -p udp -m mark --mark 0xc0000000/0xc0000000 -g OPENSHIELD_APP_PKT"
+            ));
+        }
+
+        state.set_rule_enabled(disabled_udp, true)?;
+        let mixed = state.snapshot();
+        assert_eq!(
+            mixed.application_interception(),
+            ApplicationInterception::PerPacket
+        );
+        let mixed_policy = IptablesCompiler::compile(&mixed)?;
+        for script in [mixed_policy.ipv4(), mixed_policy.ipv6()] {
+            assert!(script.contains(
+                "-A OPENSHIELD_OUT -m conntrack --ctdir ORIGINAL -j NFQUEUE --queue-num 1337"
+            ));
+            assert!(script.contains(
+                "-A OPENSHIELD_OUT -p udp -m conntrack --ctdir ORIGINAL -j CONNMARK --set-xmark 0x00000000/0x7fffffff"
+            ));
+            assert!(script.contains(
+                "-A OPENSHIELD_OUT -p udp -m mark --mark 0xc0000000/0xc0000000 -g OPENSHIELD_APP_PKT"
+            ));
         }
         Ok(())
     }

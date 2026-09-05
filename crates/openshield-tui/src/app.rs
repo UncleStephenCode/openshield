@@ -5,8 +5,11 @@ use openshield_core::{
     InterfaceName, MAX_APPLICATION_PATH_BYTES, MAX_CGROUP_PATH_BYTES, MAX_COMMAND_LINE_BYTES, Mode,
     PortRange, Rule, RuleName, RuleOrigin, RuleSpec, Snapshot, TransportProtocol,
 };
-use openshield_protocol::ControlRequest;
-use std::collections::VecDeque;
+use openshield_protocol::{ControlRequest, FirewallBackendKind, RuntimeCompatibility};
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -25,7 +28,8 @@ const MAX_ARGUMENTS_JSON_BYTES: usize = MAX_COMMAND_LINE_BYTES * 3;
 pub enum View {
     #[default]
     Status,
-    Rules,
+    Outbound,
+    Inbound,
     Events,
     Help,
 }
@@ -34,7 +38,8 @@ impl View {
     pub fn title(self, i18n: &I18n) -> &str {
         match self {
             Self::Status => i18n.tr("view.status"),
-            Self::Rules => i18n.tr("view.rules"),
+            Self::Outbound => i18n.tr("view.outbound"),
+            Self::Inbound => i18n.tr("view.inbound"),
             Self::Events => i18n.tr("view.events"),
             Self::Help => i18n.tr("view.help"),
         }
@@ -42,8 +47,9 @@ impl View {
 
     pub const fn next(self) -> Self {
         match self {
-            Self::Status => Self::Rules,
-            Self::Rules => Self::Events,
+            Self::Status => Self::Outbound,
+            Self::Outbound => Self::Inbound,
+            Self::Inbound => Self::Events,
             Self::Events => Self::Help,
             Self::Help => Self::Status,
         }
@@ -60,7 +66,6 @@ pub enum ConnectionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormField {
     Name,
-    Direction,
     Protocol,
     PeerNetwork,
     Port,
@@ -75,41 +80,29 @@ pub enum FormField {
 }
 
 impl FormField {
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Name => Self::Direction,
-            Self::Direction => Self::Protocol,
-            Self::Protocol => Self::PeerNetwork,
-            Self::PeerNetwork => Self::Port,
-            Self::Port => Self::Interface,
-            Self::Interface => Self::Application,
-            Self::Application => Self::Executable,
-            Self::Executable => Self::CommandMode,
-            Self::CommandMode => Self::Arguments,
-            Self::Arguments => Self::Uid,
-            Self::Uid => Self::Cgroup,
-            Self::Cgroup => Self::Enabled,
-            Self::Enabled => Self::Name,
-        }
-    }
+    const OUTBOUND: &'static [Self] = &[
+        Self::Name,
+        Self::Protocol,
+        Self::PeerNetwork,
+        Self::Port,
+        Self::Interface,
+        Self::Application,
+        Self::Executable,
+        Self::CommandMode,
+        Self::Arguments,
+        Self::Uid,
+        Self::Cgroup,
+        Self::Enabled,
+    ];
 
-    pub const fn previous(self) -> Self {
-        match self {
-            Self::Name => Self::Enabled,
-            Self::Direction => Self::Name,
-            Self::Protocol => Self::Direction,
-            Self::PeerNetwork => Self::Protocol,
-            Self::Port => Self::PeerNetwork,
-            Self::Interface => Self::Port,
-            Self::Application => Self::Interface,
-            Self::Executable => Self::Application,
-            Self::CommandMode => Self::Executable,
-            Self::Arguments => Self::CommandMode,
-            Self::Uid => Self::Arguments,
-            Self::Cgroup => Self::Uid,
-            Self::Enabled => Self::Cgroup,
-        }
-    }
+    const INBOUND: &'static [Self] = &[
+        Self::Name,
+        Self::Protocol,
+        Self::PeerNetwork,
+        Self::Port,
+        Self::Interface,
+        Self::Enabled,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -135,7 +128,7 @@ pub struct RuleForm {
     pub id: Option<Uuid>,
     pub active_field: FormField,
     pub name: String,
-    pub direction: Direction,
+    direction: Direction,
     pub protocol: TransportProtocol,
     pub peer_network: String,
     pub port: String,
@@ -151,6 +144,7 @@ pub struct RuleForm {
     pub error: Option<String>,
     original_executable: Option<ApplicationPath>,
     original_executable_file: Option<ExecutableFileId>,
+    direction_lock: Option<Direction>,
 }
 
 impl Default for RuleForm {
@@ -175,11 +169,26 @@ impl Default for RuleForm {
             error: None,
             original_executable: None,
             original_executable_file: None,
+            direction_lock: None,
         }
     }
 }
 
 impl RuleForm {
+    #[must_use]
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    #[must_use]
+    pub fn for_direction(direction: Direction) -> Self {
+        Self {
+            direction,
+            direction_lock: Some(direction),
+            ..Self::default()
+        }
+    }
+
     pub fn from_rule(rule: &Rule) -> Self {
         let application = rule.spec.application.as_ref();
         let command_line = application.and_then(|selector| selector.command_line.as_ref());
@@ -234,17 +243,36 @@ impl RuleForm {
             error: None,
             original_executable: application.and_then(|selector| selector.executable.clone()),
             original_executable_file: application.and_then(|selector| selector.executable_file),
+            direction_lock: Some(rule.spec.direction),
         }
     }
 
     pub fn move_next(&mut self) {
-        self.active_field = self.active_field.next();
+        self.move_field(false);
         self.error = None;
     }
 
     pub fn move_previous(&mut self) {
-        self.active_field = self.active_field.previous();
+        self.move_field(true);
         self.error = None;
+    }
+
+    fn move_field(&mut self, reverse: bool) {
+        let fields = if self.direction == Direction::Inbound {
+            FormField::INBOUND
+        } else {
+            FormField::OUTBOUND
+        };
+        let position = fields
+            .iter()
+            .position(|field| *field == self.active_field)
+            .unwrap_or(0);
+        let next = if reverse {
+            position.checked_sub(1).unwrap_or(fields.len() - 1)
+        } else {
+            (position + 1) % fields.len()
+        };
+        self.active_field = fields[next];
     }
 
     pub fn insert_char(&mut self, character: char) {
@@ -263,8 +291,7 @@ impl RuleForm {
                 return;
             }
             FormField::Cgroup => (&mut self.cgroup, MAX_CGROUP_PATH_BYTES),
-            FormField::Direction
-            | FormField::Protocol
+            FormField::Protocol
             | FormField::Application
             | FormField::CommandMode
             | FormField::Enabled => return,
@@ -304,8 +331,7 @@ impl RuleForm {
             FormField::Cgroup => {
                 self.cgroup.pop();
             }
-            FormField::Direction
-            | FormField::Protocol
+            FormField::Protocol
             | FormField::Application
             | FormField::CommandMode
             | FormField::Enabled => return,
@@ -315,16 +341,23 @@ impl RuleForm {
 
     pub fn cycle_choice(&mut self, reverse: bool) {
         match self.active_field {
-            FormField::Direction => {
-                self.direction = match self.direction {
-                    Direction::Inbound => Direction::Outbound,
-                    Direction::Outbound => Direction::Inbound,
-                };
-            }
             FormField::Protocol => {
                 self.protocol = cycle_protocol(self.protocol, reverse);
             }
-            FormField::Application => self.bind_application = !self.bind_application,
+            FormField::Application => {
+                self.bind_application = !self.bind_application;
+                if !self.bind_application {
+                    // Hidden selector fields must never survive this explicit
+                    // switch and silently broaden a rule on save.
+                    self.executable.clear();
+                    self.command_mode = CommandMode::Any;
+                    self.arguments.clear();
+                    self.uid.clear();
+                    self.cgroup.clear();
+                    self.original_executable = None;
+                    self.original_executable_file = None;
+                }
+            }
             FormField::CommandMode => {
                 self.command_mode = self.command_mode.cycle(reverse);
             }
@@ -342,6 +375,15 @@ impl RuleForm {
     }
 
     pub fn to_rule_spec(&self, i18n: &I18n) -> Result<RuleSpec, String> {
+        if self
+            .direction_lock
+            .is_some_and(|direction| direction != self.direction)
+        {
+            return Err(i18n.format(
+                "validation.invalid_rule",
+                &[("error", i18n.tr("editor.field_direction"))],
+            ));
+        }
         let name = self.name.trim();
         if name.is_empty() {
             return Err(i18n.tr("validation.name_empty").to_owned());
@@ -402,6 +444,16 @@ impl RuleForm {
 
     fn parse_application(&self, i18n: &I18n) -> Result<Option<ApplicationSelector>, String> {
         if !self.bind_application {
+            let has_hidden_selector = !self.executable.trim().is_empty()
+                || self.command_mode != CommandMode::Any
+                || !self.arguments.trim().is_empty()
+                || !self.uid.trim().is_empty()
+                || !self.cgroup.trim().is_empty()
+                || self.original_executable.is_some()
+                || self.original_executable_file.is_some();
+            if has_hidden_selector {
+                return Err(i18n.tr("validation.application_fields_disabled").to_owned());
+            }
             return Ok(None);
         }
         if self.direction != Direction::Outbound {
@@ -545,6 +597,140 @@ fn parse_port_range(value: &str, i18n: &I18n) -> Result<Option<PortRange>, Strin
     })
 }
 
+/// Stable, non-localized identity of an outbound rule group.
+///
+/// The variant order is the grouping priority. Command-line arguments and all
+/// other application selectors intentionally remain member details and never
+/// split an executable group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutboundGroupKey<'a> {
+    Cgroup(Cow<'a, str>),
+    Executable(Cow<'a, str>),
+    Destination(Option<IpNet>),
+}
+
+impl<'a> OutboundGroupKey<'a> {
+    #[must_use]
+    pub fn from_rule(rule: &'a Rule) -> Option<Self> {
+        if rule.spec.direction != Direction::Outbound {
+            return None;
+        }
+        if let Some(application) = rule
+            .spec
+            .application
+            .as_ref()
+            .filter(|application| !application.metadata_redacted)
+        {
+            if let Some(cgroup) = &application.cgroup {
+                return Some(Self::Cgroup(Cow::Borrowed(cgroup.as_str())));
+            }
+            if let Some(executable) = &application.executable {
+                return Some(Self::Executable(Cow::Borrowed(executable.as_str())));
+            }
+        }
+        Some(Self::Destination(
+            rule.spec.peer_network.map(|network| network.trunc()),
+        ))
+    }
+
+    const fn rank(&self) -> u8 {
+        match self {
+            Self::Cgroup(_) => 0,
+            Self::Executable(_) => 1,
+            Self::Destination(Some(_)) => 2,
+            Self::Destination(None) => 3,
+        }
+    }
+
+    fn to_owned_key(&self) -> OutboundGroupKey<'static> {
+        match self {
+            Self::Cgroup(value) => OutboundGroupKey::Cgroup(Cow::Owned(value.to_string())),
+            Self::Executable(value) => OutboundGroupKey::Executable(Cow::Owned(value.to_string())),
+            Self::Destination(network) => OutboundGroupKey::Destination(*network),
+        }
+    }
+
+    fn same_identity(&self, other: &OutboundGroupKey<'_>) -> bool {
+        match (self, other) {
+            (Self::Cgroup(left), OutboundGroupKey::Cgroup(right))
+            | (Self::Executable(left), OutboundGroupKey::Executable(right)) => left == right,
+            (Self::Destination(left), OutboundGroupKey::Destination(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Ord for OutboundGroupKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| match (self, other) {
+                (Self::Cgroup(left), Self::Cgroup(right))
+                | (Self::Executable(left), Self::Executable(right)) => left.cmp(right),
+                (Self::Destination(Some(left)), Self::Destination(Some(right))) => left.cmp(right),
+                _ => Ordering::Equal,
+            })
+    }
+}
+
+impl PartialOrd for OutboundGroupKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug)]
+pub struct OutboundGroup<'a> {
+    pub key: OutboundGroupKey<'a>,
+    pub rules: Vec<&'a Rule>,
+}
+
+fn protocol_rank(protocol: TransportProtocol) -> u8 {
+    match protocol {
+        TransportProtocol::Any => 0,
+        TransportProtocol::Tcp => 1,
+        TransportProtocol::Udp => 2,
+        TransportProtocol::Icmp => 3,
+        TransportProtocol::IcmpV6 => 4,
+    }
+}
+
+fn compare_rule_members(left: &Rule, right: &Rule) -> Ordering {
+    left.spec
+        .peer_network
+        .cmp(&right.spec.peer_network)
+        .then_with(|| protocol_rank(left.spec.protocol).cmp(&protocol_rank(right.spec.protocol)))
+        .then_with(|| {
+            left.spec
+                .port
+                .map(|port| (port.start(), port.end()))
+                .cmp(&right.spec.port.map(|port| (port.start(), port.end())))
+        })
+        .then_with(|| {
+            left.spec
+                .interface
+                .as_ref()
+                .map(InterfaceName::as_str)
+                .cmp(&right.spec.interface.as_ref().map(InterfaceName::as_str))
+        })
+        .then_with(|| left.spec.name.as_str().cmp(right.spec.name.as_str()))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn compare_inbound_rules(left: &Rule, right: &Rule) -> Ordering {
+    protocol_rank(left.spec.protocol)
+        .cmp(&protocol_rank(right.spec.protocol))
+        .then_with(|| {
+            left.spec
+                .port
+                .map(|port| (port.start(), port.end()))
+                .cmp(&right.spec.port.map(|port| (port.start(), port.end())))
+        })
+        .then_with(|| left.spec.peer_network.cmp(&right.spec.peer_network))
+        .then_with(|| left.spec.name.as_str().cmp(right.spec.name.as_str()))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
 const fn cycle_protocol(protocol: TransportProtocol, reverse: bool) -> TransportProtocol {
     match (protocol, reverse) {
         (TransportProtocol::Any, false) | (TransportProtocol::Udp, true) => TransportProtocol::Tcp,
@@ -578,9 +764,19 @@ pub struct App {
     pub connection: ConnectionState,
     pub telemetry: ConnectionState,
     pub snapshot: Option<Snapshot>,
+    rule_ids: HashSet<Uuid>,
+    pub backend: Option<FirewallBackendKind>,
+    pub runtime_compatibility: RuntimeCompatibility,
     pub counters: Option<FirewallCounters>,
     pub events: VecDeque<Event>,
-    pub selected_rule: usize,
+    selected_outbound_group: usize,
+    selected_outbound_member: usize,
+    selected_outbound_rule_id: Option<Uuid>,
+    selected_outbound_group_key: Option<OutboundGroupKey<'static>>,
+    selected_inbound_rule: usize,
+    selected_inbound_rule_id: Option<Uuid>,
+    outbound_details_scroll: Cell<u16>,
+    inbound_details_scroll: Cell<u16>,
     pub overlay: Overlay,
     pub read_only: bool,
     pub should_quit: bool,
@@ -599,9 +795,19 @@ impl App {
             connection: ConnectionState::Connecting,
             telemetry: ConnectionState::Connecting,
             snapshot: None,
+            rule_ids: HashSet::new(),
+            backend: None,
+            runtime_compatibility: RuntimeCompatibility::default(),
             counters: None,
             events: VecDeque::with_capacity(MAX_VISIBLE_EVENTS),
-            selected_rule: 0,
+            selected_outbound_group: 0,
+            selected_outbound_member: 0,
+            selected_outbound_rule_id: None,
+            selected_outbound_group_key: None,
+            selected_inbound_rule: 0,
+            selected_inbound_rule_id: None,
+            outbound_details_scroll: Cell::new(0),
+            inbound_details_scroll: Cell::new(0),
             overlay: Overlay::None,
             read_only,
             should_quit: false,
@@ -613,7 +819,21 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
+        self.set_observed_snapshot(
+            snapshot,
+            FirewallBackendKind::Unknown,
+            RuntimeCompatibility::default(),
+        );
+    }
+
+    pub fn set_observed_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+        runtime_compatibility: RuntimeCompatibility,
+    ) {
         if self
             .snapshot
             .as_ref()
@@ -621,16 +841,36 @@ impl App {
         {
             return;
         }
+        self.rule_ids = snapshot.rules.iter().map(|rule| rule.id).collect();
         self.snapshot = Some(snapshot);
+        self.backend = Some(backend);
+        self.runtime_compatibility = runtime_compatibility;
         self.clamp_rule_selection();
     }
 
+    #[cfg(test)]
     pub fn set_restarted_snapshot(&mut self, snapshot: Snapshot) {
+        self.set_restarted_observed_snapshot(
+            snapshot,
+            FirewallBackendKind::Unknown,
+            RuntimeCompatibility::default(),
+        );
+    }
+
+    pub fn set_restarted_observed_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+        runtime_compatibility: RuntimeCompatibility,
+    ) {
+        self.rule_ids = snapshot.rules.iter().map(|rule| rule.id).collect();
         self.snapshot = Some(snapshot);
+        self.backend = Some(backend);
+        self.runtime_compatibility = runtime_compatibility;
         self.counters = None;
         self.last_counters_at = None;
         self.events.clear();
-        self.selected_rule = 0;
+        self.reset_rule_selections();
         self.clamp_rule_selection();
         self.overlay = Overlay::None;
         self.pending_revision = None;
@@ -640,9 +880,12 @@ impl App {
     pub fn set_disconnected(&mut self, reason: String) {
         self.connection = ConnectionState::Disconnected(reason);
         self.snapshot = None;
+        self.rule_ids.clear();
+        self.backend = None;
+        self.runtime_compatibility = RuntimeCompatibility::default();
         self.counters = None;
         self.last_counters_at = None;
-        self.selected_rule = 0;
+        self.reset_rule_selections();
         self.pending_revision = None;
         if !matches!(self.overlay, Overlay::None | Overlay::Message { .. }) {
             self.overlay = Overlay::None;
@@ -650,8 +893,21 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub fn push_event(&mut self, event: Event) {
-        self.push_event_at(event, Instant::now());
+        if self.push_event_at(event, Instant::now()) {
+            self.clamp_rule_selection();
+        }
+    }
+
+    /// Applies one observer event without repeatedly rebuilding sorted rule
+    /// views. The observer drain reconciles selection once after the burst.
+    pub(crate) fn push_observer_event(&mut self, event: Event) -> bool {
+        self.push_event_at(event, Instant::now())
+    }
+
+    pub(crate) fn reconcile_rule_selection(&mut self) {
+        self.clamp_rule_selection();
     }
 
     pub fn set_telemetry_connected(&mut self) {
@@ -682,8 +938,17 @@ impl App {
         self.telemetry = ConnectionState::Connected;
     }
 
-    fn push_event_at(&mut self, event: Event, received_at: Instant) {
+    fn push_event_at(&mut self, event: Event, received_at: Instant) -> bool {
         self.set_telemetry_connected_at(received_at);
+        let mut policy_changed = false;
+        let changes_policy = matches!(
+            &event.kind,
+            EventKind::ModeChanged { .. }
+                | EventKind::RuleCreated { .. }
+                | EventKind::RuleUpdated { .. }
+                | EventKind::RuleDeleted { .. }
+                | EventKind::RuleEnabledChanged { .. }
+        );
         let record_event = if let EventKind::CountersUpdated { counters } = &event.kind {
             let values_changed = self.counters.as_ref() != Some(counters);
             self.counters = Some(counters.clone());
@@ -693,14 +958,6 @@ impl App {
             true
         };
         if let Some(snapshot) = &mut self.snapshot {
-            let changes_policy = matches!(
-                &event.kind,
-                EventKind::ModeChanged { .. }
-                    | EventKind::RuleCreated { .. }
-                    | EventKind::RuleUpdated { .. }
-                    | EventKind::RuleDeleted { .. }
-                    | EventKind::RuleEnabledChanged { .. }
-            );
             if changes_policy && event.revision > snapshot.revision.saturating_add(1) {
                 let first = snapshot.revision.saturating_add(1).to_string();
                 let last = event.revision.saturating_sub(1).to_string();
@@ -710,12 +967,16 @@ impl App {
                 ));
             }
             if changes_policy && event.revision > snapshot.revision {
+                // Runtime compatibility is an attestation for one exact
+                // policy. Only a structural event which advances that policy
+                // invalidates it; delayed or duplicate events must not erase
+                // a newer StatusV2 attestation.
+                self.runtime_compatibility = RuntimeCompatibility::default();
                 match &event.kind {
                     EventKind::ModeChanged { current, .. } => snapshot.mode = *current,
                     EventKind::RuleCreated { rule } => {
-                        if !snapshot.rules.iter().any(|current| current.id == rule.id) {
+                        if self.rule_ids.insert(rule.id) {
                             snapshot.rules.push(rule.clone());
-                            snapshot.rules.sort_unstable_by_key(|current| current.id);
                         }
                     }
                     EventKind::RuleUpdated { rule } | EventKind::RuleEnabledChanged { rule } => {
@@ -728,11 +989,13 @@ impl App {
                         }
                     }
                     EventKind::RuleDeleted { rule } => {
+                        self.rule_ids.remove(&rule.id);
                         snapshot.rules.retain(|current| current.id != rule.id);
                     }
                     EventKind::CountersUpdated { .. } => {}
                 }
                 snapshot.revision = event.revision;
+                policy_changed = true;
             }
         }
         if record_event {
@@ -741,18 +1004,58 @@ impl App {
             }
             self.events.push_back(event);
         }
-        self.clamp_rule_selection();
+        policy_changed
     }
 
     pub fn select_next_rule(&mut self) {
-        let len = self.rule_count();
-        if len > 0 {
-            self.selected_rule = (self.selected_rule + 1).min(len - 1);
+        match self.view {
+            View::Outbound => self.select_outbound_group(false),
+            View::Inbound => self.select_inbound_rule(false),
+            View::Status | View::Events | View::Help => {}
         }
     }
 
     pub fn select_previous_rule(&mut self) {
-        self.selected_rule = self.selected_rule.saturating_sub(1);
+        match self.view {
+            View::Outbound => self.select_outbound_group(true),
+            View::Inbound => self.select_inbound_rule(true),
+            View::Status | View::Events | View::Help => {}
+        }
+    }
+
+    pub fn select_next_group_member(&mut self) {
+        self.select_outbound_member(false);
+    }
+
+    pub fn select_previous_group_member(&mut self) {
+        self.select_outbound_member(true);
+    }
+
+    pub fn scroll_rule_details(&self, reverse: bool) {
+        let scroll = match self.view {
+            View::Outbound => &self.outbound_details_scroll,
+            View::Inbound => &self.inbound_details_scroll,
+            View::Status | View::Events | View::Help => return,
+        };
+        let current = scroll.get();
+        scroll.set(if reverse {
+            current.saturating_sub(3)
+        } else {
+            current.saturating_add(3)
+        });
+    }
+
+    #[must_use]
+    pub fn clamp_rule_details_scroll(&self, maximum: usize) -> u16 {
+        let scroll = match self.view {
+            View::Outbound => &self.outbound_details_scroll,
+            View::Inbound => &self.inbound_details_scroll,
+            View::Status | View::Events | View::Help => return 0,
+        };
+        let maximum = u16::try_from(maximum).unwrap_or(u16::MAX);
+        let clamped = scroll.get().min(maximum);
+        scroll.set(clamped);
+        clamped
     }
 
     pub fn open_mode_picker(&mut self) {
@@ -814,12 +1117,16 @@ impl App {
         if !self.require_write_access() {
             return;
         }
+        let Some(direction) = self.active_rule_direction() else {
+            self.notice = Some(self.i18n.tr("notice.no_rule_selected").to_owned());
+            return;
+        };
         let Some(snapshot) = self.snapshot.as_ref() else {
             self.notice = Some(self.i18n.tr("notice.wait_snapshot").to_owned());
             return;
         };
         self.pending_revision = Some(snapshot.revision);
-        self.overlay = Overlay::Editor(Box::default());
+        self.overlay = Overlay::Editor(Box::new(RuleForm::for_direction(direction)));
     }
 
     pub fn open_edit_rule(&mut self) {
@@ -830,7 +1137,7 @@ impl App {
             self.notice = Some(self.i18n.tr("notice.wait_snapshot").to_owned());
             return;
         };
-        let Some(rule) = snapshot.rules.get(self.selected_rule).cloned() else {
+        let Some(rule) = self.selected_rule().cloned() else {
             self.notice = Some(self.i18n.tr("notice.no_rule_selected").to_owned());
             return;
         };
@@ -880,15 +1187,15 @@ impl App {
             self.notice = Some(self.i18n.tr("notice.wait_snapshot").to_owned());
             return;
         };
-        let Some(rule) = snapshot.rules.get(self.selected_rule) else {
+        let Some((id, name)) = self
+            .selected_rule()
+            .map(|rule| (rule.id, rule.spec.name.to_string()))
+        else {
             self.notice = Some(self.i18n.tr("notice.no_rule_selected").to_owned());
             return;
         };
         self.pending_revision = Some(snapshot.revision);
-        self.overlay = Overlay::ConfirmDelete {
-            id: rule.id,
-            name: rule.spec.name.to_string(),
-        };
+        self.overlay = Overlay::ConfirmDelete { id, name };
     }
 
     pub fn confirm_delete(&mut self, confirmed: bool) -> Option<ControlRequest> {
@@ -914,14 +1221,12 @@ impl App {
             return None;
         }
         let snapshot = self.snapshot.as_ref()?;
-        snapshot
-            .rules
-            .get(self.selected_rule)
-            .map(|rule| ControlRequest::SetRuleEnabled {
-                expected_revision: snapshot.revision,
-                id: rule.id,
-                enabled: !rule.spec.enabled,
-            })
+        let rule = self.selected_rule()?;
+        Some(ControlRequest::SetRuleEnabled {
+            expected_revision: snapshot.revision,
+            id: rule.id,
+            enabled: !rule.spec.enabled,
+        })
     }
 
     pub fn close_overlay(&mut self) {
@@ -938,19 +1243,239 @@ impl App {
         }
     }
 
-    fn rule_count(&self) -> usize {
+    #[must_use]
+    pub fn outbound_groups(&self) -> Vec<OutboundGroup<'_>> {
+        let mut groups = BTreeMap::<OutboundGroupKey<'_>, Vec<&Rule>>::new();
+        if let Some(snapshot) = &self.snapshot {
+            for rule in &snapshot.rules {
+                if let Some(key) = OutboundGroupKey::from_rule(rule) {
+                    groups.entry(key).or_default().push(rule);
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(key, mut rules)| {
+                rules.sort_unstable_by(|left, right| compare_rule_members(left, right));
+                OutboundGroup { key, rules }
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn inbound_rules(&self) -> Vec<&Rule> {
+        let mut rules = self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
+            snapshot
+                .rules
+                .iter()
+                .filter(|rule| rule.spec.direction == Direction::Inbound)
+                .collect::<Vec<_>>()
+        });
+        rules.sort_unstable_by(|left, right| compare_inbound_rules(left, right));
+        rules
+    }
+
+    #[must_use]
+    pub const fn selected_outbound_group_index(&self) -> usize {
+        self.selected_outbound_group
+    }
+
+    #[must_use]
+    pub const fn selected_outbound_member_index(&self) -> usize {
+        self.selected_outbound_member
+    }
+
+    #[must_use]
+    pub const fn selected_inbound_rule_index(&self) -> usize {
+        self.selected_inbound_rule
+    }
+
+    #[must_use]
+    pub fn selected_rule(&self) -> Option<&Rule> {
+        let selected_id = match self.view {
+            View::Outbound => self.selected_outbound_rule_id,
+            View::Inbound => self.selected_inbound_rule_id,
+            View::Status | View::Events | View::Help => None,
+        }?;
         self.snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.rules.len())
+            .as_ref()?
+            .rules
+            .iter()
+            .find(|rule| rule.id == selected_id)
+    }
+
+    const fn active_rule_direction(&self) -> Option<Direction> {
+        match self.view {
+            View::Outbound => Some(Direction::Outbound),
+            View::Inbound => Some(Direction::Inbound),
+            View::Status | View::Events | View::Help => None,
+        }
+    }
+
+    fn select_outbound_group(&mut self, reverse: bool) {
+        let target = {
+            let groups = self.outbound_groups();
+            if groups.is_empty() {
+                None
+            } else {
+                let index = if reverse {
+                    self.selected_outbound_group.saturating_sub(1)
+                } else {
+                    (self.selected_outbound_group + 1).min(groups.len() - 1)
+                };
+                groups[index]
+                    .rules
+                    .first()
+                    .map(|rule| (index, groups[index].key.to_owned_key(), rule.id))
+            }
+        };
+        if let Some((index, key, id)) = target {
+            if self.selected_outbound_rule_id != Some(id) {
+                self.outbound_details_scroll.set(0);
+            }
+            self.selected_outbound_group = index;
+            self.selected_outbound_member = 0;
+            self.selected_outbound_group_key = Some(key);
+            self.selected_outbound_rule_id = Some(id);
+        }
+    }
+
+    fn select_outbound_member(&mut self, reverse: bool) {
+        let target = {
+            let groups = self.outbound_groups();
+            groups.get(self.selected_outbound_group).and_then(|group| {
+                if group.rules.is_empty() {
+                    None
+                } else {
+                    let index = if reverse {
+                        self.selected_outbound_member.saturating_sub(1)
+                    } else {
+                        (self.selected_outbound_member + 1).min(group.rules.len() - 1)
+                    };
+                    Some((index, group.rules[index].id))
+                }
+            })
+        };
+        if let Some((index, id)) = target {
+            if self.selected_outbound_rule_id != Some(id) {
+                self.outbound_details_scroll.set(0);
+            }
+            self.selected_outbound_member = index;
+            self.selected_outbound_rule_id = Some(id);
+        }
+    }
+
+    fn select_inbound_rule(&mut self, reverse: bool) {
+        let target = {
+            let rules = self.inbound_rules();
+            if rules.is_empty() {
+                None
+            } else {
+                let index = if reverse {
+                    self.selected_inbound_rule.saturating_sub(1)
+                } else {
+                    (self.selected_inbound_rule + 1).min(rules.len() - 1)
+                };
+                Some((index, rules[index].id))
+            }
+        };
+        if let Some((index, id)) = target {
+            if self.selected_inbound_rule_id != Some(id) {
+                self.inbound_details_scroll.set(0);
+            }
+            self.selected_inbound_rule = index;
+            self.selected_inbound_rule_id = Some(id);
+        }
+    }
+
+    fn reset_rule_selections(&mut self) {
+        self.selected_outbound_group = 0;
+        self.selected_outbound_member = 0;
+        self.selected_outbound_rule_id = None;
+        self.selected_outbound_group_key = None;
+        self.selected_inbound_rule = 0;
+        self.selected_inbound_rule_id = None;
+        self.outbound_details_scroll.set(0);
+        self.inbound_details_scroll.set(0);
     }
 
     fn clamp_rule_selection(&mut self) {
-        let len = self.rule_count();
-        self.selected_rule = if len == 0 {
-            0
-        } else {
-            self.selected_rule.min(len - 1)
+        let selected_id = self.selected_outbound_rule_id;
+        let selected_key = self.selected_outbound_group_key.clone();
+        let group_hint = self.selected_outbound_group;
+        let member_hint = self.selected_outbound_member;
+        let outbound = {
+            let groups = self.outbound_groups();
+            if groups.is_empty() {
+                None
+            } else {
+                let selected_position = selected_id.and_then(|id| {
+                    groups.iter().enumerate().find_map(|(group_index, group)| {
+                        group
+                            .rules
+                            .iter()
+                            .position(|rule| rule.id == id)
+                            .map(|member_index| (group_index, member_index))
+                    })
+                });
+                let (group_index, member_index) = selected_position.unwrap_or_else(|| {
+                    let group_index = selected_key
+                        .as_ref()
+                        .and_then(|key| {
+                            groups
+                                .iter()
+                                .position(|group| key.same_identity(&group.key))
+                        })
+                        .unwrap_or_else(|| group_hint.min(groups.len() - 1));
+                    let member_index = member_hint.min(groups[group_index].rules.len() - 1);
+                    (group_index, member_index)
+                });
+                Some((
+                    group_index,
+                    member_index,
+                    groups[group_index].key.to_owned_key(),
+                    groups[group_index].rules[member_index].id,
+                ))
+            }
         };
+        if let Some((group, member, key, id)) = outbound {
+            if self.selected_outbound_rule_id != Some(id) {
+                self.outbound_details_scroll.set(0);
+            }
+            self.selected_outbound_group = group;
+            self.selected_outbound_member = member;
+            self.selected_outbound_group_key = Some(key);
+            self.selected_outbound_rule_id = Some(id);
+        } else {
+            self.selected_outbound_group = 0;
+            self.selected_outbound_member = 0;
+            self.selected_outbound_group_key = None;
+            self.selected_outbound_rule_id = None;
+        }
+
+        let selected_id = self.selected_inbound_rule_id;
+        let inbound_hint = self.selected_inbound_rule;
+        let inbound = {
+            let rules = self.inbound_rules();
+            if rules.is_empty() {
+                None
+            } else {
+                let index = selected_id
+                    .and_then(|id| rules.iter().position(|rule| rule.id == id))
+                    .unwrap_or_else(|| inbound_hint.min(rules.len() - 1));
+                Some((index, rules[index].id))
+            }
+        };
+        if let Some((index, id)) = inbound {
+            if self.selected_inbound_rule_id != Some(id) {
+                self.inbound_details_scroll.set(0);
+            }
+            self.selected_inbound_rule = index;
+            self.selected_inbound_rule_id = Some(id);
+        } else {
+            self.selected_inbound_rule = 0;
+            self.selected_inbound_rule_id = None;
+        }
     }
 }
 
@@ -965,6 +1490,7 @@ pub fn peer_label(rule: &Rule, i18n: &I18n) -> String {
 mod tests {
     use chrono::Utc;
     use openshield_core::FirewallCounters;
+    use openshield_protocol::{CompatibilityLevel, CompatibilityReason};
 
     use super::*;
 
@@ -1120,6 +1646,43 @@ mod tests {
     }
 
     #[test]
+    fn disabled_application_matching_clears_and_rejects_hidden_selectors() {
+        let mut form = RuleForm {
+            name: "application rule".to_owned(),
+            active_field: FormField::Application,
+            protocol: TransportProtocol::Tcp,
+            bind_application: true,
+            executable: "/usr/bin/client".to_owned(),
+            command_mode: CommandMode::Prefix,
+            arguments: r#"["client","--safe"]"#.to_owned(),
+            uid: "1000".to_owned(),
+            cgroup: "/system.slice/client.service".to_owned(),
+            ..RuleForm::default()
+        };
+        form.cycle_choice(false);
+        assert!(!form.bind_application);
+        assert!(form.executable.is_empty());
+        assert_eq!(form.command_mode, CommandMode::Any);
+        assert!(form.arguments.is_empty());
+        assert!(form.uid.is_empty());
+        assert!(form.cgroup.is_empty());
+        assert!(form.to_rule_spec(&I18n::test_english()).is_ok());
+
+        let orphaned = RuleForm {
+            name: "unsafe broadening".to_owned(),
+            protocol: TransportProtocol::Tcp,
+            executable: "/usr/bin/client".to_owned(),
+            ..RuleForm::default()
+        };
+        assert_eq!(
+            orphaned.to_rule_spec(&I18n::test_english()),
+            Err(I18n::test_english()
+                .tr("validation.application_fields_disabled")
+                .to_owned())
+        );
+    }
+
+    #[test]
     fn form_rejects_ambiguous_or_non_string_argv() {
         let mut form = RuleForm {
             name: "invalid argv".to_owned(),
@@ -1184,6 +1747,7 @@ mod tests {
         )?;
         let rule_id = rule.id;
         let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
         app.set_snapshot(Snapshot {
             revision: 1,
             flow_generation: 1,
@@ -1223,6 +1787,7 @@ mod tests {
         )?;
         let rule_id = rule.id;
         let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
         app.set_snapshot(Snapshot {
             revision: 1,
             flow_generation: 1,
@@ -1286,7 +1851,8 @@ mod tests {
     fn rule_selection_never_underflows() {
         let mut app = App::new(false, I18n::test_english());
         app.select_previous_rule();
-        assert_eq!(app.selected_rule, 0);
+        assert_eq!(app.selected_outbound_group, 0);
+        assert_eq!(app.selected_inbound_rule, 0);
     }
 
     #[test]
@@ -1315,6 +1881,7 @@ mod tests {
     #[test]
     fn confirmed_daemon_restart_replaces_higher_revision_state() {
         let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
         app.set_snapshot(Snapshot {
             revision: 12,
             flow_generation: 1,
@@ -1488,6 +2055,7 @@ mod tests {
     #[test]
     fn disconnect_clears_stale_policy_and_cancels_mutation() {
         let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
         app.set_snapshot(Snapshot {
             revision: 4,
             flow_generation: 1,
@@ -1500,10 +2068,493 @@ mod tests {
         app.set_disconnected("daemon restarted".to_owned());
 
         assert!(app.snapshot.is_none());
+        assert!(app.backend.is_none());
         assert!(app.counters.is_none());
         assert!(app.counters_age(Instant::now()).is_none());
         assert_eq!(app.overlay, Overlay::None);
         assert!(matches!(app.connection, ConnectionState::Disconnected(_)));
+    }
+
+    #[test]
+    fn structural_event_invalidates_runtime_attestation_but_counters_do_not() {
+        let mut app = App::new(true, I18n::test_english());
+        let attested = RuntimeCompatibility {
+            level: CompatibilityLevel::KernelNative,
+            reason: CompatibilityReason::NetworkOnly,
+        };
+        app.set_observed_snapshot(
+            Snapshot {
+                revision: 2,
+                flow_generation: 1,
+                mode: Mode::Enforcing,
+                rules: Vec::new(),
+            },
+            FirewallBackendKind::Nftables,
+            attested,
+        );
+
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::CountersUpdated {
+                counters: FirewallCounters::default(),
+            },
+        });
+        assert_eq!(app.runtime_compatibility, attested);
+
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::ModeChanged {
+                previous: Mode::Enforcing,
+                current: Mode::Learning,
+            },
+        });
+        assert_eq!(app.runtime_compatibility, attested);
+
+        app.push_event(Event {
+            revision: 1,
+            occurred_at: Utc::now(),
+            kind: EventKind::ModeChanged {
+                previous: Mode::Enforcing,
+                current: Mode::Learning,
+            },
+        });
+        assert_eq!(app.runtime_compatibility, attested);
+
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::ModeChanged {
+                previous: Mode::Enforcing,
+                current: Mode::Learning,
+            },
+        });
+        assert_eq!(app.runtime_compatibility, RuntimeCompatibility::default());
+    }
+
+    #[test]
+    fn outbound_groups_use_cgroup_then_executable_then_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cgroup_a = test_rule(
+            "cgroup one",
+            Direction::Outbound,
+            Some("203.0.113.10"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            Some(r#"["client","--one"]"#),
+        )?;
+        let cgroup_b = test_rule(
+            "cgroup two",
+            Direction::Outbound,
+            Some("203.0.113.11"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            Some(r#"["client","--two"]"#),
+        )?;
+        let executable_a = test_rule(
+            "path one",
+            Direction::Outbound,
+            Some("198.51.100.1"),
+            Some("/usr/bin/fetch"),
+            None,
+            Some(r#"["fetch","--one"]"#),
+        )?;
+        let executable_b = test_rule(
+            "path two",
+            Direction::Outbound,
+            Some("198.51.100.2"),
+            Some("/usr/bin/fetch"),
+            None,
+            Some(r#"["fetch","--two"]"#),
+        )?;
+        let destination = test_rule(
+            "network",
+            Direction::Outbound,
+            Some("192.0.2.9"),
+            None,
+            None,
+            None,
+        )?;
+        let inbound = test_rule(
+            "inbound",
+            Direction::Inbound,
+            Some("192.0.2.9"),
+            None,
+            None,
+            None,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![
+                destination,
+                executable_b,
+                cgroup_a,
+                inbound,
+                executable_a,
+                cgroup_b,
+            ],
+        });
+
+        let groups = app.outbound_groups();
+        assert_eq!(groups.len(), 3);
+        assert!(matches!(
+            &groups[0].key,
+            OutboundGroupKey::Cgroup(value) if value == "/system.slice/client.service"
+        ));
+        assert_eq!(groups[0].rules.len(), 2);
+        assert!(matches!(
+            &groups[1].key,
+            OutboundGroupKey::Executable(value) if value == "/usr/bin/fetch"
+        ));
+        assert_eq!(groups[1].rules.len(), 2);
+        assert!(matches!(
+            &groups[2].key,
+            OutboundGroupKey::Destination(Some(network)) if network.to_string() == "192.0.2.9/32"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn equivalent_destination_networks_share_one_group() -> Result<(), Box<dyn std::error::Error>> {
+        let first = test_rule(
+            "first subnet spelling",
+            Direction::Outbound,
+            Some("192.0.2.1/24"),
+            None,
+            None,
+            None,
+        )?;
+        let second = test_rule(
+            "second subnet spelling",
+            Direction::Outbound,
+            Some("192.0.2.99/24"),
+            None,
+            None,
+            None,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![first, second],
+        });
+
+        let groups = app.outbound_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rules.len(), 2);
+        assert_eq!(
+            groups[0].key,
+            OutboundGroupKey::Destination(Some("192.0.2.0/24".parse()?))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_api_rejects_non_rule_views() -> Result<(), Box<dyn std::error::Error>> {
+        let rule = test_rule(
+            "outbound",
+            Direction::Outbound,
+            Some("192.0.2.1"),
+            None,
+            None,
+            None,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![rule],
+        });
+
+        assert!(app.selected_rule().is_none());
+        assert!(app.toggle_selected_rule().is_none());
+        app.open_create_rule();
+        assert_eq!(app.overlay, Overlay::None);
+        app.open_edit_rule();
+        assert_eq!(app.overlay, Overlay::None);
+        Ok(())
+    }
+
+    #[test]
+    fn redacted_application_group_falls_back_to_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rule = test_rule(
+            "private app",
+            Direction::Outbound,
+            Some("203.0.113.20"),
+            Some("/usr/bin/private"),
+            Some("/user.slice/private.scope"),
+            None,
+        )?
+        .redacted_for_observer();
+        assert!(matches!(
+            OutboundGroupKey::from_rule(&rule),
+            Some(OutboundGroupKey::Destination(Some(network)))
+                if network.to_string() == "203.0.113.20/32"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn group_key_keeps_selector_kinds_distinct_and_supports_any_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cgroup = test_rule(
+            "cgroup",
+            Direction::Outbound,
+            Some("192.0.2.1"),
+            Some("/same"),
+            Some("/same"),
+            None,
+        )?;
+        let executable = test_rule(
+            "executable",
+            Direction::Outbound,
+            Some("192.0.2.2"),
+            Some("/same"),
+            None,
+            None,
+        )?;
+        let any_destination = test_rule(
+            "any destination",
+            Direction::Outbound,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![cgroup, executable, any_destination],
+        });
+
+        let keys = app
+            .outbound_groups()
+            .into_iter()
+            .map(|group| group.key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&OutboundGroupKey::Cgroup(Cow::Borrowed("/same"))));
+        assert!(keys.contains(&OutboundGroupKey::Executable(Cow::Borrowed("/same"))));
+        assert!(keys.contains(&OutboundGroupKey::Destination(None)));
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_selection_tracks_uuid_across_insert_and_group_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = test_rule(
+            "first",
+            Direction::Outbound,
+            Some("203.0.113.20"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            None,
+        )?;
+        let second = test_rule(
+            "second",
+            Direction::Outbound,
+            Some("203.0.113.30"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            None,
+        )?;
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Outbound;
+        app.set_snapshot(Snapshot {
+            revision: 1,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: vec![first, second],
+        });
+        app.select_next_group_member();
+        let selected_id = app.selected_rule().ok_or("missing selection")?.id;
+
+        let inserted = test_rule(
+            "inserted",
+            Direction::Outbound,
+            Some("203.0.113.10"),
+            Some("/usr/bin/client"),
+            Some("/system.slice/client.service"),
+            None,
+        )?;
+        app.push_event(Event {
+            revision: 2,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleCreated { rule: inserted },
+        });
+        assert_eq!(app.selected_rule().map(|rule| rule.id), Some(selected_id));
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled { id, .. }) if id == selected_id
+        ));
+
+        let mut migrated = app.selected_rule().ok_or("missing selection")?.clone();
+        migrated
+            .spec
+            .application
+            .as_mut()
+            .ok_or("missing selector")?
+            .cgroup = Some(CgroupPath::new("/system.slice/new.service")?);
+        migrated.spec.validate()?;
+        app.push_event(Event {
+            revision: 3,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleUpdated {
+                rule: migrated.clone(),
+            },
+        });
+        assert_eq!(app.selected_rule().map(|rule| rule.id), Some(selected_id));
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled { id, .. }) if id == selected_id
+        ));
+
+        app.push_event(Event {
+            revision: 4,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleDeleted { rule: migrated },
+        });
+        assert!(
+            app.selected_rule()
+                .is_some_and(|rule| rule.id != selected_id)
+        );
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled { id, .. }) if id != selected_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_tab_edits_only_the_selected_inbound_uuid() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let outbound = test_rule(
+            "outbound",
+            Direction::Outbound,
+            Some("192.0.2.1"),
+            None,
+            None,
+            None,
+        )?;
+        let inbound_22 = test_rule(
+            "ssh",
+            Direction::Inbound,
+            Some("192.0.2.0/24"),
+            None,
+            None,
+            None,
+        )?;
+        let mut inbound_443 = test_rule(
+            "https",
+            Direction::Inbound,
+            Some("198.51.100.0/24"),
+            None,
+            None,
+            None,
+        )?;
+        inbound_443.spec.port = Some(PortRange::new(443, 443)?);
+        inbound_443.spec.validate()?;
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Inbound;
+        app.set_snapshot(Snapshot {
+            revision: 9,
+            flow_generation: 1,
+            mode: Mode::Enforcing,
+            rules: vec![outbound, inbound_443, inbound_22],
+        });
+        app.select_next_rule();
+        let selected_id = app.selected_rule().ok_or("missing inbound")?.id;
+        app.open_edit_rule();
+        assert!(matches!(
+            &app.overlay,
+            Overlay::Editor(form)
+                if form.id == Some(selected_id) && form.direction == Direction::Inbound
+        ));
+        app.close_overlay();
+        assert!(matches!(
+            app.toggle_selected_rule(),
+            Some(ControlRequest::SetRuleEnabled { id, .. }) if id == selected_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_editor_locks_direction_and_omits_application()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = App::new(false, I18n::test_english());
+        app.view = View::Inbound;
+        app.set_snapshot(Snapshot {
+            revision: 3,
+            flow_generation: 1,
+            mode: Mode::Learning,
+            rules: Vec::new(),
+        });
+        app.open_create_rule();
+        let Overlay::Editor(form) = &mut app.overlay else {
+            return Err("inbound editor did not open".into());
+        };
+        assert_eq!(form.direction, Direction::Inbound);
+        form.name = "HTTPS ingress".to_owned();
+        form.protocol = TransportProtocol::Tcp;
+        form.port = "443".to_owned();
+        for _ in 0..20 {
+            form.move_next();
+            assert!(!matches!(
+                form.active_field,
+                FormField::Application
+                    | FormField::Executable
+                    | FormField::CommandMode
+                    | FormField::Arguments
+                    | FormField::Uid
+                    | FormField::Cgroup
+            ));
+        }
+        let request = app.submit_editor().ok_or("valid rule was not submitted")?;
+        assert!(matches!(
+            request,
+            ControlRequest::CreateRule { rule, .. }
+                if rule.direction == Direction::Inbound && rule.application.is_none()
+        ));
+        Ok(())
+    }
+
+    fn test_rule(
+        name: &str,
+        direction: Direction,
+        peer: Option<&str>,
+        executable: Option<&str>,
+        cgroup: Option<&str>,
+        arguments: Option<&str>,
+    ) -> Result<Rule, Box<dyn std::error::Error>> {
+        let form = RuleForm {
+            name: name.to_owned(),
+            direction,
+            protocol: TransportProtocol::Tcp,
+            peer_network: peer.unwrap_or_default().to_owned(),
+            port: "443".to_owned(),
+            bind_application: executable.is_some(),
+            executable: executable.unwrap_or_default().to_owned(),
+            command_mode: if arguments.is_some() {
+                CommandMode::Exact
+            } else {
+                CommandMode::Any
+            },
+            arguments: arguments.unwrap_or_default().to_owned(),
+            cgroup: cgroup.unwrap_or_default().to_owned(),
+            ..RuleForm::default()
+        };
+        Ok(Rule::new(
+            form.to_rule_spec(&I18n::test_english()).map_err(io_error)?,
+        )?)
     }
 
     fn io_error(message: String) -> std::io::Error {

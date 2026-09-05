@@ -2,7 +2,10 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-03, OpenShield 0.1.28, Rust stable 1.98.0.
+Review snapshot: 2026-09-05, OpenShield 0.2.0 source tree (the audited v0.1.32
+code plus release-version and documentation updates), Rust stable 1.98.0.
+Exact v0.1.32 E2E and performance evidence below remains labelled with the
+version that was measured and is not silently relabelled as v0.2.0 evidence.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -35,16 +38,28 @@ The normative boundary is defined by the
   rejected before state, backend, or event side effects. A lost reply is treated
   by the TUI as an unconfirmed outcome followed by a snapshot refresh, not as a
   safe invitation to repeat the mutation.
+- The TUI reports policy mode, the daemon-selected typed backend, and the
+  dynamically recomputed `StatusV2` active policy path separately from
+  telemetry health. This is a policy classification, not kernel-capability
+  attestation or fallback negotiation. Missing legacy data is displayed as `Unknown`. A live
+  read-only quarantine is shown as the distinct red `EmergencyBlockAll`, not as
+  a healthy operator-selected `BlockAll`. Its outbound
+  cgroup/executable/destination grouping is presentation only: individual rules
+  retain all selectors, selection follows stable UUIDs, and edit, delete, or
+  enable actions cannot implicitly target a whole group. Inbound rules have a
+  separate view and cannot carry application selectors.
 
 ### Policy construction and firewall backends
 
 - Workspace code forbids unsafe Rust. Policy data cannot select a shell command,
   plugin, downloaded policy, eBPF object, or executable to run. An application
   path is a bounded identity selector only.
-- Backend selection is deterministic. A trusted and usable nftables executable
-  is preferred. The daemon selects the iptables/ip6tables compatibility backend
-  only if the nftables capability probe fails, and fails startup if neither
-  complete backend is safe to use.
+- Backend selection is deterministic. A trusted nftables executable is preferred
+  only after a read-only preflight checks previous xtables state, table ownership,
+  every bounded JSON query required by runtime observation, and a representative
+  policy through the kernel's check-only transaction. The daemon selects the
+  iptables/ip6tables compatibility backend if that preflight fails, and fails
+  startup if neither complete backend is safe to use.
 - Backend programs are selected from fixed absolute allowlists and must be
   root-owned, safely permissioned, regular executable files. Commands run with a
   cleared environment, fixed working directory, bounded input/output, and
@@ -52,6 +67,12 @@ The normative boundary is defined by the
 - The nftables compiler emits validated syntax and checks it before an atomic
   transaction. It owns only `table inet openshield` and verifies its ownership
   sentinel before replacement.
+- The v0.1.32 nftables runtime observer invokes one fixed `nft` process for its
+  table, chain, and counter queries and requires exactly three ordered bounded
+  JSON documents. This preserves the one-second cadence, owned-table and base-
+  chain/default-drop/counter invariants, and fail-closed repair while avoiding
+  two additional process launches. It does not use a shell or broaden the
+  executable or argument trust boundary.
 - The compatibility compiler emits complete IPv4 and IPv6 restore programs. It
   uses `--noflush`, owns only `OPENSHIELD_*` chains, verifies ownership and full
   installed rule bodies, and keeps its dispatch jumps first in the relevant
@@ -79,6 +100,16 @@ The normative boundary is defined by the
   packet copy length, procfs work, and attribution time are bounded. Parse,
   ownership, identity, ambiguity, or terminal queue failures deny traffic or
   request emergency `BlockAll`.
+- The reported active-path classification is derived conservatively from
+  committed enabled rules. `KernelNative` is limited to `BlockAll` or application-free
+  `Enforcing`; TCP-only application `Enforcing` is `ConntrackHybrid`; `Learning`
+  and every enabled UDP/ICMP/ICMPv6/`Any` application path are `Nfqueue`.
+  Network-only matches remain kernel-native at the lower levels. An unavailable
+  NFQUEUE consumer does not select a weaker network-only policy: bootstrap
+  `BlockAll` remains installed and startup fails.
+- The only automatic startup backend fallback is from nftables to the complete
+  iptables/ip6tables bundle when nftables cannot be validated. L3/L2/L1 are not
+  successive fallback implementations for an unchanged policy.
 - The engine rechecks mode and generation under its lock through verdict
   delivery and reinjection. nftables uses `NF_ACCEPT` followed by its later
   authorization base chain; iptables uses `NF_REPEAT` with an authenticated
@@ -118,6 +149,20 @@ The normative boundary is defined by the
   task if stale, and is rechecked after capture. The absence of a matching-UID
   holder, multiple matching TGIDs, an incomplete scan, an unstable identity, or
   exhausted bounds results in denial.
+- In v0.1.32 the consumer drains at most 32 already-ready NFQUEUE packets
+  without waiting to fill a batch. Each packet still performs its own
+  `SOCK_DIAG` lookup. The optimization shares only two complete bounded procfs
+  owner snapshots, one before and one after identity capture, under one absolute
+  250 ms deadline. Each snapshot has a global cap of 131,072 owner records
+  across all targets. Identity capture is
+  memoized only inside that batch for an identical inode, socket UID, and
+  capture requirement. Duplicate requests must reach consensus on PID, process
+  start time, executable path and complete file version, and filesystem UID.
+  The typed attribution-timeout marker is preserved into NFQUEUE accounting.
+  A changed snapshot, inconsistent identity, timeout, ambiguity, or exceeded
+  bound denies the affected packet. No identity or authorization result survives
+  into the next batch, so otherwise-unmatched UDP/ICMP remains repeatedly
+  attributed.
 - On cgroup v2, exactly one unified `0::/path` entry supplies the cgroup
   identity. On a v1-only host, bounded controller memberships are validated but
   no cgroup identity is returned. Executable path, full file version, filesystem
@@ -143,14 +188,21 @@ The normative boundary is defined by the
   entering the queue; only a potential new candidate consumes a slot, and the
   worker coalesces exact duplicates in each bounded drain. A policy/cache mismatch
   or full/disconnected queue for a candidate fails closed. At a learning quota,
-  no permit is persisted for Enforcing.
+  no permit is persisted for Enforcing. Preparation, persistence reservation,
+  and the pending admission index run under the engine mutex; atomic save and
+  `fsync` do not. Exact pending endpoints are deduplicated, and state/events are
+  published only after durable commit. Concurrent privileged controls return
+  `Conflict`, except root `BlockAll`, which installs the kernel deny immediately
+  and is serialized last. Recoverable failure retains the previous state and
+  pauses persistence; unsafe outcomes enter fail-closed quarantine.
 
 ### State, startup, shutdown, and packaging
 
 - State storage is bounded and root-owned, rejects links and unsafe metadata,
   and uses a same-directory temporary file, `fsync`, and atomic rename.
-  Ambiguous persistence or rollback outcomes escalate to kernel `BlockAll` or a
-  read-only recovery state.
+  A coordinator prevents an older learning write from overwriting newer control
+  state. Ambiguous persistence or rollback outcomes escalate to kernel
+  `BlockAll` or a read-only recovery state.
 - A direct daemon start acquires a root-owned singleton lock, discovers a
   trusted backend, and installs bootstrap `BlockAll` before inspecting state or
   constructing the fallible runtime. If no state exists, the first requested
@@ -191,34 +243,77 @@ The normative boundary is defined by the
 The evidence layers below are intentionally separate. Passing one layer does not
 establish the properties of another.
 
-- Final Rust 1.98.0 verification passed `cargo fmt --all -- --check`, locked
-  workspace all-target checks, workspace all-target clippy with warnings denied,
-  and all 263 workspace tests: 55 core, 145 daemon, 11 protocol, and 52 TUI.
-  This includes automatic-learning budgets, version pinning, fsuid-prefilter,
-  and immutable policy-index cases. Daemon tests used mock backends and temporary
-  Unix sockets and did not touch the host firewall. These are component results,
-  not a live-firewall result.
-- `cargo-audit` checked the current 152-dependency lock graph against 1,235
+Evidence below remains tied to the explicitly named revision and execution
+environment. The v0.1.32 source, component, local Tumbleweed x86-64 E2E, and
+local performance evidence retained below does not predeclare a tag build
+successful; release artifacts must still pass the configured Quality Gate,
+package matrix, 74 firewall jobs, and performance gate in GitHub Actions. The recorded full
+v0.1.31 performance run remains valid historical evidence, but failed its
+relative-performance gate, so neither that run nor this document certifies a
+v0.1.31 tag. Broader binary, packaging, cross-target, and Tumbleweed results
+identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
+
+- Local v0.1.32 verification on Rust 1.98.0 passed
+  `cargo fmt --all -- --check` and locked
+  workspace all-target clippy with warnings denied. The complete Rust suite in
+  a container passed 350 tests; the normal invocation ignored six live tests,
+  and a separate live-test invocation passed all six. The Python performance
+  harness suite passed 211 tests in an isolated Python 3.13 container; one
+  identity-probe build test was intentionally skipped because that minimal
+  image contains no C compiler. Coverage includes automatic-learning budgets, version pinning,
+  fsuid-prefilter, immutable policy indexes, compatibility classification, and
+  the performance-report confidence model. Daemon unit tests used mock backends
+  and temporary Unix sockets and did not touch the host firewall. These are
+  component results and remain distinct from the full performance-gate result
+  below.
+- The v0.2.0 release-version preparation resolved all four workspace crates and
+  their exact internal dependency pins as `0.2.0`. The locked all-target Rust
+  suite passed 350 tests with six environment-dependent live tests explicitly
+  ignored, formatting and all-target Clippy with warnings denied passed, the
+  release matrix validated 43 binary builds, 43 packages, 86 declared
+  platforms, 37 package-install jobs, and 74 firewall jobs, and both locally
+  built release executables reported version `0.2.0`. This is source/build
+  evidence; the v0.2.0 GitHub release workflow has not yet run.
+- The final local v0.1.32 x86-64 Tumbleweed CI-smoke performance gate completed
+  with `PASS` for both nftables and the iptables fallback. It used daemon SHA-256
+  `d3b824e680baebb30e30f65e2fa010cd0643d3272a2f370bc0001ee727487c29` and
+  configuration SHA-256
+  `b52b3a390a25a6cc611fb91a2ecb1b9df2cebd1bbef86cf6615ba7144fd7ed43`.
+  The independently recomputed result covered 36 comparison groups, 108
+  order-balanced adjacent AB/BA pairs, and 276 metric-evidence records, with no
+  blocking steady or burst regression. The worst steady mean reduction was
+  0.407% for throughput and 0.527% for PPS against their 10% limits; minimum
+  target attainment was 91.26%. Peak daemon CPU was 26.78% of one core, peak
+  RSS was 7.66 MiB, and peak request p99 was 2.717 ms. The retained advisory
+  evidence remains material: CPU/latency crossed the observation threshold in
+  29 of 36 steady groups, with maxima of +150.44% cgroup CPU, +242.62% request
+  p99, and +597.99% TCP-connect p99 relative to very small baselines. All four controlled NFQUEUE-overload
+  proofs passed fail-closed and recovery checks; ordinary windows reported no
+  NIC drops/errors, TCP retransmits, UDP loss, NFQUEUE drops/errors, attribution
+  timeout, terminal queue error, or fail-open behavior. This local result
+  validates the tested source snapshot and binary, not a future GitHub release
+  artifact.
+- For v0.1.28, `cargo-audit` checked the 152-dependency lock graph against 1,235
   advisories from the RustSec database revision dated 2026-09-01 and reported no
   applicable advisory. The offline cargo-deny advisories, bans, licenses, and
   sources checks passed; only the two explicitly allowed duplicate-version
   warnings for `hashbrown` and `syn` remained.
-- Both final static-PIE musl binaries completed a no-network, read-only,
+- Both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 rows of
   `tests/compat/distros.tsv`. This establishes startup compatibility of those
   artifacts with the selected container userspaces, not firewall operation or
   certification of 60 distributions.
-- `cargo check --workspace --all-targets --locked` completed for all 23 Linux
+- For v0.1.28, `cargo check --workspace --all-targets --locked` completed for all 23 Linux
   targets whose standard libraries were available from stable Rust 1.98.0. The
   two recorded RISC-V 32 targets are Tier 3 and were skipped because stable
   rustup does not provide their standard libraries; a separately reviewed
   nightly `build-std` workflow would be required.
-- Separate Tumbleweed GNU binaries were linked and ELF-validated for x86_64,
+- Separate v0.1.28 Tumbleweed GNU binaries were linked and ELF-validated for x86_64,
   i586, AArch64, ppc64le, and s390x. The four non-host daemon/TUI pairs ran
   capability-free `--version` smokes under digest-pinned Cross QEMU images;
   i586 also ran in the pinned official Tumbleweed `linux/386` image. These are
   execution smokes, not hardware or firewall certification.
-- Static staging checks covered all six init layouts. Isolated container
+- For v0.1.28, static staging checks covered all six init layouts. Isolated container
   parser/supervisor fixtures passed for OpenRC, SysVinit, runit, s6, and dinit,
   including lifecycle quarantine and group creation. systemd is staged and
   analyzed separately rather than booted as PID 1 in that container matrix. The
@@ -231,8 +326,8 @@ establish the properties of another.
   full tmpfiles create/relabel declaration was applied twice in the pinned
   Tumbleweed container; exact root ownership/modes and idempotence passed. These
   are packaging/unit-fixture results, not a systemd boot or packet-filtering run.
-- The TUI suite covers all 31 locale resources with 183 messages each and
-  verifies exact key, placeholder, and newline parity. No non-English value is
+- The TUI suite covers all 31 locale resources with the same complete message
+  key set and verifies exact key, placeholder, and newline parity. No non-English value is
   exactly equal to its English counterpart. A second regression checks every
   unordered locale pair and, after excluding placeholders and common protocol
   or product identifiers, permits at most 24 nontrivial short exact matches and
@@ -247,18 +342,96 @@ establish the properties of another.
 - `tests/e2e/server-learning-enforcing.sh` defines separate disposable nftables
   and iptables workflows for observation authorization, Learning, application
   attribution, Enforcing, coexistence, inbound allow, shutdown quarantine, and
-  restart. Final Rust 1.98.0 release runs passed for both backends on Debian
-  Bookworm and the pinned openSUSE Tumbleweed snapshot and printed:
+  restart. The current scenario separately requires a TCP-only L2
+  `ConntrackHybrid` status and proves its established-flow fast path with a
+  real persistent socket while the daemon is paused, before adding UDP and
+  requiring the mixed policy to report L1 `Nfqueue`. The locally built v0.1.32
+  daemon passed both backends in isolated openSUSE Tumbleweed x86-64
+  containers. The
+  successful scenarios printed:
 
   ```text
-  PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
-  PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
+  PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (nftables)
+  PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (iptables)
   ```
 
-  The nftables runs installed both frontends and selected nftables; the iptables
-  runs omitted `nft` and selected the fallback. These were local, isolated
+  The nftables run installed both frontends and selected nftables; the iptables
+  run omitted `nft` and selected the fallback. These were local, isolated
   Docker network/container-namespace tests. They did not exercise or modify the
   host firewall and are not production certification.
+- `tests/perf` and the release `performance` job define a bounded, isolated
+  host-firewall load gate after all functional E2E jobs. The exact release
+  daemon is compared with a no-daemon baseline for nftables and, when available,
+  the iptables/ip6tables fallback, covering `Learning` and `Enforcing`,
+  network-only rules, application TCP, and application UDP. Each exact group
+  receives three predetermined independent pairs with unique pair and baseline
+  sample identities. A baseline sample is single-use, both pair sides use
+  separate pristine DUT generations, and order is balanced AB/BA. The protected
+  block may use only its assigned immediately adjacent baseline. Both sides use
+  identical offered parameters and a policy-independent deterministic trace
+  seed, with conntrack flushed for every load point. The conservative comparison
+  gap is the maximum separation across the authenticated workload interval and
+  the synchronized DUT and peer metric intervals; its configured ceiling is 15
+  seconds for CI and 90 seconds for the production-like profile. Each phase has a new
+  client process; established TCP fast-path behavior is therefore demonstrated
+  by multiple keep-alive operations inside that phase, not by carrying sockets
+  between phases. The real `/var/lib/openshield` directory is stored in the
+  container's writable overlay, exercises atomic rename and `fsync`, retains
+  learned state for the backend topology, and is discarded at cleanup. Formal
+  validity checks invalidate generator or peer/server
+  saturation and propagate an invalid baseline to its pair. Every executed
+  invalid result row fails the complete report. Separate capacity
+  and safety checks cover target attainment, latency, loss/retransmits,
+  daemon CPU/RSS, NIC and NFQUEUE errors, expected NFQUEUE path shape,
+  wrong-executable probes, and verified `BlockAll` quarantine. Invalid points
+  cannot become capacity maxima. Configuration, synchronized metric documents,
+  and pairing evidence use `openshield.perf.config.v2`,
+  `openshield.perf.metrics.v3`, and
+  `openshield.perf.baseline-pairing.v2`, respectively. Daemon-observed queue failures use deltas of
+  the typed, process-lifetime `status.data.nfqueue` counters as authoritative
+  gate evidence; throttled log messages are retained only as diagnostic lower
+  bounds. All per-window relative deltas and threshold crossings are retained.
+  The CI observation thresholds remain 10%. Under the current v0.2.0
+  field-evaluation policy, the authenticated criterion
+  `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
+  means to `observe`; throughput and PPS means retain the blocking `fail`
+  action. The production-like profile sets the criterion to `false` and keeps
+  all relative means blocking. A one-sided 95% Student-t lower confidence bound
+  records stronger confirmation without changing that action. A single
+  burst has no confidence claim, but throughput/PPS threshold crossings block
+  directly and CPU/latency follows the profile action; absolute CPU/RSS and p99
+  latency, burst validity, configured
+  capacity bounds, and safety remain mandatory. Loss, retransmits, NIC or
+  NFQUEUE drops/errors, and fail-open behavior are immediate failures rather
+  than statistically aggregated relative decisions. The CI smoke has three short steady repetitions
+  and is path/safety evidence, not a maximum-capacity result; the production
+  profile also requires three longer repetitions. Softirq deltas are host-wide, include unrelated host
+  work, and are meaningful only relative to the paired baseline on a quiet
+  runner. A separate, non-capacity overload gate uses `SIGSTOP`/`SIGCONT` around
+  the NFQUEUE consumer while real application TCP and UDP fill the bounded
+  queue. It requires the configured minimum combined kernel/userspace NFQUEUE
+  drops, an explicit pressure-client ready/start barrier, same-transport
+  network-only liveness round trips around every wrong-executable probe, and no
+  successful wrong-executable round trip during or after the stall. Generator,
+  peer, or canary saturation and socket/NIC errors invalidate this evidence.
+  Recovery must either be error-free in `Enforcing` or enter an independently
+  verified kernel `BlockAll` quarantine. A reported quarantine also requires
+  bracketed real TCP and UDP negative probes while out-of-band loopback round
+  trips inside the canary container prove both peer servers healthy. This
+  item describes the implemented gates; benchmark numbers are evidence only
+  when the corresponding JSON report is retained.
+
+  The final local v0.1.31 full x86-64 Tumbleweed run produced a structurally
+  valid report but an overall `FAIL` performance result. Ordinary measurement
+  windows had zero safety failures and zero authoritative NFQUEUE error-counter
+  deltas. All four deliberate overload proofs (TCP and UDP on nftables and
+  iptables) passed their fail-closed and recovery checks. Application-aware L2
+  and L1 groups contained mean regressions above the unchanged 10% threshold,
+  with one-sided 95% lower confidence bounds providing stronger confirmation.
+  Two L3 groups also failed the repeated CPU gate in this run: nftables
+  `ingress_http_mixed` and iptables `egress_tcp_mixed`, both with network-only
+  `Enforcing` policy. Therefore the source-level safety evidence is useful,
+  but the performance result does not certify publication of the v0.1.31 tag.
 - The v0.1.18 procfs optimization was measured in the same SHA-256-pinned
   Tumbleweed container image with `--network none`, private PID/network
   namespaces, no privileged mode, and only the daemon's four packaged
@@ -279,6 +452,15 @@ Commands and exact interpretation are documented in
 [the compatibility guide](../tests/compat/README.md).
 
 ## Residual findings and deliberate limits
+
+- The dynamically selected L3/L2/L1 value classifies the active policy path; it
+  is not a distribution-kernel capability level. `KernelNative` is the
+  nftables/iptables policy path, not an eBPF application
+  data plane or a claim about distribution kernel features. OpenShield 0.1.32 does
+  not add `CAP_BPF`, a kernel module, a boot-parameter change, or MOK enrollment.
+  Exact application identity still uses the audited NFQUEUE/procfs path. A
+  future kernel application fast path requires independent rule-equivalence,
+  lifecycle, packaging, Secure Boot, LSM, and native-kernel evidence.
 
 ### Deployment and availability
 
@@ -316,9 +498,14 @@ Commands and exact interpretation are documented in
   Unrelated-UID fd tables are skipped, but global process/task pressure and
   matching-UID fd pressure can still deny application attribution. The v0.1.18
   self-TGID and scan-local fd-hint optimizations reduce the common-case scan cost.
-  Every completed owner scan still includes two shared self-table checks. The
-  optimizations do not cache authorization, skip the fresh external PID/TID scan
-  on each owner-resolution attempt, or alter its worst-case complexity. A
+  Every completed owner snapshot still includes two shared self-table checks.
+  The v0.1.32 micro-batch shares its before/after snapshots across at most 32
+  already-ready packets, retains per-packet `SOCK_DIAG`, and applies one 250 ms
+  deadline to the whole batch plus a 131,072-owner-record cap to each snapshot.
+  Intra-batch
+  identity reuse is keyed by inode, UID, and capture requirements and is accepted
+  only with mandatory-identity consensus and unchanged ownership; nothing is
+  cached across batches. These optimizations do not alter worst-case complexity. A
   sustained packet stream or hostile procfs cardinality
   can still saturate the queue consumer and deny legitimate traffic. The
   immutable packet-policy cache removes the previous per-packet full-state clone
@@ -383,6 +570,9 @@ Commands and exact interpretation are documented in
   not the complete rule body. The iptables backend compares full owned rule
   bodies, but its first-position dispatch can be displaced by another
   privileged editor. Neither check is protection from UID 0 or `CAP_NET_ADMIN`.
+  The v0.1.32 nftables observer obtains its table, chain, and counter documents
+  from one fixed `nft` process, but preserves the same one-second cadence,
+  ordered bounded parsing, validation set, and fail-closed repair behavior.
 - The fixed backend executable is checked before it is later run by path. A
   privileged package update can replace it in that interval. This TOCTOU remains
   inside the trusted UID-0/package-manager boundary.

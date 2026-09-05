@@ -34,6 +34,7 @@ Validation
     -> Install Matrix
     -> Container Tests
     -> Firewall E2E
+    -> Performance Smoke
     -> Release Evidence
     -> Publish
 ```
@@ -43,6 +44,11 @@ documented in [the release CI guide](../../.github/README-CI.md). Compilation is
 allowed only after Validation and the Quality Gate. Publication is allowed only
 after the evidence stage has reconciled every required matrix row and release
 asset.
+
+The single openSUSE Tumbleweed `linux/amd64` performance smoke begins only after
+the entire functional E2E matrix succeeds. It is a bounded release regression
+gate and does not add architecture or distribution support evidence to this
+compatibility matrix.
 
 The 37 runtime rows cover Debian 12/13, Ubuntu 22.04/24.04/26.04, Fedora 43/44,
 Rocky Linux 9/10, AlmaLinux 9/10, openSUSE Leap 16.0, Tumbleweed, Alpine
@@ -183,6 +189,34 @@ This matrix does not boot systemd in a container or as PID 1.
 The lifecycle fixtures mount a stub daemon. Their successful result does not
 mean a backend was selected or that real packets were filtered.
 
+## Dynamic active-policy path evidence
+
+Since OpenShield 0.1.31, `StatusV2` exposes a dynamically recomputed,
+conservative active-policy path classification:
+L3 `KernelNative` for `BlockAll` or application-free `Enforcing`, L2
+`ConntrackHybrid` for TCP-only application `Enforcing`, L1 `Nfqueue` for
+`Learning` or an enabled UDP/ICMP/ICMPv6/`Any` application rule, and `Unknown`
+for a legacy or unverified response. This is the worst-case active path;
+network-only matches remain in the kernel at L2 and L1.
+
+This is not kernel-capability attestation or fallback negotiation for an
+unchanged policy. The classification is independent of nftables-versus-iptables selection. Both backend
+scenarios must preserve identical rule semantics and fail closed if mandatory
+NFQUEUE setup is unavailable. A container result demonstrates the level
+calculation and packet paths on the runner kernel only. It does not certify the
+stock kernel, boot configuration, LSM, or Secure Boot state of the named
+distribution. OpenShield has no eBPF application data plane, so none of the
+37 runtime rows or 49 build-only mappings is an eBPF support claim.
+The only automatic startup backend fallback is from nftables to the complete
+iptables/ip6tables bundle when nftables cannot be validated.
+
+The bounded NFQUEUE micro-batch and single-process nftables observation introduced in v0.1.32
+are userspace changes. They add no architecture-specific kernel object,
+capability, LSM rule, Secure Boot key, or module requirement. This statement
+describes compatibility. Retained v0.1.32 E2E and performance reports remain
+scoped to the exact artifacts they tested; a current release claim requires its
+own retained reports.
+
 ## Real firewall end-to-end workflow
 
 The workflow expands every one of the 37 runtime platform rows into two
@@ -245,8 +279,8 @@ Each successful runtime release row reports both backend runs in its selected
 userspace:
 
 ```text
-PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (nftables)
-PASS server Learning -> UDP/TCP Enforcing -> inbound allow -> restart (iptables)
+PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (nftables)
+PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (iptables)
 ```
 
 In an nftables run both frontends are installed and nftables must be selected.

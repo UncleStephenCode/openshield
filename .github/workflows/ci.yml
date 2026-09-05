@@ -31,6 +31,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Performance harness and real-socket workload tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          bash -n tests/perf/ci-smoke.sh
+          python3 -m unittest -v \
+            tests/perf/test_harness.py \
+            tests/perf/test_environment.py \
+            tests/perf/test_metrics.py \
+            tests/perf/workloads/test_workloads.py
+
   packaging:
     name: Packaging checks
     runs-on: ubuntu-24.04

@@ -68,6 +68,41 @@ or EOF after sending a command is treated as an unconfirmed outcome because the
 daemon may have committed before its acknowledgement was lost. The TUI warns
 against retrying and resynchronizes instead of claiming the change failed.
 
+## TUI policy projection
+
+The TUI separates Status, Outbound rules, Inbound rules, Events, and Help into
+five tabs selected by `1` through `5` or cycled with `Tab`. Status obtains the
+active typed backend identity from the daemon and displays `nftables` or the
+`iptables`/`ip6tables` fallback independently of observation-stream health. A
+`StatusV2` snapshot also displays the policy mode and dynamically recomputed
+active policy-path classification. A legacy response is shown as `Unknown`; the
+client never infers acceleration from absent data.
+An active read-only fail-closed quarantine is reported as L3 with the distinct
+`EmergencyBlockAll` reason. Both the level and reason are rendered as an
+emergency, so this state cannot look like an operator-selected healthy
+`BlockAll`.
+
+The outbound view is a projection over the authoritative rule snapshot, not a
+second policy model. It selects exactly one grouping key per rule in priority
+order: unified-cgroup-v2 path, exact validated executable path without argv, then
+destination network. A rule with no destination network uses an explicit
+"any destination" key. All lower-priority selectors remain individual rule
+fields. The left pane selects a group; the right pane retains each member and
+shows its complete network and application constraints. Navigation follows
+stable rule UUIDs so insertion, sorting, or migration between groups cannot
+redirect an edit, delete, or enable operation to a different rule. Grouping
+never changes matching or creates an implicit bulk mutation.
+
+Inbound rules have a separate view and editor entry point. They expose source
+network, local port or range, interface, and protocol, but never an application
+selector. `Up`/`Down` change the current group or inbound rule and
+`Left`/`Right` change the selected member of an outbound group.
+`PageUp`/`PageDown` scroll the complete, bounded rule detail projection. The
+current tab supplies the direction for `n`; `e`, `d`, and `Space` act on one
+selected UUID. The daemon still independently enforces root-only control;
+authorized non-root `openshield` observers can navigate only the redacted,
+read-only projection.
+
 ## Application attribution
 
 An application selector is valid only on an outbound rule. The executable path
@@ -109,23 +144,38 @@ Serialized application rules that contain only the older device/inode pair fail
 closed and must be reviewed and recreated; network-only state is unaffected.
 
 Otherwise-unmatched application traffic enters the fixed NFQUEUE 1337 without
-a fail-open queue-bypass flag. The kernel supplies a bounded packet prefix, socket
-UID, and output-interface index. A single bounded consumer parses only TCP,
-UDP, ICMP echo, and ICMPv6 echo, maps the tuple to exactly one procfs socket
-inode, requires exactly one process owner, and captures identity with repeated
-start-time, fd, executable path, complete file-version, UID, argv, and cgroup
-checks. Ambiguity, unsupported traffic, malformed metadata, a 250 ms procfs
-deadline, or any configured bound causes DROP. After an attribution attempt has
-resolved one socket inode, its owner search performs a fresh bounded enumeration
-of external PID/TID entries, reads each task's filesystem UID, and scans
-`/proc/TGID/task/TID/fd` only when that UID equals the kernel socket UID. It does
-not retain a process identity or authorization result across packets. Matching
-holders are grouped by TGID. The absence of a matching-UID holder, different
-matching TGIDs, an incomplete or unavailable live process/task scan, or candidate
-descriptor-bound exhaustion makes the attribution fail closed. Sibling holder
-TIDs in one TGID are accepted as one process only when their captured executable
-path/file version, argv, filesystem-UID, and cgroup enforcement identities are
-equal.
+a fail-open queue-bypass flag. The kernel supplies a bounded packet prefix,
+socket UID, and output-interface index. A single bounded consumer parses only
+TCP, UDP, ICMP echo, and ICMPv6 echo. It may drain at most 32 already-ready
+packets without waiting to fill the batch. Every request retains its own
+`SOCK_DIAG` tuple-to-inode lookup. The resolver then performs one complete
+bounded procfs owner snapshot before identity capture and another after capture
+for all targets in the batch. The entire operation shares one absolute 250 ms
+deadline, and each snapshot has one global limit of 131,072 owner records across
+all targets. These bounds are not multiplied by packet count.
+
+Identity capture can be memoized only within that batch and only for an exact
+tuple of socket inode, socket UID, and capture requirements. Duplicate requests
+for one socket must reach consensus on mandatory identity: PID, process start
+time, executable path, complete file version, and filesystem UID. The optional
+argv and cgroup fields are still captured whenever the matching policy requires
+them. The typed procfs timeout marker survives batched error propagation and is
+recorded by the NFQUEUE runtime counters. A later batch starts again with
+per-packet `SOCK_DIAG`; there is no cross-batch process-identity or authorization
+cache, so otherwise-unmatched UDP and ICMP packets continue to require fresh
+attribution.
+
+For each owner snapshot, external PID/TID entries are enumerated once, every
+task's filesystem UID is read, and `/proc/TGID/task/TID/fd` is scanned only when
+that UID equals a target's kernel socket UID. Matching holders are grouped by
+TGID. A changed before/after snapshot, lack of a matching-UID holder, different
+matching TGIDs, inconsistent mandatory identity, incomplete or unavailable live
+process/task enumeration, the shared deadline or owner-record bound, or a
+candidate descriptor-bound exhaustion makes the affected attribution fail
+closed. Sibling holder TIDs in one TGID are accepted as one process only when
+their captured executable path/file version, argv, filesystem-UID, and cgroup
+enforcement identities are equal. Unsupported traffic, malformed metadata, and
+any other configured-bound failure also cause DROP.
 
 The daemon's own TGID is handled separately because its standard Rust threads
 share one descriptor table. When its filesystem UID equals the kernel socket UID,
@@ -228,6 +278,64 @@ network-only rule is emitted before the queue and can accept the same traffic
 without application attribution. Operators must avoid such overlap when the
 application identity is intended to be mandatory.
 
+## Dynamic active-policy path classification
+
+The daemon derives a typed active-policy path classification from the validated
+snapshot and returns it in `StatusV2`. The value is recomputed after every
+committed mode or rule change and describes the worst-case, most expensive data
+path which the current policy can exercise. It is not kernel-capability
+attestation or runtime fallback negotiation for an otherwise identical policy:
+
+- **L3 `KernelNative`** applies in `BlockAll` and in `Enforcing` when no enabled
+  application-bound rule exists. The selected nftables or iptables compiler
+  expresses the complete active filtering policy in kernel rules.
+- **L2 `ConntrackHybrid`** applies in `Enforcing` when every enabled
+  application-bound rule is TCP. A new TCP connection reaches NFQUEUE for
+  process attribution; after successful authorization, packets in both
+  directions must carry the exact current conntrack domain/generation and the
+  established path remains in the kernel. The generated queue expression is
+  TCP-scoped at this level: unrelated UDP and ICMP traffic is resolved by
+  kernel network rules or the terminal kernel drop and never enters NFQUEUE.
+- **L1 `Nfqueue`** applies throughout `Learning`, and in `Enforcing` when any
+  enabled application-bound rule can match UDP, ICMP, ICMPv6, or `Any`.
+  Otherwise-unmatched original packets on those paths require fresh userspace
+  attribution. This level dominates L2 when both kinds of rule are present.
+- **`Unknown`** is reserved for a legacy response or a runtime whose level has
+  not been verified. It is never interpreted as one of the accelerated paths.
+
+Disabled application rules do not affect the level. Network-only rules and
+packets which match them remain kernel-native at L2 and L1; the reported value
+is a conservative daemon-wide summary, not a statement that every packet takes
+the same route. A successful mode or rule transaction recomputes the level from
+the committed snapshot. Level selection does not relax selector conjunctions,
+rewrite a rule, or substitute a network-only allow for an application rule.
+
+Policy mode, firewall backend, and active-path classification are orthogonal
+status dimensions. Startup first installs `BlockAll`. Its only automatic
+backend fallback is from a fully validated nftables backend to the complete
+iptables/ip6tables bundle when nftables is unusable. The same four status
+values have the same meaning on both backends. Startup does not activate a
+saved non-`BlockAll` policy until the
+non-bypass NFQUEUE consumer and the other required resources are ready. If
+NFQUEUE setup fails, the daemon retains `BlockAll` and exits rather than
+starting with a network-only approximation. A later terminal queue failure
+requests emergency `BlockAll`; it never promotes the level or bypasses the
+queue.
+
+Normal `BlockAll` and emergency quarantine both execute a kernel-native deny
+policy, but they are not operationally equivalent. `StatusV2` reports reason
+`BlockAll` for the operator-selected mode and `EmergencyBlockAll` while the
+engine is poisoned and read-only. The latter permits observation but rejects
+all privileged mutations until recovery.
+
+L3 is a description of the policy currently compiled into nftables or
+iptables, not an eBPF implementation. OpenShield currently has no eBPF application
+data plane, does not retain `CAP_BPF`, does not install a kernel module, and
+does not modify boot parameters or MOK state. A future cgroup/BPF-LSM path must
+have separate feature/load/attach/exercise probes, exact rule-equivalence tests,
+and a fail-closed detach/downgrade transaction before it can introduce a higher
+level or change these semantics.
+
 ## Modes
 
 `BlockAll`
@@ -285,8 +393,12 @@ make otherwise valid privileged mutations unavailable.
 The monitor reads bounded backend-specific chain and counter state once per
 second rather than serializing every compiled rule. The iptables path compares
 the complete OpenShield-owned rules with the last verified transaction;
-the nftables path verifies the owned table, base hooks, default-drop policies,
-and named counters. Application learning is fed
+the nftables path requests tables, chains, and counters in one fixed `nft`
+process, parses exactly three ordered bounded JSON documents, and verifies the
+owned table, base hooks, default-drop policies, and named counters. Combining
+the three nftables reads removes two process launches but does not change the
+one-second cadence, validation invariants, output bounds, or fail-closed repair.
+Application learning is fed
 by the separate bounded NFQUEUE worker described above. Deduplication builds one
 O(N) index for the batch, and one batch persists at most 256 new rules. Automatic
 insertion also stops at 512 learned rules per filesystem UID and 256 per pair of
@@ -315,6 +427,21 @@ mutation or a restart; the active `Learning` traffic behavior remains in force.
 An argv or unified-v2 cgroup change creates a distinct candidate rather than
 widening an existing learned selector. Operators must therefore conduct Learning
 in a controlled window and review its exact selectors before Enforcing.
+
+Application Learning uses a serialized two-phase persistence transaction.
+Under the `Engine` mutex the worker validates the base state, builds the
+candidate and events, reserves persistence, and installs the pending-candidate
+admission index. Atomic save and file/directory `fsync` then run without that
+mutex, keeping packet snapshots, admission, and verdict rechecks live during
+storage latency. Exact endpoints in the pending candidate are deduplicated.
+Finalization reacquires the mutex, verifies the transaction token and exact base
+state, and publishes state and events only after durable commit. Other
+privileged mutations return `Conflict` while persistence is reserved. Root
+`BlockAll` is the exception: it installs the kernel deny immediately, then
+persists the combined blocked state after the learning write and supersedes its
+finalizer. Recoverable failures retain the prior state and pause persistence;
+unsafe storage, rollback, or base-state outcomes enter fail-closed quarantine.
+
 After a save error the daemon rereads authoritative state: an exact previous
 snapshot is left untouched, while a candidate or unknown result is rolled back.
 Only an ambiguous result together with failed rollback escalates to `BlockAll`. This keeps health
@@ -323,11 +450,105 @@ complete rule bodies; a privileged targeted edit or additional allow can evade
 it. The iptables comparison is stricter for owned chains, but no monitor makes
 arbitrary concurrent privileged firewall editors a supported configuration.
 
+## Performance verification model
+
+The isolated harness in [`tests/perf`](../tests/perf/README.md) exercises the
+same nftables and, where the kernel supports it, iptables/ip6tables paths as the
+daemon. Network-only policy is measured in both `Learning` and `Enforcing`;
+outbound application TCP and UDP use privileged exact rules in `Enforcing` and
+persisted learned rules in `Learning`. The DUT creates the real
+`/var/lib/openshield` directory in its writable container overlay rather than a
+`tmpfs`, so the production atomic-rename and `fsync` state path is exercised.
+State and learned rules survive phase-client exits and daemon control
+transactions within one backend topology, but that disposable writable layer
+is not reused by a later independent harness run.
+
+Warm-up, every ramp step, every steady repetition, and burst each start an
+independent client process and initial socket set. The server remains alive for
+the whole load point. Application TCP fast-path evidence is collected inside
+each phase: a keep-alive connection first crosses NFQUEUE for process
+attribution and then carries multiple request/response operations under the
+current conntrack generation. No established connection is carried across a
+phase boundary. A bounded 50--3,600,000 ms weighted lifetime distribution is
+selected deterministically for every persistent connection. Expiry closes and
+reopens an ordinary TCP socket between completed exchanges, producing a real
+new conntrack/NFQUEUE attribution path without interrupting in-flight work;
+short-connection profiles validate but otherwise ignore the lifetime. Each
+exact backend/policy/mode/profile/load group has three predetermined,
+independent baseline/protected pairs. Every pair has unique pair and baseline
+sample identities, uses its baseline exactly once, and runs its sides in
+separate pristine DUT generations. The daemon is never started on the baseline
+DUT. Pair order is fixed before measurement and balanced AB/BA, and a protected
+block may use only its assigned immediately adjacent baseline. Both sides use
+identical offered parameters and a policy-independent deterministic trace seed;
+conntrack is flushed before each baseline and policy load point. The
+conservative comparison gap is the maximum temporal separation across the
+authenticated workload interval and the synchronized DUT and peer metric
+intervals. It must not exceed 15 seconds in CI or 90 seconds in the
+production-like profile.
+
+The configuration, synchronized metrics, and baseline-pairing contracts are
+versioned as `openshield.perf.config.v2`, `openshield.perf.metrics.v3`, and
+`openshield.perf.baseline-pairing.v2`. The result model separates validity,
+capacity, and safety. Generator CPU or
+scheduler saturation and peer/server CPU, rejection, or protocol saturation
+invalidate a window; an invalid baseline propagates to its pair. Valid windows
+then have formal configured gates for target attainment, latency, loss,
+retransmits, daemon CPU/RSS, interface errors, NFQUEUE drops, and expected queue
+shape. Repeated wrong-executable probes during application bursts and direct
+kernel inspection of a reported quarantine prevent a fail-open result from
+passing. Every executed invalid result row fails the complete report rather
+than being silently excluded; invalid points also cannot become capacity
+evidence. A production maximum requires three successful steady repetitions.
+
+Relative performance uses those independent adjacent pristine AB/BA pairs.
+Every window delta and threshold crossing is preserved as evidence. The
+CI observation threshold remains 10%. Its authenticated configuration assigns
+relative throughput/PPS means to the blocking `fail` action and, under the
+current v0.2.0 CI policy, assigns relative CPU and latency means to the
+non-blocking `observe` action. The production-like profile assigns all four to
+`fail`. A one-sided 95% Student-t lower confidence bound records stronger
+confirmation without changing the configured action. A single
+burst has no repeated-sample confidence claim, so its relative crossing is
+evaluated directly: throughput/PPS blocks, while CPU/latency follows the
+profile action. Its validity, configured capacity bounds, and safety are also
+mandatory. Safety signals such as loss, retransmits, NIC or NFQUEUE
+drops/errors, and fail-open behavior fail immediately and are not subject to
+the statistical relative decision. Host `/proc/softirqs` counters are not
+namespaced or attributable to the daemon; they are interpreted only as a
+paired-baseline delta on a quiet runner. The bounded release smoke follows
+the functional firewall E2E jobs, but its three short steady repetitions
+validate the path and safety gate rather than certifying a capacity maximum.
+
+A separate configured overload gate deliberately stops the daemon with
+`SIGSTOP`, drives real application TCP and UDP until the bounded NFQUEUE shows
+at least the required combined kernel/userspace drop count, and repeatedly
+tests a different executable while the consumer is stalled. The pressure
+client first publishes readiness and waits at an explicit start barrier. A
+separate network-only endpoint on the same canary veth and transport must
+complete a real round trip immediately before and after every negative probe;
+resource saturation or socket/NIC errors at the generator, peer, or canary make
+the proof invalid. `SIGCONT` is attempted in a `finally` path, with
+disposable-container teardown as the outer fallback. After resume, the daemon
+must either retain `Enforcing` and pass an allowed-traffic recovery exchange or
+expose a `BlockAll` quarantine independently verified in the selected kernel
+backend. A reported quarantine additionally requires bracketed real TCP and UDP
+negative probes while loopback round trips inside the canary container prove
+both peer servers healthy immediately before and after each probe. The
+different executable must remain blocked both during and after the stall. This
+controlled test is a fail-closed stress proof and is kept out of capacity
+calculations. Its TCP pressure payload forces short connections, so the
+inherited validated keep-alive lifetime distribution cannot reduce NFQUEUE
+saturation pressure.
+
 ## Trust boundaries
 
 The daemon trusts the Linux kernel, UID 0, and the selected fixed system backend
-executables. nftables is preferred only after a kernel validation probe. The
-fallback requires complete trusted IPv4 and IPv6 xtables bundles. Executable
+executables. nftables is preferred only after a read-only preflight verifies
+the previous xtables state, table ownership, the exact bounded JSON table,
+chain, and counter queries needed by runtime observation, and a representative
+Learning policy with the kernel's check-only transaction. The fallback requires
+complete trusted IPv4 and IPv6 xtables bundles. Executable
 paths come from compiled allowlists, are metadata-checked, and are invoked with a
 cleared environment and typed arguments, never a shell. The daemon does not load
 plugins, scripts, downloaded policy, eBPF objects, or configuration-selected

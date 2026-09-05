@@ -1,0 +1,134 @@
+{
+  "schema": "openshield.perf.config.v2",
+  "description": "Editable production-like sweep. Replace offered rates with measured production percentiles before capacity qualification.",
+  "capacity_certification": true,
+  "seed": 2901337,
+  "backends": ["nftables", "iptables"],
+  "modes": ["enforcing", "learning"],
+  "learning_variants": ["known_endpoint", "discovery_churn"],
+  "allow_unsupported_iptables": false,
+  "platform": "linux/amd64",
+  "images": {
+    "dut": "opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045",
+    "peer": "python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285"
+  },
+  "max_total_workload_seconds": 91000,
+  "load_levels": [0.5, 1.0, 1.5, 2.0],
+  "phases": {
+    "warmup": {"duration_seconds": 10, "scale": 0.2},
+    "ramp": {"duration_seconds": 10, "scales": [0.2, 0.4, 0.6, 0.8, 1.0]},
+    "steady": {"duration_seconds": 30, "repetitions": 3},
+    "burst": {"duration_seconds": 10, "scale": 1.75},
+    "cooldown_seconds": 5
+  },
+  "criteria": {
+    "minimum_target_ratio": 0.95,
+    "maximum_error_ratio": 0.0,
+    "maximum_udp_reply_loss_ratio": 0.0,
+    "maximum_tcp_retransmits_per_tx_packet": 0.0,
+    "maximum_latency_p99_ms": 100.0,
+    "maximum_daemon_cpu_percent_one_core": 90.0,
+    "maximum_daemon_rss_bytes": 268435456,
+    "maximum_generator_wall_cpu_ratio": 0.85,
+    "maximum_peer_wall_cpu_ratio": 0.85,
+    "maximum_scheduler_lag_p99_ms": 5.0,
+    "maximum_throughput_reduction_vs_baseline_percent": 5.0,
+    "maximum_dut_pps_reduction_vs_baseline_percent": 5.0,
+    "maximum_latency_increase_vs_baseline_percent": 5.0,
+    "maximum_cgroup_cpu_increase_vs_baseline_percent": 5.0,
+    "cpu_latency_relative_regressions_are_advisory": false,
+    "maximum_comparison_gap_seconds": 90.0,
+    "require_zero_nic_errors": true,
+    "require_zero_nfqueue_drops": true,
+    "network_only_maximum_queue_hits": 0,
+    "application_tcp_minimum_queue_hits_per_connection": 0.7,
+    "application_tcp_maximum_queue_hits_per_connection": 2.0,
+    "application_tcp_keepalive_maximum_queue_hits_per_operation": 0.1,
+    "application_udp_minimum_queue_hits_per_datagram": 0.95,
+    "application_udp_maximum_queue_hits_per_datagram": 1.05,
+    "require_burst_capacity": true
+  },
+  "overload": {
+    "enabled": true,
+    "pause_seconds": 3.0,
+    "client_duration_seconds": 5.0,
+    "tcp_connections": 8192,
+    "tcp_concurrency": 512,
+    "udp_datagrams": 65536,
+    "udp_flows": 256,
+    "probe_attempts": 10,
+    "probe_timeout_ms": 250,
+    "recovery_operations": 10,
+    "recovery_duration_seconds": 2.0,
+    "minimum_nfqueue_drops": 1,
+    "tcp_canary_port": 28103,
+    "udp_canary_port": 28106,
+    "tcp_liveness_port": 28109,
+    "udp_liveness_port": 28112
+  },
+  "profiles": [
+    {
+      "name": "ingress_http_keepalive",
+      "direction": "inbound",
+      "transport": "tcp",
+      "port": 18101,
+      "policy_cases": ["baseline", "network_only"],
+      "client": {"protocol": "http1", "mode": "keepalive", "concurrency": 256, "cps": 250, "pps": 5000, "mbps": 1000, "keepalive_ratio": 1.0, "connection_lifetime_ms_mix": "5000:20,30000:60,120000:20", "request_bytes": 128, "response_mix": "1024:70,16384:25,262144:5", "reply_every": 1, "io_timeout": 2, "latency_samples": 100000},
+      "server": {"workers": 1024, "backlog": 4096, "processing_delay_ms": 0}
+    },
+    {
+      "name": "ingress_http_short",
+      "direction": "inbound",
+      "transport": "tcp",
+      "port": 18102,
+      "policy_cases": ["baseline", "network_only"],
+      "client": {"protocol": "http1", "mode": "short", "concurrency": 256, "cps": 2000, "pps": 2000, "mbps": 1000, "keepalive_ratio": 0, "connection_lifetime_ms_mix": "3600000:1", "request_bytes": 128, "response_mix": "1024:70,16384:25,262144:5", "reply_every": 1, "io_timeout": 2, "latency_samples": 100000},
+      "server": {"workers": 1024, "backlog": 4096, "processing_delay_ms": 0}
+    },
+    {
+      "name": "egress_tcp_keepalive",
+      "direction": "outbound",
+      "transport": "tcp",
+      "port": 18103,
+      "policy_cases": ["baseline", "network_only", "application_tcp"],
+      "client": {"protocol": "http1", "mode": "keepalive", "concurrency": 128, "cps": 250, "pps": 5000, "mbps": 1000, "keepalive_ratio": 1.0, "connection_lifetime_ms_mix": "5000:20,30000:60,120000:20", "request_bytes": 128, "response_mix": "1024:70,16384:25,262144:5", "reply_every": 1, "io_timeout": 2, "latency_samples": 100000},
+      "server": {"workers": 1024, "backlog": 4096, "processing_delay_ms": 0}
+    },
+    {
+      "name": "egress_tcp_short",
+      "direction": "outbound",
+      "transport": "tcp",
+      "port": 18104,
+      "policy_cases": ["baseline", "network_only", "application_tcp"],
+      "client": {"protocol": "http1", "mode": "short", "concurrency": 256, "cps": 2000, "pps": 2000, "mbps": 1000, "keepalive_ratio": 0, "connection_lifetime_ms_mix": "3600000:1", "request_bytes": 128, "response_mix": "1024:70,16384:25,262144:5", "reply_every": 1, "io_timeout": 2, "latency_samples": 100000},
+      "server": {"workers": 1024, "backlog": 4096, "processing_delay_ms": 0}
+    },
+    {
+      "name": "egress_tcp_mixed",
+      "direction": "outbound",
+      "transport": "tcp",
+      "port": 18105,
+      "policy_cases": ["baseline", "network_only", "application_tcp"],
+      "client": {"protocol": "http1", "mode": "mixed", "concurrency": 256, "cps": 1000, "pps": 5000, "mbps": 1000, "keepalive_ratio": 0.8, "connection_lifetime_ms_mix": "1000:20,5000:50,30000:30", "request_bytes": 128, "response_mix": "1024:70,16384:25,262144:5", "reply_every": 1, "io_timeout": 2, "latency_samples": 100000},
+      "server": {"workers": 1024, "backlog": 4096, "processing_delay_ms": 0}
+    },
+    {
+      "name": "egress_udp_stream",
+      "direction": "outbound",
+      "transport": "udp",
+      "port": 18106,
+      "policy_cases": ["baseline", "network_only", "application_udp"],
+      "client": {"flows": 64, "pps": 20000, "mbps": 5000, "request_bytes": 60000, "request_mix": "60000:1", "response_mix": "60000:1", "reply_every": 100, "io_timeout": 2, "latency_samples": 100000, "socket_buffer_bytes": 16777216},
+      "server": {"processing_delay_ms": 0, "socket_buffer_bytes": 16777216}
+    },
+    {
+      "name": "egress_udp_high_pps_128_512",
+      "direction": "outbound",
+      "transport": "udp",
+      "port": 18107,
+      "policy_cases": ["baseline", "network_only", "application_udp"],
+      "client": {"flows": 256, "pps": 100000, "mbps": 0, "request_bytes": 256, "request_mix": "128:50,256:35,512:15", "response_mix": "128:40,256:40,512:20", "reply_every": 100, "io_timeout": 2, "latency_samples": 100000, "socket_buffer_bytes": 16777216},
+      "server": {"processing_delay_ms": 0, "socket_buffer_bytes": 16777216, "max_request_bytes": 512}
+    }
+  ]
+}

@@ -16,8 +16,9 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Group, getegid, geteuid, getgroups};
 use openshield_core::{Event, MAX_RULES, Mode, Rule, Snapshot};
 use openshield_protocol::{
-    Ack, CONTROL_SOCKET_PATH, ControlRequest, FrameError, MAX_RULES_PER_PAGE, OBSERVE_GROUP_NAME,
-    OBSERVE_SOCKET_PATH, ReadRequest, Request, Response, read_response, write_request,
+    Ack, CONTROL_SOCKET_PATH, ControlRequest, ErrorCode, FirewallBackendKind, FrameError,
+    MAX_RULES_PER_PAGE, OBSERVE_GROUP_NAME, OBSERVE_SOCKET_PATH, ReadRequest, Request, Response,
+    RuntimeCompatibility, read_response, write_request,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -32,6 +33,7 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const STATUS_V2_REPROBE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_SOCKET_MODE: u32 = 0o600;
 const OBSERVE_SOCKET_MODE: u32 = 0o660;
 
@@ -169,8 +171,16 @@ pub enum ObserverUpdate {
     Disconnected(String),
     TelemetryConnected,
     TelemetryDisconnected(String),
-    Snapshot(Snapshot),
-    Restarted(Snapshot),
+    Snapshot {
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+        runtime_compatibility: RuntimeCompatibility,
+    },
+    Restarted {
+        snapshot: Snapshot,
+        backend: FirewallBackendKind,
+        runtime_compatibility: RuntimeCompatibility,
+    },
     Event(Box<Event>),
     Dropped(u64),
 }
@@ -202,6 +212,10 @@ struct RevisionEpoch {
     generation: u64,
     mode: Option<Mode>,
     rule_count: Option<u32>,
+    backend: Option<FirewallBackendKind>,
+    runtime_compatibility: Option<RuntimeCompatibility>,
+    status_protocol: StatusProtocol,
+    next_status_v2_probe_at: Option<std::time::Instant>,
     resync_required: bool,
     restart_update_pending: bool,
 }
@@ -213,6 +227,10 @@ impl Default for RevisionEpoch {
             generation: 0,
             mode: None,
             rule_count: None,
+            backend: None,
+            runtime_compatibility: None,
+            status_protocol: StatusProtocol::ProbeV2,
+            next_status_v2_probe_at: None,
             resync_required: true,
             restart_update_pending: false,
         }
@@ -224,6 +242,16 @@ struct PolicyStatus {
     revision: u64,
     mode: Mode,
     rule_count: u32,
+    backend: FirewallBackendKind,
+    runtime_compatibility: RuntimeCompatibility,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StatusProtocol {
+    #[default]
+    ProbeV2,
+    V2,
+    Legacy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -327,10 +355,7 @@ pub enum IpcError {
     #[error("IPC protocol error: {0}")]
     Frame(#[from] FrameError),
     #[error("daemon rejected request ({code:?}): {message}")]
-    Rejected {
-        code: openshield_protocol::ErrorCode,
-        message: String,
-    },
+    Rejected { code: ErrorCode, message: String },
     #[error("unexpected daemon response: {0}")]
     Unexpected(&'static str),
     #[error("daemon returned an invalid snapshot: {0}")]
@@ -447,7 +472,9 @@ pub fn send_control(paths: &SocketPaths, request: ControlRequest) -> Result<Ack,
             code: error.code,
             message: error.message,
         }),
-        Response::Status { .. } => Err(IpcError::Unexpected("status on control socket")),
+        Response::Status { .. } | Response::StatusV2 { .. } => {
+            Err(IpcError::Unexpected("status on control socket"))
+        }
         Response::RulesPage { .. } => Err(IpcError::Unexpected("rules page on control socket")),
         Response::Event(_) => Err(IpcError::Unexpected("event on control socket")),
     }
@@ -579,9 +606,8 @@ fn refresh_snapshot(
     revision: &Mutex<RevisionEpoch>,
     dropped: &DroppedCounter,
 ) -> Result<Option<OfferOutcome>, IpcError> {
-    let mut stream = connect_verified(path, testing_override, SocketTrust::Observe)?;
-    set_request_timeouts(&stream)?;
-    let first = fetch_status(&mut stream)?;
+    let (mut stream, first, status_protocol) =
+        open_status_session(path, testing_override, revision)?;
     let known_revision = {
         let cursor = lock_revision_epoch(revision)?;
         if status_is_unchanged(&cursor, first) {
@@ -590,33 +616,63 @@ fn refresh_snapshot(
         cursor.revision
     };
     if first.revision >= known_revision {
-        let snapshot = fetch_consistent_snapshot_from_status(&mut stream, first)?;
-        return enqueue_snapshot(sender, revision, dropped, snapshot, false);
+        let snapshot = fetch_consistent_snapshot_from_status(&mut stream, first, status_protocol)?;
+        return enqueue_snapshot(
+            sender,
+            revision,
+            dropped,
+            snapshot,
+            first.backend,
+            first.runtime_compatibility,
+            false,
+            status_protocol,
+        );
     }
 
     // A lower first read can be a harmless race with an event received after
     // Status. A second Status must include that event on the same daemon epoch;
     // if it is still below the captured revision, the daemon has restarted from
     // an older persisted state.
-    let confirmed = fetch_status(&mut stream)?;
+    let confirmed = fetch_status(&mut stream, status_protocol)?;
     let restarted = confirmed.revision < known_revision;
     if !restarted && shared_status_is_unchanged(revision, confirmed)? {
         return Ok(None);
     }
-    let snapshot = fetch_consistent_snapshot_from_status(&mut stream, confirmed)?;
-    enqueue_snapshot(sender, revision, dropped, snapshot, restarted)
+    let snapshot = fetch_consistent_snapshot_from_status(&mut stream, confirmed, status_protocol)?;
+    enqueue_snapshot(
+        sender,
+        revision,
+        dropped,
+        snapshot,
+        confirmed.backend,
+        confirmed.runtime_compatibility,
+        restarted,
+        status_protocol,
+    )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "snapshot delivery keeps the wire evidence and epoch decision explicit"
+)]
 fn enqueue_snapshot(
     sender: &SyncSender<ObserverUpdate>,
     revision: &Mutex<RevisionEpoch>,
     dropped: &DroppedCounter,
     snapshot: Snapshot,
-    restarted: bool,
+    backend: FirewallBackendKind,
+    runtime_compatibility: RuntimeCompatibility,
+    restart_confirmed: bool,
+    status_protocol: StatusProtocol,
 ) -> Result<Option<OfferOutcome>, IpcError> {
     let rule_count = u32::try_from(snapshot.rules.len())
         .map_err(|_| IpcError::InvalidSnapshot("rule count does not fit u32".to_owned()))?;
     let mut cursor = lock_revision_epoch(revision)?;
+    // `AutoBackend` is immutable for one daemon lifetime. A changed backend
+    // therefore proves that this snapshot belongs to a new daemon epoch even
+    // when the persisted policy revision did not move backwards. Treat it as
+    // a restart so an event worker attached to the old daemon is invalidated.
+    let restarted = restart_confirmed || cursor.backend.is_some_and(|current| current != backend);
     if restarted {
         cursor.generation = cursor
             .generation
@@ -625,6 +681,19 @@ fn enqueue_snapshot(
         cursor.revision = snapshot.revision;
         cursor.mode = Some(snapshot.mode);
         cursor.rule_count = Some(rule_count);
+        cursor.backend = Some(backend);
+        cursor.runtime_compatibility = Some(runtime_compatibility);
+        cursor.status_protocol = if status_protocol == StatusProtocol::Legacy {
+            // A confirmed new daemon epoch may have gained StatusV2 support.
+            // Probe once on the next snapshot instead of retaining a capability
+            // conclusion made about the previous process forever.
+            StatusProtocol::ProbeV2
+        } else {
+            status_protocol
+        };
+        if cursor.status_protocol != StatusProtocol::Legacy {
+            cursor.next_status_v2_probe_at = None;
+        }
         cursor.resync_required = true;
         cursor.restart_update_pending = true;
     } else if snapshot.revision < cursor.revision && !cursor.restart_update_pending {
@@ -633,13 +702,24 @@ fn enqueue_snapshot(
         cursor.revision = cursor.revision.max(snapshot.revision);
         cursor.mode = Some(snapshot.mode);
         cursor.rule_count = Some(rule_count);
+        cursor.backend = Some(backend);
+        cursor.runtime_compatibility = Some(runtime_compatibility);
+        cursor.status_protocol = status_protocol;
     }
 
     let is_restart_update = cursor.restart_update_pending;
     let update = if is_restart_update {
-        ObserverUpdate::Restarted(snapshot)
+        ObserverUpdate::Restarted {
+            snapshot,
+            backend,
+            runtime_compatibility,
+        }
     } else {
-        ObserverUpdate::Snapshot(snapshot)
+        ObserverUpdate::Snapshot {
+            snapshot,
+            backend,
+            runtime_compatibility,
+        }
     };
     let outcome = offer_update(sender, dropped, update);
     match outcome {
@@ -670,9 +750,27 @@ fn enqueue_event(
     if cursor.generation != subscribed_generation || cursor.restart_update_pending {
         return Ok(EventEnqueueOutcome::GenerationChanged);
     }
+    let advances_policy = event.revision > cursor.revision;
+    let changes_policy = matches!(
+        &event.kind,
+        openshield_core::EventKind::ModeChanged { .. }
+            | openshield_core::EventKind::RuleCreated { .. }
+            | openshield_core::EventKind::RuleUpdated { .. }
+            | openshield_core::EventKind::RuleDeleted { .. }
+            | openshield_core::EventKind::RuleEnabledChanged { .. }
+    );
     cursor.revision = cursor.revision.max(event.revision);
     let outcome = match offer_update(sender, dropped, ObserverUpdate::Event(Box::new(event))) {
-        OfferOutcome::Delivered => EventEnqueueOutcome::Delivered,
+        OfferOutcome::Delivered => {
+            if advances_policy && changes_policy {
+                // Structural events update App immediately but do not carry a
+                // RuntimeCompatibility attestation. Force one coherent
+                // StatusV2+rules refresh even when mode, rule count and the
+                // selected level happen to remain unchanged.
+                cursor.resync_required = true;
+            }
+            EventEnqueueOutcome::Delivered
+        }
         OfferOutcome::Dropped => {
             cursor.resync_required = true;
             EventEnqueueOutcome::Dropped
@@ -688,6 +786,8 @@ fn status_is_unchanged(cursor: &RevisionEpoch, status: PolicyStatus) -> bool {
         && cursor.revision == status.revision
         && cursor.mode == Some(status.mode)
         && cursor.rule_count == Some(status.rule_count)
+        && cursor.backend == Some(status.backend)
+        && cursor.runtime_compatibility == Some(status.runtime_compatibility)
 }
 
 fn shared_status_is_unchanged(
@@ -713,6 +813,7 @@ fn lock_revision_epoch(
 fn fetch_consistent_snapshot_from_status(
     stream: &mut UnixStream,
     status: PolicyStatus,
+    status_protocol: StatusProtocol,
 ) -> Result<Snapshot, IpcError> {
     let expected_count =
         usize::try_from(status.rule_count).map_err(|_| IpcError::RuleCountMismatch {
@@ -769,7 +870,40 @@ fn fetch_consistent_snapshot_from_status(
         mode: status.mode,
         rules,
     };
-    validate_observer_snapshot(snapshot)
+    let snapshot = validate_observer_snapshot(snapshot)?;
+    validate_snapshot_runtime_compatibility(&snapshot, status, status_protocol)?;
+    Ok(snapshot)
+}
+
+fn validate_snapshot_runtime_compatibility(
+    snapshot: &Snapshot,
+    status: PolicyStatus,
+    status_protocol: StatusProtocol,
+) -> Result<(), IpcError> {
+    if status_protocol == StatusProtocol::Legacy {
+        return Ok(());
+    }
+    let expected = RuntimeCompatibility::for_policy(
+        status.backend,
+        snapshot.mode,
+        snapshot.application_interception(),
+    );
+    let emergency_quarantine = expected
+        == (RuntimeCompatibility {
+            level: openshield_protocol::CompatibilityLevel::KernelNative,
+            reason: openshield_protocol::CompatibilityReason::BlockAll,
+        })
+        && status.runtime_compatibility
+            == (RuntimeCompatibility {
+                level: openshield_protocol::CompatibilityLevel::KernelNative,
+                reason: openshield_protocol::CompatibilityReason::EmergencyBlockAll,
+            });
+    if status.runtime_compatibility != expected && !emergency_quarantine {
+        return Err(IpcError::InvalidSnapshot(
+            "StatusV2 runtime compatibility does not match the returned policy snapshot".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_observer_snapshot(snapshot: Snapshot) -> Result<Snapshot, IpcError> {
@@ -779,26 +913,145 @@ fn validate_observer_snapshot(snapshot: Snapshot) -> Result<Snapshot, IpcError> 
     Ok(snapshot)
 }
 
-fn fetch_status(stream: &mut UnixStream) -> Result<PolicyStatus, IpcError> {
-    write_request(stream, &Request::Read(ReadRequest::Status))?;
-    match read_response(stream)? {
-        Response::Status {
+fn open_status_session(
+    path: &Path,
+    testing_override: bool,
+    revision: &Mutex<RevisionEpoch>,
+) -> Result<(UnixStream, PolicyStatus, StatusProtocol), IpcError> {
+    let now = std::time::Instant::now();
+    let requested = {
+        let cursor = lock_revision_epoch(revision)?;
+        status_protocol_for_connection(&cursor, now)
+    };
+    let mut stream = connect_verified(path, testing_override, SocketTrust::Observe)?;
+    set_request_timeouts(&stream)?;
+    match fetch_status(&mut stream, requested) {
+        Ok(status) => {
+            let mut cursor = lock_revision_epoch(revision)?;
+            cursor.status_protocol = requested;
+            if requested == StatusProtocol::V2 {
+                cursor.next_status_v2_probe_at = None;
+            }
+            Ok((stream, status, requested))
+        }
+        Err(error) if requested == StatusProtocol::V2 && status_v2_is_unsupported(&error) => {
+            // A legacy daemon closes the observation session after rejecting
+            // the unknown request. Reconnect before sending the old Status
+            // shape, and cache the result so a healthy legacy daemon receives
+            // at most one StatusV2 probe per bounded re-probe interval.
+            drop(stream);
+            let mut legacy = connect_verified(path, testing_override, SocketTrust::Observe)?;
+            set_request_timeouts(&legacy)?;
+            let status = fetch_status(&mut legacy, StatusProtocol::Legacy)?;
+            let mut cursor = lock_revision_epoch(revision)?;
+            cursor.status_protocol = StatusProtocol::Legacy;
+            cursor.next_status_v2_probe_at = now.checked_add(STATUS_V2_REPROBE_INTERVAL);
+            Ok((legacy, status, StatusProtocol::Legacy))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn status_protocol_for_connection(
+    cursor: &RevisionEpoch,
+    now: std::time::Instant,
+) -> StatusProtocol {
+    match cursor.status_protocol {
+        StatusProtocol::Legacy
+            if cursor
+                .next_status_v2_probe_at
+                .is_some_and(|probe_at| now < probe_at) =>
+        {
+            StatusProtocol::Legacy
+        }
+        StatusProtocol::ProbeV2 | StatusProtocol::V2 | StatusProtocol::Legacy => StatusProtocol::V2,
+    }
+}
+
+fn status_v2_is_unsupported(error: &IpcError) -> bool {
+    matches!(
+        error,
+        IpcError::Rejected {
+            code: ErrorCode::InvalidRequest,
+            ..
+        }
+    )
+}
+
+fn fetch_status(
+    stream: &mut UnixStream,
+    protocol: StatusProtocol,
+) -> Result<PolicyStatus, IpcError> {
+    let request = match protocol {
+        StatusProtocol::ProbeV2 | StatusProtocol::V2 => ReadRequest::StatusV2,
+        StatusProtocol::Legacy => ReadRequest::Status,
+    };
+    write_request(stream, &Request::Read(request))?;
+    match (protocol, read_response(stream)?) {
+        (
+            StatusProtocol::Legacy,
+            Response::Status {
+                revision,
+                mode,
+                rule_count,
+                backend,
+                ..
+            },
+        ) => Ok(PolicyStatus {
             revision,
             mode,
             rule_count,
-        } => Ok(PolicyStatus {
-            revision,
-            mode,
-            rule_count,
+            backend,
+            runtime_compatibility: RuntimeCompatibility::default(),
         }),
-        Response::Error(error) => Err(IpcError::Rejected {
+        (
+            StatusProtocol::ProbeV2 | StatusProtocol::V2,
+            Response::StatusV2 {
+                revision,
+                mode,
+                rule_count,
+                backend,
+                runtime_compatibility,
+                ..
+            },
+        ) => validated_v2_policy_status(revision, mode, rule_count, backend, runtime_compatibility),
+        (_, Response::Error(error)) => Err(IpcError::Rejected {
             code: error.code,
             message: error.message,
         }),
-        Response::Ack(_) => Err(IpcError::Unexpected("ack on observation socket")),
-        Response::Event(_) => Err(IpcError::Unexpected("event instead of status")),
-        Response::RulesPage { .. } => Err(IpcError::Unexpected("rules page instead of status")),
+        (_, Response::Ack(_)) => Err(IpcError::Unexpected("ack on observation socket")),
+        (_, Response::Event(_)) => Err(IpcError::Unexpected("event instead of status")),
+        (_, Response::RulesPage { .. }) => {
+            Err(IpcError::Unexpected("rules page instead of status"))
+        }
+        (StatusProtocol::Legacy, Response::StatusV2 { .. }) => {
+            Err(IpcError::Unexpected("status v2 instead of legacy status"))
+        }
+        (StatusProtocol::ProbeV2 | StatusProtocol::V2, Response::Status { .. }) => {
+            Err(IpcError::Unexpected("legacy status instead of status v2"))
+        }
     }
+}
+
+fn validated_v2_policy_status(
+    revision: u64,
+    mode: Mode,
+    rule_count: u32,
+    backend: FirewallBackendKind,
+    runtime_compatibility: RuntimeCompatibility,
+) -> Result<PolicyStatus, IpcError> {
+    if !runtime_compatibility.is_consistent_with(mode, backend) {
+        return Err(IpcError::InvalidSnapshot(
+            "StatusV2 runtime compatibility is inconsistent with its mode or backend".to_owned(),
+        ));
+    }
+    Ok(PolicyStatus {
+        revision,
+        mode,
+        rule_count,
+        backend,
+        runtime_compatibility,
+    })
 }
 
 fn fetch_rules_page(
@@ -824,7 +1077,9 @@ fn fetch_rules_page(
         }),
         Response::Ack(_) => Err(IpcError::Unexpected("ack on observation socket")),
         Response::Event(_) => Err(IpcError::Unexpected("event instead of rules page")),
-        Response::Status { .. } => Err(IpcError::Unexpected("status instead of rules page")),
+        Response::Status { .. } | Response::StatusV2 { .. } => {
+            Err(IpcError::Unexpected("status instead of rules page"))
+        }
     }
 }
 
@@ -876,7 +1131,7 @@ fn subscribe_once(
                 });
             }
             Response::Ack(_) => return Err(IpcError::Unexpected("ack on event subscription")),
-            Response::Status { .. } => {
+            Response::Status { .. } | Response::StatusV2 { .. } => {
                 return Err(IpcError::Unexpected("status on event subscription"));
             }
             Response::RulesPage { .. } => {
@@ -1169,6 +1424,51 @@ mod tests {
     }
 
     #[test]
+    fn legacy_status_v2_probe_is_cached_then_retried_on_deadline() {
+        let started = std::time::Instant::now();
+        let mut cursor = RevisionEpoch {
+            status_protocol: StatusProtocol::Legacy,
+            next_status_v2_probe_at: started.checked_add(STATUS_V2_REPROBE_INTERVAL),
+            ..RevisionEpoch::default()
+        };
+
+        assert_eq!(
+            status_protocol_for_connection(
+                &cursor,
+                started + STATUS_V2_REPROBE_INTERVAL.saturating_sub(Duration::from_millis(1)),
+            ),
+            StatusProtocol::Legacy
+        );
+        assert_eq!(
+            status_protocol_for_connection(&cursor, started + STATUS_V2_REPROBE_INTERVAL,),
+            StatusProtocol::V2
+        );
+
+        // A successful legacy status read must not postpone the fixed retry
+        // deadline on every two-second snapshot connection.
+        cursor.status_protocol = StatusProtocol::Legacy;
+        assert_eq!(
+            status_protocol_for_connection(&cursor, started + STATUS_V2_REPROBE_INTERVAL,),
+            StatusProtocol::V2
+        );
+    }
+
+    #[test]
+    fn status_v2_downgrade_requires_an_explicit_invalid_request() {
+        assert!(status_v2_is_unsupported(&IpcError::Rejected {
+            code: ErrorCode::InvalidRequest,
+            message: "unknown request".to_owned(),
+        }));
+        assert!(!status_v2_is_unsupported(&IpcError::Rejected {
+            code: ErrorCode::Unauthorized,
+            message: "denied".to_owned(),
+        }));
+        assert!(!status_v2_is_unsupported(&IpcError::Unexpected(
+            "malformed status response",
+        )));
+    }
+
+    #[test]
     fn only_root_uid_is_allowed_to_send_control_requests() {
         assert!(is_control_uid(0));
         assert!(!is_control_uid(1));
@@ -1191,6 +1491,118 @@ mod tests {
             &[4, 27, 1000],
             991
         ));
+    }
+
+    #[test]
+    fn status_v2_rejects_inconsistent_runtime_evidence() {
+        let kernel_native = RuntimeCompatibility {
+            level: openshield_protocol::CompatibilityLevel::KernelNative,
+            reason: openshield_protocol::CompatibilityReason::NetworkOnly,
+        };
+        assert!(matches!(
+            validated_v2_policy_status(
+                1,
+                Mode::Enforcing,
+                0,
+                FirewallBackendKind::Unknown,
+                kernel_native,
+            ),
+            Err(IpcError::InvalidSnapshot(_))
+        ));
+        assert!(matches!(
+            validated_v2_policy_status(
+                1,
+                Mode::Learning,
+                0,
+                FirewallBackendKind::Nftables,
+                kernel_native,
+            ),
+            Err(IpcError::InvalidSnapshot(_))
+        ));
+        assert!(
+            validated_v2_policy_status(
+                1,
+                Mode::Enforcing,
+                0,
+                FirewallBackendKind::Nftables,
+                kernel_native,
+            )
+            .is_ok()
+        );
+
+        let emergency = RuntimeCompatibility {
+            level: openshield_protocol::CompatibilityLevel::KernelNative,
+            reason: openshield_protocol::CompatibilityReason::EmergencyBlockAll,
+        };
+        assert!(
+            validated_v2_policy_status(
+                2,
+                Mode::BlockAll,
+                0,
+                FirewallBackendKind::Iptables,
+                emergency,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validated_v2_policy_status(
+                2,
+                Mode::Enforcing,
+                0,
+                FirewallBackendKind::Iptables,
+                emergency,
+            ),
+            Err(IpcError::InvalidSnapshot(_))
+        ));
+        assert!(matches!(
+            validated_v2_policy_status(
+                2,
+                Mode::BlockAll,
+                0,
+                FirewallBackendKind::Iptables,
+                RuntimeCompatibility {
+                    level: openshield_protocol::CompatibilityLevel::Nfqueue,
+                    reason: openshield_protocol::CompatibilityReason::EmergencyBlockAll,
+                },
+            ),
+            Err(IpcError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn block_all_snapshot_accepts_only_a_production_emergency_attestation() -> Result<(), IpcError>
+    {
+        let snapshot = Snapshot {
+            revision: 2,
+            flow_generation: 1,
+            mode: Mode::BlockAll,
+            rules: Vec::new(),
+        };
+        let emergency = RuntimeCompatibility {
+            level: openshield_protocol::CompatibilityLevel::KernelNative,
+            reason: openshield_protocol::CompatibilityReason::EmergencyBlockAll,
+        };
+        let status = PolicyStatus {
+            revision: 2,
+            mode: Mode::BlockAll,
+            rule_count: 0,
+            backend: FirewallBackendKind::Nftables,
+            runtime_compatibility: emergency,
+        };
+        validate_snapshot_runtime_compatibility(&snapshot, status, StatusProtocol::V2)?;
+
+        assert!(matches!(
+            validate_snapshot_runtime_compatibility(
+                &snapshot,
+                PolicyStatus {
+                    backend: FirewallBackendKind::Unknown,
+                    ..status
+                },
+                StatusProtocol::V2,
+            ),
+            Err(IpcError::InvalidSnapshot(_))
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1276,7 +1688,11 @@ mod tests {
 
         sender.try_send(ObserverUpdate::Connected)?;
         sender.try_send(ObserverUpdate::TelemetryConnected)?;
-        sender.try_send(ObserverUpdate::Snapshot(empty_snapshot(1)))?;
+        sender.try_send(ObserverUpdate::Snapshot {
+            snapshot: empty_snapshot(1),
+            backend: FirewallBackendKind::Unknown,
+            runtime_compatibility: RuntimeCompatibility::default(),
+        })?;
         sender.try_send(ObserverUpdate::Event(Box::new(counter_event(1))))?;
         for revision in 2..=u64::try_from(LEARNING_BURST + 1)? {
             assert_eq!(
@@ -1302,10 +1718,25 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(8);
 
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                RuntimeCompatibility::default(),
+                false,
+                StatusProtocol::V2,
+            )?,
             Some(OfferOutcome::Delivered)
         );
-        assert!(matches!(receiver.recv()?, ObserverUpdate::Snapshot(_)));
+        assert!(matches!(
+            receiver.recv()?,
+            ObserverUpdate::Snapshot {
+                backend: FirewallBackendKind::Unknown,
+                ..
+            }
+        ));
         let (_, old_generation) = subscription_cursor(&revision)?;
 
         assert_eq!(
@@ -1323,7 +1754,16 @@ mod tests {
         // A merely stale snapshot must not rewind a cursor advanced by a
         // concurrent event from the same daemon epoch.
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                RuntimeCompatibility::default(),
+                false,
+                StatusProtocol::V2,
+            )?,
             None
         );
         assert_eq!(subscription_cursor(&revision)?, (11, old_generation));
@@ -1331,10 +1771,25 @@ mod tests {
         // A second, confirmed lower read starts a new epoch and is delivered
         // explicitly so App does not reject it as stale.
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(3), true,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(3),
+                FirewallBackendKind::Iptables,
+                RuntimeCompatibility::default(),
+                true,
+                StatusProtocol::V2,
+            )?,
             Some(OfferOutcome::Delivered)
         );
-        assert!(matches!(receiver.recv()?, ObserverUpdate::Restarted(_)));
+        assert!(matches!(
+            receiver.recv()?,
+            ObserverUpdate::Restarted {
+                backend: FirewallBackendKind::Iptables,
+                ..
+            }
+        ));
         let (current_revision, new_generation) = subscription_cursor(&revision)?;
         assert_eq!(current_revision, 3);
         assert_eq!(new_generation, old_generation + 1);
@@ -1363,13 +1818,24 @@ mod tests {
         let dropped = DroppedCounter::new();
         let (sender, _receiver) = mpsc::sync_channel(1);
         assert_eq!(
-            enqueue_snapshot(&sender, &revision, &dropped, empty_snapshot(10), false,)?,
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                RuntimeCompatibility::default(),
+                false,
+                StatusProtocol::V2,
+            )?,
             Some(OfferOutcome::Delivered)
         );
         let unchanged = PolicyStatus {
             revision: 10,
             mode: Mode::BlockAll,
             rule_count: 0,
+            backend: FirewallBackendKind::Unknown,
+            runtime_compatibility: RuntimeCompatibility::default(),
         };
         assert!(shared_status_is_unchanged(&revision, unchanged)?);
         assert!(!shared_status_is_unchanged(
@@ -1383,6 +1849,23 @@ mod tests {
             &revision,
             PolicyStatus {
                 mode: Mode::Learning,
+                ..unchanged
+            }
+        )?);
+        assert!(!shared_status_is_unchanged(
+            &revision,
+            PolicyStatus {
+                backend: FirewallBackendKind::Nftables,
+                ..unchanged
+            }
+        )?);
+        assert!(!shared_status_is_unchanged(
+            &revision,
+            PolicyStatus {
+                runtime_compatibility: RuntimeCompatibility {
+                    level: openshield_protocol::CompatibilityLevel::KernelNative,
+                    reason: openshield_protocol::CompatibilityReason::NetworkOnly,
+                },
                 ..unchanged
             }
         )?);
@@ -1403,12 +1886,175 @@ mod tests {
     }
 
     #[test]
+    fn advancing_rule_update_forces_runtime_resync_but_duplicate_does_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rule = Rule::new(RuleSpec::new(
+            RuleName::new("network rule")?,
+            Direction::Outbound,
+            TransportProtocol::Tcp,
+            Some("203.0.113.8/32".parse()?),
+            Some(PortRange::single(443)?),
+            None,
+            RuleOrigin::Manual,
+            true,
+        )?)?;
+        let attested = RuntimeCompatibility {
+            level: openshield_protocol::CompatibilityLevel::KernelNative,
+            reason: openshield_protocol::CompatibilityReason::NetworkOnly,
+        };
+        let revision = Mutex::new(RevisionEpoch::default());
+        let dropped = DroppedCounter::new();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let snapshot = |revision| Snapshot {
+            revision,
+            flow_generation: 1,
+            mode: Mode::Enforcing,
+            rules: vec![rule.clone()],
+        };
+
+        assert_eq!(
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                snapshot(10),
+                FirewallBackendKind::Nftables,
+                attested,
+                false,
+                StatusProtocol::V2,
+            )?,
+            Some(OfferOutcome::Delivered)
+        );
+        let _initial = receiver.recv()?;
+        let (_, generation) = subscription_cursor(&revision)?;
+        let updated = Event {
+            revision: 11,
+            occurred_at: Utc::now(),
+            kind: EventKind::RuleUpdated { rule: rule.clone() },
+        };
+
+        assert_eq!(
+            enqueue_event(&sender, &revision, &dropped, generation, updated.clone(),)?,
+            EventEnqueueOutcome::Delivered
+        );
+        let _event = receiver.recv()?;
+        let current = PolicyStatus {
+            revision: 11,
+            mode: Mode::Enforcing,
+            rule_count: 1,
+            backend: FirewallBackendKind::Nftables,
+            runtime_compatibility: attested,
+        };
+        assert!(!shared_status_is_unchanged(&revision, current)?);
+
+        assert_eq!(
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                snapshot(11),
+                current.backend,
+                current.runtime_compatibility,
+                false,
+                StatusProtocol::V2,
+            )?,
+            Some(OfferOutcome::Delivered)
+        );
+        let _resynced = receiver.recv()?;
+        assert!(shared_status_is_unchanged(&revision, current)?);
+
+        assert_eq!(
+            enqueue_event(&sender, &revision, &dropped, generation, updated,)?,
+            EventEnqueueOutcome::Delivered
+        );
+        let _duplicate = receiver.recv()?;
+        assert!(shared_status_is_unchanged(&revision, current)?);
+        Ok(())
+    }
+
+    #[test]
+    fn backend_change_starts_a_new_epoch_and_invalidates_old_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let revision = Mutex::new(RevisionEpoch::default());
+        let dropped = DroppedCounter::new();
+        let (sender, receiver) = mpsc::sync_channel(2);
+
+        assert_eq!(
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                FirewallBackendKind::Unknown,
+                RuntimeCompatibility::default(),
+                false,
+                StatusProtocol::V2,
+            )?,
+            Some(OfferOutcome::Delivered)
+        );
+        let _initial = receiver.recv()?;
+        let (_, old_generation) = subscription_cursor(&revision)?;
+
+        let changed = PolicyStatus {
+            revision: 10,
+            mode: Mode::BlockAll,
+            rule_count: 0,
+            backend: FirewallBackendKind::Nftables,
+            runtime_compatibility: RuntimeCompatibility::default(),
+        };
+        assert!(!shared_status_is_unchanged(&revision, changed)?);
+        assert_eq!(
+            enqueue_snapshot(
+                &sender,
+                &revision,
+                &dropped,
+                empty_snapshot(10),
+                changed.backend,
+                changed.runtime_compatibility,
+                false,
+                StatusProtocol::V2,
+            )?,
+            Some(OfferOutcome::Delivered)
+        );
+        assert!(matches!(
+            receiver.recv()?,
+            ObserverUpdate::Restarted {
+                snapshot: Snapshot { revision: 10, .. },
+                backend: FirewallBackendKind::Nftables,
+                ..
+            }
+        ));
+        assert!(shared_status_is_unchanged(&revision, changed)?);
+        let (_, new_generation) = subscription_cursor(&revision)?;
+        assert_eq!(new_generation, old_generation + 1);
+        assert_eq!(
+            enqueue_event(
+                &sender,
+                &revision,
+                &dropped,
+                old_generation,
+                counter_event(11),
+            )?,
+            EventEnqueueOutcome::GenerationChanged
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn explicit_conflict_resync_invalidates_an_unchanged_status() -> Result<(), IpcError> {
         let revision = Mutex::new(RevisionEpoch {
             revision: 10,
             generation: 0,
             mode: Some(Mode::BlockAll),
             rule_count: Some(0),
+            backend: Some(FirewallBackendKind::Unknown),
+            runtime_compatibility: Some(RuntimeCompatibility::default()),
+            status_protocol: StatusProtocol::V2,
+            next_status_v2_probe_at: None,
             resync_required: false,
             restart_update_pending: false,
         });
@@ -1416,6 +2062,8 @@ mod tests {
             revision: 10,
             mode: Mode::BlockAll,
             rule_count: 0,
+            backend: FirewallBackendKind::Unknown,
+            runtime_compatibility: RuntimeCompatibility::default(),
         };
         assert!(shared_status_is_unchanged(&revision, unchanged)?);
         mark_resync_required(&revision)?;
@@ -1455,7 +2103,7 @@ mod tests {
         let snapshot = Snapshot {
             revision: 7,
             flow_generation: 1,
-            mode: Mode::Learning,
+            mode: Mode::Enforcing,
             rules: vec![rule],
         };
 
@@ -1467,6 +2115,42 @@ mod tests {
                 .as_ref()
                 .is_some_and(|selector| selector.metadata_redacted)
         );
+        let false_kernel_status = PolicyStatus {
+            revision: validated.revision,
+            mode: validated.mode,
+            rule_count: 1,
+            backend: FirewallBackendKind::Nftables,
+            runtime_compatibility: RuntimeCompatibility {
+                level: openshield_protocol::CompatibilityLevel::KernelNative,
+                reason: openshield_protocol::CompatibilityReason::NetworkOnly,
+            },
+        };
+        assert!(matches!(
+            validate_snapshot_runtime_compatibility(
+                &validated,
+                false_kernel_status,
+                StatusProtocol::V2,
+            ),
+            Err(IpcError::InvalidSnapshot(_))
+        ));
+        let tcp_status = PolicyStatus {
+            runtime_compatibility: RuntimeCompatibility {
+                level: openshield_protocol::CompatibilityLevel::ConntrackHybrid,
+                reason: openshield_protocol::CompatibilityReason::ApplicationTcp,
+            },
+            ..false_kernel_status
+        };
+        validate_snapshot_runtime_compatibility(&validated, tcp_status, StatusProtocol::V2)?;
+        // A legacy status deliberately carries no path attestation and must
+        // remain readable without inventing one from client-side state.
+        validate_snapshot_runtime_compatibility(
+            &validated,
+            PolicyStatus {
+                runtime_compatibility: RuntimeCompatibility::default(),
+                ..false_kernel_status
+            },
+            StatusProtocol::Legacy,
+        )?;
         Ok(())
     }
 
