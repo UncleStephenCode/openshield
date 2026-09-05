@@ -144,23 +144,38 @@ Serialized application rules that contain only the older device/inode pair fail
 closed and must be reviewed and recreated; network-only state is unaffected.
 
 Otherwise-unmatched application traffic enters the fixed NFQUEUE 1337 without
-a fail-open queue-bypass flag. The kernel supplies a bounded packet prefix, socket
-UID, and output-interface index. A single bounded consumer parses only TCP,
-UDP, ICMP echo, and ICMPv6 echo, maps the tuple to exactly one procfs socket
-inode, requires exactly one process owner, and captures identity with repeated
-start-time, fd, executable path, complete file-version, UID, argv, and cgroup
-checks. Ambiguity, unsupported traffic, malformed metadata, a 250 ms procfs
-deadline, or any configured bound causes DROP. After an attribution attempt has
-resolved one socket inode, its owner search performs a fresh bounded enumeration
-of external PID/TID entries, reads each task's filesystem UID, and scans
-`/proc/TGID/task/TID/fd` only when that UID equals the kernel socket UID. It does
-not retain a process identity or authorization result across packets. Matching
-holders are grouped by TGID. The absence of a matching-UID holder, different
-matching TGIDs, an incomplete or unavailable live process/task scan, or candidate
-descriptor-bound exhaustion makes the attribution fail closed. Sibling holder
-TIDs in one TGID are accepted as one process only when their captured executable
-path/file version, argv, filesystem-UID, and cgroup enforcement identities are
-equal.
+a fail-open queue-bypass flag. The kernel supplies a bounded packet prefix,
+socket UID, and output-interface index. A single bounded consumer parses only
+TCP, UDP, ICMP echo, and ICMPv6 echo. It may drain at most 32 already-ready
+packets without waiting to fill the batch. Every request retains its own
+`SOCK_DIAG` tuple-to-inode lookup. The resolver then performs one complete
+bounded procfs owner snapshot before identity capture and another after capture
+for all targets in the batch. The entire operation shares one absolute 250 ms
+deadline, and each snapshot has one global limit of 131,072 owner records across
+all targets. These bounds are not multiplied by packet count.
+
+Identity capture can be memoized only within that batch and only for an exact
+tuple of socket inode, socket UID, and capture requirements. Duplicate requests
+for one socket must reach consensus on mandatory identity: PID, process start
+time, executable path, complete file version, and filesystem UID. The optional
+argv and cgroup fields are still captured whenever the matching policy requires
+them. The typed procfs timeout marker survives batched error propagation and is
+recorded by the NFQUEUE runtime counters. A later batch starts again with
+per-packet `SOCK_DIAG`; there is no cross-batch process-identity or authorization
+cache, so otherwise-unmatched UDP and ICMP packets continue to require fresh
+attribution.
+
+For each owner snapshot, external PID/TID entries are enumerated once, every
+task's filesystem UID is read, and `/proc/TGID/task/TID/fd` is scanned only when
+that UID equals a target's kernel socket UID. Matching holders are grouped by
+TGID. A changed before/after snapshot, lack of a matching-UID holder, different
+matching TGIDs, inconsistent mandatory identity, incomplete or unavailable live
+process/task enumeration, the shared deadline or owner-record bound, or a
+candidate descriptor-bound exhaustion makes the affected attribution fail
+closed. Sibling holder TIDs in one TGID are accepted as one process only when
+their captured executable path/file version, argv, filesystem-UID, and cgroup
+enforcement identities are equal. Unsupported traffic, malformed metadata, and
+any other configured-bound failure also cause DROP.
 
 The daemon's own TGID is handled separately because its standard Rust threads
 share one descriptor table. When its filesystem UID equals the kernel socket UID,
@@ -314,7 +329,7 @@ engine is poisoned and read-only. The latter permits observation but rejects
 all privileged mutations until recovery.
 
 L3 is a description of the policy currently compiled into nftables or
-iptables, not an eBPF implementation. Version 0.1.31 has no eBPF application
+iptables, not an eBPF implementation. OpenShield 0.1.32 has no eBPF application
 data plane, does not retain `CAP_BPF`, does not install a kernel module, and
 does not modify boot parameters or MOK state. A future cgroup/BPF-LSM path must
 have separate feature/load/attach/exercise probes, exact rule-equivalence tests,
@@ -378,8 +393,12 @@ make otherwise valid privileged mutations unavailable.
 The monitor reads bounded backend-specific chain and counter state once per
 second rather than serializing every compiled rule. The iptables path compares
 the complete OpenShield-owned rules with the last verified transaction;
-the nftables path verifies the owned table, base hooks, default-drop policies,
-and named counters. Application learning is fed
+the nftables path requests tables, chains, and counters in one fixed `nft`
+process, parses exactly three ordered bounded JSON documents, and verifies the
+owned table, base hooks, default-drop policies, and named counters. Combining
+the three nftables reads removes two process launches but does not change the
+one-second cadence, validation invariants, output bounds, or fail-closed repair.
+Application learning is fed
 by the separate bounded NFQUEUE worker described above. Deduplication builds one
 O(N) index for the batch, and one batch persists at most 256 new rules. Automatic
 insertion also stops at 512 learned rules per filesystem UID and 256 per pair of
@@ -455,33 +474,49 @@ selected deterministically for every persistent connection. Expiry closes and
 reopens an ordinary TCP socket between completed exchanges, producing a real
 new conntrack/NFQUEUE attribution path without interrupting in-flight work;
 short-connection profiles validate but otherwise ignore the lifetime. Each
-protected measurement is paired with a sequential
-no-daemon baseline using identical offered parameters and a policy-independent
-deterministic trace seed; conntrack is flushed before each baseline and policy
-load point.
+exact backend/policy/mode/profile/load group has three predetermined,
+independent baseline/protected pairs. Every pair has unique pair and baseline
+sample identities, uses its baseline exactly once, and runs its sides in
+separate pristine DUT generations. The daemon is never started on the baseline
+DUT. Pair order is fixed before measurement and balanced AB/BA, and a protected
+block may use only its assigned immediately adjacent baseline. Both sides use
+identical offered parameters and a policy-independent deterministic trace seed;
+conntrack is flushed before each baseline and policy load point. The
+conservative comparison gap is the maximum temporal separation across the
+authenticated workload interval and the synchronized DUT and peer metric
+intervals. It must not exceed 15 seconds in CI or 90 seconds in the
+production-like profile.
 
-The result model separates validity, capacity, and safety. Generator CPU or
+The configuration, synchronized metrics, and baseline-pairing contracts are
+versioned as `openshield.perf.config.v2`, `openshield.perf.metrics.v3`, and
+`openshield.perf.baseline-pairing.v2`. The result model separates validity,
+capacity, and safety. Generator CPU or
 scheduler saturation and peer/server CPU, rejection, or protocol saturation
 invalidate a window; an invalid baseline propagates to its pair. Valid windows
 then have formal configured gates for target attainment, latency, loss,
 retransmits, daemon CPU/RSS, interface errors, NFQUEUE drops, and expected queue
 shape. Repeated wrong-executable probes during application bursts and direct
 kernel inspection of a reported quarantine prevent a fail-open result from
-passing. Invalid points are excluded from capacity, and a production maximum
-requires three successful steady repetitions.
+passing. Every executed invalid result row fails the complete report rather
+than being silently excluded; invalid points also cannot become capacity
+evidence. A production maximum requires three successful steady repetitions.
 
-Relative performance uses predetermined adjacent pristine AB/BA pairs. Every
-window delta and threshold crossing is preserved as evidence. The unchanged
-release threshold is 10%, but it becomes a blocking relative regression only
-when at least three valid steady paired deltas have a one-sided 95% Student-t
-lower confidence bound above that threshold. A single burst has no repeated
-sample confidence claim, so its relative crossing is diagnostic only; its
-validity, configured capacity bounds, and safety are still mandatory. Safety
-signals such as loss, retransmits, NIC or NFQUEUE drops/errors, and fail-open
-behavior fail immediately and are not subject to the statistical relative
-decision. Host `/proc/softirqs` counters are not namespaced or attributable to
-the daemon; they are interpreted only as a paired-baseline delta on a quiet
-runner. The bounded release smoke follows
+Relative performance uses those independent adjacent pristine AB/BA pairs.
+Every window delta and threshold crossing is preserved as evidence. The
+CI observation threshold remains 10%. Its authenticated configuration assigns
+relative throughput/PPS means to the blocking `fail` action and, for the
+v0.1.32 field-evaluation period, assigns relative CPU and latency means to the
+non-blocking `observe` action. The production-like profile assigns all four to
+`fail`. A one-sided 95% Student-t lower confidence bound records stronger
+confirmation without changing the configured action. A single
+burst has no repeated-sample confidence claim, so its relative crossing is
+evaluated directly: throughput/PPS blocks, while CPU/latency follows the
+profile action. Its validity, configured capacity bounds, and safety are also
+mandatory. Safety signals such as loss, retransmits, NIC or NFQUEUE
+drops/errors, and fail-open behavior fail immediately and are not subject to
+the statistical relative decision. Host `/proc/softirqs` counters are not
+namespaced or attributable to the daemon; they are interpreted only as a
+paired-baseline delta on a quiet runner. The bounded release smoke follows
 the functional firewall E2E jobs, but its three short steady repetitions
 validate the path and safety gate rather than certifying a capacity maximum.
 

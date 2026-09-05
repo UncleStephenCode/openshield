@@ -113,18 +113,25 @@ the generator on the DUT and therefore exercise OpenShield's unique
 application-aware path. UDP includes long-lived large-datagram streams and a
 many-flow 128--512-byte high-PPS profile.
 
-Each load point executes warm-up, one or more ramp steps, repeated steady-state
-windows, and a burst. `production-like.json` sets
+Each exact backend/policy/mode/profile/load group executes at least three
+independent baseline/protected comparison pairs. Every pair has a fresh
+warm-up and one matching steady-state window; the first pair also executes the
+configured ramp and the last pair executes the burst. `production-like.json` sets
 `capacity_certification=true`; a capacity-qualified maximum requires three
 passing steady windows and, when `require_burst_capacity=true`, the matching
 passing burst at the same load level. The much shorter `ci-smoke.json` sets
 `capacity_certification=false`: it verifies path selection, reporting, and
 fail-closed safety, but can never publish a capacity-qualified point.
 The release smoke retains every backend, mode, policy path, and workload
-profile, but uses one half-load ramp and three one-second steady windows. Its
+profile, but uses one half-load ramp and three independent one-second steady
+pairs. Its
 bounded rates target hundreds of operations in every steady window, reducing
 the single-digit-sample instability of the earlier sub-second profile. All
-three repetitions must pass independently.
+three independent pairs must pass. Each independent CI block now receives a
+1.0-second warm-up. The deterministic workload-time estimate for the complete
+two-backend plan is 609.6 seconds under the explicit
+`max_total_workload_seconds` bound of 620 seconds; Docker provisioning,
+teardown, and runner scheduling are bounded separately by the outer timeouts.
 
 Every phase launches a fresh client process with a fresh initial socket set;
 TCP connections are deliberately not carried from warm-up into ramp, steady,
@@ -157,21 +164,32 @@ reuse or identity drift aborts the topology, and no broad `pkill` is used. This 
 launcher/teardown work outside the measured window and makes orphaned
 `docker exec` children a release-blocking failure.
 
-For a given backend, profile, load level, and phase, the baseline and every
-OpenShield policy case use the same offered configuration and the same
-deterministic trace seed; policy is intentionally absent from seed derivation.
-Conntrack is flushed before each load point in both topologies.
+Within a comparison pair, the baseline and OpenShield policy case use the same
+offered configuration and deterministic trace seed; policy is intentionally
+absent from seed derivation. Repetitions receive distinct deterministic seeds.
+Before every block, conntrack is flushed; the protected topology also returns
+to Learning, clears its rules, rebuilds the selected policy, and only then
+selects the requested mode.
 
 The complete execution order is derived from the validated configuration before
-any measurement is observed. It uses nearest-pristine AB/BA blocks such as
-`A0, B0, B1, A1, B2, B3, A2, ...`, where `A` is a pristine baseline block and
-`B` is a protected block. `B0` is compared with the immediately preceding `A0`
-(AB), while `B1` is compared with the immediately following `A1` (BA). A
-baseline sample can therefore serve at most the two protected blocks it
-directly brackets. The harness cannot select a more favorable earlier or later
-baseline after seeing results: sample identity, comparison order, and execution
-sequence are fixed in advance, and non-adjacent or ambiguous pairs invalidate
-the release gate.
+any measurement is observed. Each repetition receives a unique
+`comparison_pair_id` and `baseline_sample_id`; its pristine baseline is used
+exactly once and is immediately adjacent to its protected block. Order
+alternates AB/BA within each exact group, with the starting order alternating
+between groups, so both orders are represented and globally balanced. The
+harness cannot select a more favorable reference after seeing results: pair
+identity, repetition, comparison order, and execution sequence are fixed in
+advance. Missing, duplicated, reused, single-order, unbalanced, non-adjacent,
+or ambiguous evidence invalidates the release gate. The configured
+`maximum_comparison_gap_seconds` bounds the actual elapsed gap between paired
+steady measurement windows. The harness computes the conservative maximum of
+the authenticated workload, DUT collector, and peer collector boundaries, not
+the shorter idle time between outer blocks. The CI smoke keeps a strict
+15-second bound. The production-like profile uses 90 seconds because its first
+pair intentionally places a 10-second warm-up and five 10-second ramp steps,
+plus bounded teardown and cooldown, between sequential steady windows. This
+cost is explicit rather than hidden; exceeding either profile's bound makes the
+evidence invalid instead of labeling drift as a measured regression.
 
 ## Running safely
 
@@ -204,7 +222,7 @@ OPENSHIELD_DAEMON="$PWD/target/release/openshield-daemon" \
   tests/perf/ci-smoke.sh /tmp/openshield-perf-ci
 ```
 
-The wrapper has a 1200-second hard process-group timeout and validates the
+The wrapper has an 1800-second hard process-group timeout and validates the
 report schema, file types, permissions, and size bounds. It runs on the single
 openSUSE Tumbleweed `linux/amd64` release stand after all functional firewall
 E2E jobs.
@@ -247,11 +265,16 @@ mismatch makes `baseline_pairing.valid` false and blocks the release.
 
 ## Configuration
 
-Both checked-in files use `openshield.perf.config.v1`. Unknown keys, duplicate
+Both checked-in files use `openshield.perf.config.v2`. In v2, steady repetitions
+denote independent baseline/protected pairs rather than correlated windows in
+one block. Unknown keys, duplicate
 JSON keys, non-finite numbers, unsafe names, duplicate ports, unpinned images,
 and values outside fixed resource bounds are rejected before Docker is used.
 The estimated total workload duration must also fit
-`max_total_workload_seconds`.
+`max_total_workload_seconds`. This deterministic estimate covers configured
+phase, cooldown, and overload durations. It deliberately does not claim to
+cover Docker lifecycle, policy transitions, package setup, or runner jitter;
+the outer process and workflow timeouts separately bound that wall-clock work.
 
 The following values are intended to be replaced with measured production
 p50/p95/p99 distributions later:
@@ -265,6 +288,16 @@ p50/p95/p99 distributions later:
 - all latency, loss, saturation, daemon CPU/RSS, NFQUEUE, and path-shape gates;
 - the single deterministic `seed` used to derive a separate seed for every
   backend, scenario, load point, and phase.
+
+The boolean criterion `cpu_latency_relative_regressions_are_advisory` changes
+only the disposition of repeated relative DUT-cgroup CPU and
+request/TCP-connect latency threshold crossings. It does not change their
+numeric limits or any measurement. It is `true` in `ci-smoke.json`, where those
+relative crossings remain visible evidence but do not alone fail the noisy
+shared-runner release smoke, and `false` in `production-like.json`, where they
+remain blocking. Relative throughput/PPS limits, absolute latency and daemon
+CPU/RSS ceilings, validity, drops, NFQUEUE errors, and fail-closed checks are
+blocking in both profiles.
 
 TCP and UDP `pps` are pacing targets from a documented packet-cost estimate;
 they are not reported as observed PPS. Actual RX/TX PPS and Mbps always come
@@ -281,16 +314,55 @@ TCP and conntrack semantics and never interrupts a request in flight. `short`
 mode still creates one connection per exchange and therefore validates but
 otherwise ignores this field.
 
+The TCP target-rate model also charges this finite lifetime turnover to the
+configured wire caps without assuming that every concurrent socket expires at
+`N / E[L]`. Let `r` be the aggregate operation rate, `N` the concurrency, `k`
+the keep-alive probability, `L` the configured discrete lifetime random
+variable in seconds, and `lambda = r / N` the worker-local operation rate. For
+mixed traffic (`0 < k < 1`), the probability that a persistent cycle reaches a
+lifetime renewal before a competing short request is
+`q(r) = k * E[exp(-lambda * (1 - k) * L)]`. The short-to-keep-alive cycle start
+rate is `B(r) = r * (1 - k) * k`, so the expected lifetime-renewal rate is
+`X(r) = q(r) / (1 - q(r)) * B(r)`. For pure keep-alive, this reduces to
+`X(r) = r / (1 + r * E[L] / N)`; for pure short traffic, `X(r) = 0`.
+
+This is explicitly a steady-state, worker-local Poisson-arrival estimate. It
+models the competing short request that closes an idle persistent socket and
+does not double-count normal connections already included in the per-operation
+cost. Each actual lifetime renewal adds seven estimated packets: four for the
+close and three for the replacement TCP handshake. If `P` is the ordinary
+packet estimate per operation, the nonlinear PPS and CPS candidates solve
+`P * r + 7 * X(r) <= configured_pps` and
+`(1 - k^2) * r + X(r) <= configured_cps`; the final operation target is the
+minimum of those candidates and the independent Mbps candidate. For the
+checked-in pure keep-alive smoke profile, `E[L] = 0.275 s`, `N = 16`, and
+`P = 4.8`; unchanged `pps = 1280` and `cps = 160` produce a corrected target of
+`200.874426 operations/s` and `X = 45.114679 renewals/s`. This correction does
+not lower the offered PPS/CPS or the numerical value of any release threshold.
+It prevents FIN and replacement-handshake traffic from being omitted from the
+target denominator; observed PPS, CPS, and throughput still come from real
+sockets and kernel/interface counters.
+
 ## Measurements and validity
 
 Every phase records:
 
-- actual DUT and peer RX/TX packets and bytes, converted to PPS and Mbps;
+- actual DUT and peer RX/TX packets and bytes, converted to PPS and Mbps over
+  the authenticated workload wall interval. The collector interval and rate
+  denominator are both retained and independently checked before any paired
+  PPS comparison;
 - application operation rate, actual TCP CPS, current/peak/mean flows, response
   latency p50/p95/p99, and separate TCP connect p50/p95/p99 latency;
 - errors, sampled UDP reply loss, kernel TCP retransmits, conntrack count, and
   interface drops/errors;
 - `openshield-daemon` CPU as a percentage of one core and mean/peak RSS;
+- authoritative container-cgroup CPU as raw `cpu.stat` usage minus only the
+  metric collector's own high-resolution process-CPU interval strictly bracketed
+  inside the two cgroup boundaries. Boundary bookkeeping is conservatively left
+  included. The raw, excluded, and adjusted values remain in
+  evidence; unavailable, negative, impossible, or too close-to-zero to resolve
+  the configured relative threshold accounting invalidates the evidence.
+  Daemon children and firewall/kernel work remain included;
 - host-wide NET_RX/NET_TX softirq deltas;
 - NFQUEUE 1337 depth, wrap-safe packet-sequence delta, and exact kernel/user
   drop deltas from `/proc/net/netfilter/nfnetlink_queue`;
@@ -346,21 +418,32 @@ Explicit wrong-executable fail-open behavior is tested separately by the
 independent canary during controlled NFQUEUE overload, so the paired burst
 workloads remain equivalent.
 
-The release `ci-smoke.json` thresholds remain unchanged: at most a 10% paired
-reduction in throughput or DUT PPS and at most a 10% paired increase in request
-p50/p95/p99, TCP-connect p50/p95/p99, or DUT-cgroup CPU. Every per-window delta
-and every threshold crossing is retained in JSON and Markdown evidence. A
-relative regression becomes blocking only for a group of at least three valid
-steady repetitions when the one-sided 95% Student-t lower confidence bound of
-their adjacent pristine AB/BA paired deltas is itself greater than the
-configured threshold. A noisy single crossing therefore remains visible but
-does not silently become a release claim. `production-like.json` uses the same
-method and tightens each relative limit to 5%.
+The numerical release `ci-smoke.json` thresholds remain unchanged: at most a
+10% paired reduction in throughput or DUT PPS and at most a 10% paired increase
+in request p50/p95/p99, TCP-connect p50/p95/p99, or DUT-cgroup CPU. Every
+per-window delta and crossing is retained in JSON and Markdown evidence. For
+throughput and DUT PPS, a group becomes blocking when the arithmetic mean of at
+least three valid, independent, adjacent pristine AB/BA steady pairs exceeds
+the configured limit. The one-sided 95% Student-t lower confidence bound
+remains as stronger evidence; high variance cannot hide a blocking throughput
+or PPS mean regression. In release smoke,
+`cpu_latency_relative_regressions_are_advisory: true` keeps the same mean and
+confidence calculations for relative DUT-cgroup CPU and request/TCP-connect
+latency, but classifies crossings as advisory: they remain prominent evidence
+and do not alone fail publication on the shared runner. Absolute p99 latency,
+daemon CPU/RSS, target-attainment, and validity ceilings are unchanged and
+blocking. `production-like.json` sets the option to `false`, uses 5% for every
+relative limit, and blocks every relative mean regression above those limits.
+Publication-grade non-inferiority still requires the dedicated runner described
+below.
 
-A single burst has insufficient repeated evidence for that relative
-confidence test, so its relative deltas and crossings are diagnostic only.
-Burst validity, configured capacity ceilings, and fail-closed safety remain
-mandatory and blocking. Safety is never deferred to statistical confirmation:
+A single burst has insufficient repeated evidence for a statistical
+non-inferiority claim. It nevertheless applies the configured threshold
+directly: throughput and DUT PPS crossings block both checked-in profiles;
+relative CPU/latency crossings follow the explicit advisory setting (observe in
+CI smoke, fail in production-like). Burst validity, configured capacity
+ceilings, and fail-closed safety also remain mandatory and blocking. Safety is
+never deferred to statistical confirmation:
 application loss/errors, TCP retransmits, NIC drops/errors, NFQUEUE errors or
 drops, a failed identity probe, or any fail-open behavior fails the affected
 ordinary window immediately. The only intentional exception is
@@ -430,7 +513,7 @@ Every run atomically creates owner-only files:
   validated baseline-pairing evidence, and sustainable points;
 - `report.csv`: one flat row per phase for analysis and plotting, including the
   baseline sample, AB/BA order, execution sequence, topology role, monotonic
-  block boundaries, and measured comparison gap;
+  block boundaries, and measured steady-window comparison gap;
 - `overload.csv`: one flat safety-evidence row per backend and TCP/UDP
   controlled-overload proof;
 - `report.md`: short outcome, baseline-pairing status and counts, failed/invalid
@@ -438,35 +521,53 @@ Every run atomically creates owner-only files:
 - `raw/`: bounded per-phase input and evidence useful for diagnosis. Baseline
   and protected environment evidence is retained below the corresponding
   topology-role directory; each canonical result filename includes its
-  `baseline_sample_id`, preventing reused bracket samples from overwriting one
-  another;
+  unique `baseline_sample_id`, preventing independent samples from overwriting
+  one another;
 - `runtime-bundle/`: the exact source-only allowlist mounted into containers,
   plus its canonical manifest; no `.pyc` or unlisted import candidate is allowed.
 
 Each JSON controlled-overload record uses `openshield.perf.overload.v2`; this
 version adds the mandatory, gap-free split between the controlled
 pressure/resume-transition and clean post-resume DUT metric windows. Metric
-documents use `openshield.perf.metrics.v2`; synchronized collectors acknowledge
-the exact initial boundary before workload or overload activity can begin.
+documents use `openshield.perf.metrics.v3`; this version makes raw, bracketed
+collector, and adjusted cgroup CPU explicit. Synchronized collectors acknowledge the exact
+initial boundary before workload or overload activity can begin.
 
 `report.json.baseline_pairing` uses
-`openshield.perf.baseline-pairing.v1` and the strategy
-`nearest_pristine_ab_ba`. It records overall validity and failure reasons,
+`openshield.perf.baseline-pairing.v2` and the strategy
+`independent_order_balanced_ab_ba`. It records overall validity and failure reasons,
 baseline environments, per-backend environment/DUT-identity pairs, baseline
 sample and protected-comparison counts, AB and BA counts, and the maximum
-observed adjacent-block gap. Every normal phase result, in JSON and CSV, carries
-`baseline_sample_id`, `comparison_order`, `execution_sequence`, `topology_role`,
+observed paired steady-window gap. Every normal phase result, in JSON and CSV, carries
+`baseline_sample_id`, `comparison_pair_id`, `comparison_repetition`,
+`comparison_order`, `execution_sequence`, `topology_role`,
 `block_started_monotonic_ns`, `block_finished_monotonic_ns`, and
 `comparison_gap_seconds`. Baseline rows have no comparison order or gap;
-protected rows must name exactly one adjacent sample and a finite non-negative
-gap.
+protected rows must name exactly one adjacent, single-use baseline/pair identity
+and a finite non-negative gap.
 
 Relative throughput, DUT PPS, request and TCP-connect p50/p95/p99 latency, and
 DUT-cgroup CPU deltas are paired by backend, policy, mode, learning variant,
 profile, load level, and steady phase role. All individual deltas and crossings
-remain in the report. The blocking relative decision is made over at least
-three valid steady AB/BA pairs by the one-sided 95% Student-t lower confidence
-bound described above; a burst contributes diagnostic relative evidence only.
+remain in the report. The relative decision is made over at least three valid
+independent steady AB/BA pairs by their arithmetic mean; the one-sided 95%
+Student-t lower confidence bound described above records stronger confirmation.
+Whether CPU/latency crossings are advisory is taken from the authenticated
+configuration field `cpu_latency_relative_regressions_are_advisory`; throughput
+and PPS crossings remain blocking. A burst records a single-sample comparison
+and immediately blocks every crossing whose release action is `fail`.
+The release wrapper then runs a separate source-manifested validator. Starting
+from primary workload and DUT metric fields, it independently recomputes every
+paired delta, arithmetic mean, strict threshold comparison, advisory/blocking
+disposition, Student-t lower bound, observation/failure linkage, and final
+per-row relative outcome. For every steady and burst row it also independently
+recomputes target attainment and absolute p99 latency and checks raw daemon
+CPU/RSS against their configured hard limits instead of trusting
+`capacity_pass`. It also rebuilds
+the normalized configuration from the checked-in JSON, independently derives
+the workload-time estimate, and verifies its canonical compact sorted UTF-8
+SHA-256. A self-consistent but altered report cannot substitute its own
+configuration or relative decision.
 A maximum is called capacity-qualified only
 when `capacity_certification=true`, at least three steady-state repetitions at
 that load point all remain valid, sustainable, and fail-closed, and every
@@ -475,16 +576,21 @@ configured mandatory burst gate for that point passes as well. With
 candidate points but `capacity_qualified` is always false.
 
 In report v2, *paired* means the same backend/profile/load/phase and
-deterministic trace plus the exact `baseline_sample_id` selected by the
-precomputed nearest-pristine AB/BA schedule. Monotonic block boundaries prove
-whether the baseline immediately precedes or follows its protected block. The
+deterministic trace plus a unique `comparison_pair_id`, single-use
+`baseline_sample_id`, and exact repetition. Monotonic block boundaries prove
+whether the baseline immediately precedes or follows its protected block;
+authenticated workload and DUT/peer collector boundaries determine the actual
+steady-window gap independently of warm-up, ramp, burst, teardown, and cooldown. The
 separate baseline DUT remains pristine for its entire lifetime, rather than
 temporarily disabling the daemon in a previously protected namespace. This
-temporal bracketing reduces runner drift and makes the choice auditable; it does
-not turn a shared hosted runner into a controlled benchmark host. The release
-gate remains conservative: missing, ambiguous, reordered, non-adjacent, or
-environment-mismatched pairing evidence fails rather than weakening or
-suppressing a marginal 10% regression.
+adjacent AB/BA design reduces runner drift and makes the choice auditable; it
+does not turn a shared hosted runner into a controlled benchmark host. The
+release gate remains conservative: fewer than three independent pairs, missing
+either order, imbalance greater than one, or missing, duplicated, reordered,
+non-adjacent, ambiguous, or environment-mismatched evidence makes the group
+invalid rather than suppressing a marginal 10% observation. Advisory
+CPU/latency observations remain preserved; they are never rewritten as values
+below the threshold.
 
 Container/veth results are appropriate for regression and architecture-path
 validation. They are not a NIC line-rate claim. Offloads can make interface
@@ -493,7 +599,10 @@ to the host kernel rather than a container or network namespace, and therefore
 includes Docker and unrelated host activity; its deltas are interpreted only
 against the paired baseline on a quiet runner and never as daemon-attributed
 CPU. Docker scheduling adds further noise, and a shared CI runner is not a
-controlled benchmark host. In addition, a signed live Tumbleweed repository is
+controlled benchmark host. The protected daemon also remains resident while
+the separate pristine topology is measured; although its own DUT-cgroup CPU is
+accounted independently, shared-host scheduling can still bias throughput and
+latency. In addition, a signed live Tumbleweed repository is
 mutable between runs even though each run records its exact metadata and RPM
 inventory. Publication-grade numbers require a prebuilt performance image
 pinned by digest, a dedicated runner with reserved CPUs and recorded

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import math
 import random
 import socket
 import struct
@@ -22,6 +23,8 @@ if __package__ in (None, ""):
         MAX_CONCURRENCY,
         MAX_CPS,
         MAX_INFLIGHT_MEMORY_BYTES,
+        MAX_MBPS,
+        MAX_PPS,
         MAX_SERVER_WORKERS,
         MAX_TCP_BODY_BYTES,
         AsyncMultiRateLimiter,
@@ -52,6 +55,8 @@ else:
         MAX_CONCURRENCY,
         MAX_CPS,
         MAX_INFLIGHT_MEMORY_BYTES,
+        MAX_MBPS,
+        MAX_PPS,
         MAX_SERVER_WORKERS,
         MAX_TCP_BODY_BYTES,
         AsyncMultiRateLimiter,
@@ -542,6 +547,33 @@ class TcpWorkloadClient:
     """One-thread event-loop client with many independent real TCP sockets."""
 
     def __init__(self, config: TcpClientConfig, stop: Optional[threading.Event] = None):
+        if config.mode not in ("keepalive", "short", "mixed"):
+            raise ValueError("TCP client workload mode is unsupported")
+        if (
+            not isinstance(config.concurrency, int)
+            or isinstance(config.concurrency, bool)
+            or not 1 <= config.concurrency <= MAX_CONCURRENCY
+        ):
+            raise ValueError("TCP client concurrency is outside the safety bound")
+        for name, value, maximum in (
+            ("pps", config.pps, MAX_PPS),
+            ("cps", config.cps, MAX_CPS),
+            ("mbps", config.mbps, MAX_MBPS),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= maximum
+            ):
+                raise ValueError(f"TCP client {name} is outside the safety bound")
+        if (
+            isinstance(config.keepalive_ratio, bool)
+            or not isinstance(config.keepalive_ratio, (int, float))
+            or not math.isfinite(float(config.keepalive_ratio))
+            or not 0.0 <= float(config.keepalive_ratio) <= 1.0
+        ):
+            raise ValueError("TCP client keepalive ratio is outside the safety bound")
         estimated_flow_memory = (
             config.request_bytes + config.response_mix.maximum_value * 2
         )
@@ -698,6 +730,81 @@ class TcpWorkloadClient:
             + (4 if close else 0)
         )
 
+    def _expected_lifetime_expiration_rate(
+        self, application_ops_per_second: float, keepalive_probability: float
+    ) -> float:
+        """Estimate persistent-connection renewal under a steady offered rate.
+
+        Each worker receives an equal share of the aggregate operation stream.
+        Treating those worker-local arrivals as a Poisson process gives a
+        closed-form competing-risk model: a short request can retire a
+        persistent connection before its selected lifetime, while the first
+        operation after an elapsed lifetime renews it only when that operation
+        is keep-alive.  This includes mixed-mode renewal without double-counting
+        the short and short-to-keepalive connections already present in the
+        per-operation cost model.
+        """
+
+        rate = float(application_ops_per_second)
+        keepalive = float(keepalive_probability)
+        if rate <= 0.0 or keepalive <= 0.0:
+            return 0.0
+        mean_lifetime_seconds = (
+            self.config.connection_lifetime_ms_mix.weighted_mean() / 1_000.0
+        )
+        worker_rate = rate / self.config.concurrency
+        if keepalive >= 1.0:
+            # With no competing short request, a renewal cycle is its selected
+            # lifetime plus the residual wait for the next worker-local
+            # operation.  E[residual] is 1 / worker_rate.
+            return rate / (1.0 + worker_rate * mean_lifetime_seconds)
+
+        short = 1.0 - keepalive
+        # Probability that no short request arrives before the selected
+        # lifetime, averaged over the configured discrete lifetime mix.
+        no_short_before_expiry = sum(
+            entry.weight
+            * math.exp(
+                -worker_rate * short * (entry.value / 1_000.0)
+            )
+            for entry in self.config.connection_lifetime_ms_mix.entries
+        ) / self.config.connection_lifetime_ms_mix.total_weight
+        expires_and_renews = keepalive * no_short_before_expiry
+        # A persistent cycle begins after S->K or after a lifetime renewal.  If
+        # B is the S->K rate and q its lifetime-renewal probability, the renewal
+        # rate X satisfies X = q * (B + X).
+        cycle_denominator = 1.0 - expires_and_renews
+        short_to_keepalive_rate = rate * short * keepalive
+        return (
+            short_to_keepalive_rate
+            * expires_and_renews
+            / cycle_denominator
+        )
+
+    @staticmethod
+    def _bounded_rate_candidate(
+        cap: float, linear_cost: float, total_cost: Callable[[float], float]
+    ) -> float | None:
+        """Return the greatest steady rate satisfying one monotone wire cap."""
+
+        if cap <= 0.0:
+            return None
+        if linear_cost <= 0.0:
+            raise ValueError("rate-model linear cost must be positive")
+        lower = 0.0
+        upper = cap / linear_cost
+        if total_cost(upper) <= cap:
+            return upper
+        # Fixed iterations make the result deterministic and comfortably more
+        # precise than its serialized binary64 workload evidence.
+        for _ in range(80):
+            midpoint = (lower + upper) / 2.0
+            if total_cost(midpoint) <= cap:
+                lower = midpoint
+            else:
+                upper = midpoint
+        return lower
+
     def target_rate_model(self) -> dict:
         """Translate independent wire caps into an expected steady-state op rate."""
 
@@ -743,25 +850,82 @@ class TcpWorkloadClient:
             )
 
         candidates = []
+        packets_per_turnover = 7.0
         if self.config.pps > 0 and expected_packets > 0:
-            candidates.append(self.config.pps / expected_packets)
+            packet_candidate = self._bounded_rate_candidate(
+                self.config.pps,
+                expected_packets,
+                lambda rate: expected_packets * rate
+                + packets_per_turnover
+                * self._expected_lifetime_expiration_rate(
+                    rate, keepalive_probability
+                ),
+            )
+            if packet_candidate is not None:
+                candidates.append(packet_candidate)
         if self.config.mbps > 0 and expected_bytes > 0:
             candidates.append(
                 self.config.mbps * 1_000_000.0 / 8.0 / expected_bytes
             )
-        if self.config.cps > 0 and new_connection_probability > 0:
-            candidates.append(self.config.cps / new_connection_probability)
+        if self.config.cps > 0:
+            if new_connection_probability > 0:
+                connection_candidate = self._bounded_rate_candidate(
+                    self.config.cps,
+                    new_connection_probability,
+                    lambda rate: new_connection_probability * rate
+                    + self._expected_lifetime_expiration_rate(
+                        rate, keepalive_probability
+                    ),
+                )
+                if connection_candidate is not None:
+                    candidates.append(connection_candidate)
+            elif keepalive_probability > 0:
+                mean_lifetime_seconds = (
+                    self.config.connection_lifetime_ms_mix.weighted_mean()
+                    / 1_000.0
+                )
+                maximum_expiration_rate = (
+                    self.config.concurrency / mean_lifetime_seconds
+                )
+                if self.config.cps < maximum_expiration_rate:
+                    # X = r / (1 + r E[L] / concurrency).  Solve X = CPS.
+                    # Use the representable distance from the asymptote instead
+                    # of 1-CPS/asymptote, which can round to zero one ULP below
+                    # the limit.
+                    candidates.append(
+                        self.config.cps
+                        * maximum_expiration_rate
+                        / (maximum_expiration_rate - self.config.cps)
+                    )
         target = min(candidates) if candidates else None
-        return {
-            "target_application_ops_per_second": None
+        lifetime_expiration_rate = (
+            None
             if target is None
-            else round(target, 6),
-            "expected_packets_per_operation": round(expected_packets, 6),
-            "expected_application_bytes_per_operation": round(expected_bytes, 6),
-            "expected_new_connections_per_operation": round(
-                new_connection_probability, 6
+            else self._expected_lifetime_expiration_rate(target, keepalive_probability)
+        )
+        lifetime_turnover_packets_per_second = (
+            None
+            if lifetime_expiration_rate is None
+            else packets_per_turnover * lifetime_expiration_rate
+        )
+        return {
+            # Keep full finite binary64 precision so the raw model remains
+            # algebraically consistent at the maximum supported CPS/PPS rates;
+            # rounding a per-operation probability before multiplying it by a
+            # large target can otherwise manufacture a cap violation.
+            "target_application_ops_per_second": target,
+            "expected_packets_per_operation": expected_packets,
+            "expected_application_bytes_per_operation": expected_bytes,
+            "expected_new_connections_per_operation": new_connection_probability,
+            "expected_lifetime_expirations_per_second": lifetime_expiration_rate,
+            "expected_lifetime_turnover_packets_per_second": (
+                lifetime_turnover_packets_per_second
             ),
-            "scope": "steady-state estimate; initial persistent connections are excluded",
+            "scope": (
+                "steady-state worker-local Poisson-arrival estimate; initial "
+                "persistent connections are excluded; finite keep-alive lifetime "
+                "turnover and competing short connections are included"
+            ),
         }
 
     async def _worker(self, worker_id: int) -> None:

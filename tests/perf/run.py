@@ -70,6 +70,12 @@ ONE_SIDED_T_95 = {
 }
 MINIMUM_RELATIVE_PAIRED_SAMPLES = 3
 RELATIVE_CONFIDENCE_LEVEL = 0.95
+# cgroup-v2 reports usage_usec.  A paired CPU percentage cannot support a
+# threshold claim when two one-microsecond endpoint quantization errors are as
+# large as that threshold relative to the baseline.  Such evidence is invalid,
+# never silently passed; real workload CPU is normally orders of magnitude
+# above this floor.
+CGROUP_CPU_ACCOUNTING_RESOLUTION_SECONDS = 1e-6
 
 def _load_environment_source(
     source_path: Path | None = None,
@@ -130,12 +136,12 @@ validate_sha256_digest = _ENVIRONMENT_SOURCE["validate_sha256_digest"]
 validate_uname = _ENVIRONMENT_SOURCE["validate_uname"]
 
 
-CONFIG_SCHEMA = "openshield.perf.config.v1"
+CONFIG_SCHEMA = "openshield.perf.config.v2"
 REPORT_SCHEMA = "openshield.perf.report.v2"
 OVERLOAD_SCHEMA = "openshield.perf.overload.v2"
-BASELINE_PAIRING_SCHEMA = "openshield.perf.baseline-pairing.v1"
+BASELINE_PAIRING_SCHEMA = "openshield.perf.baseline-pairing.v2"
 WORKLOAD_SCHEMA = "openshield.perf.workload.v1"
-METRICS_SCHEMA = "openshield.perf.metrics.v2"
+METRICS_SCHEMA = "openshield.perf.metrics.v3"
 METRICS_CONTROL_SCHEMA = "openshield.perf.metrics.control.v2"
 WORKLOAD_CONTROL_PROTOCOL = "stdin_start_finish_release_v2"
 # The inner client/collector waits are deliberately longer than every bounded
@@ -148,7 +154,9 @@ PROCESS_TERMINATION_GRACE_SECONDS = 3.0
 MAX_CONFIG_BYTES = 512 * 1024
 MAX_PROFILES = 32
 MAX_LOAD_LEVELS = 32
-MAX_ESTIMATED_WORKLOAD_SECONDS = 86_400.0
+# The production matrix may span more than one day once every statistical
+# sample is an independent AB/BA pair.  Keep the bound explicit and finite.
+MAX_ESTIMATED_WORKLOAD_SECONDS = 172_800.0
 MIN_TCP_CONNECTION_LIFETIME_MS = 50
 MAX_TCP_CONNECTION_LIFETIME_MS = 3_600_000
 MAX_TCP_CLIENT_CONCURRENCY = 512
@@ -177,6 +185,7 @@ HARNESS_COMPONENT_PATHS = (
     "tests/perf/metrics.py",
     "tests/perf/run.py",
     "tests/perf/runtime_launcher.py",
+    "tests/perf/validate_report.py",
     "tests/perf/workloads/common.py",
     "tests/perf/workloads/identity_probe.c",
     "tests/perf/workloads/tcp.py",
@@ -629,6 +638,8 @@ CRITERIA_KEYS = {
     "maximum_dut_pps_reduction_vs_baseline_percent",
     "maximum_latency_increase_vs_baseline_percent",
     "maximum_cgroup_cpu_increase_vs_baseline_percent",
+    "cpu_latency_relative_regressions_are_advisory",
+    "maximum_comparison_gap_seconds",
 }
 PROFILE_KEYS = {
     "name",
@@ -818,6 +829,12 @@ def validate_config(document: dict[str, Any]) -> dict[str, Any]:
         "maximum_cgroup_cpu_increase_vs_baseline_percent",
     ):
         finite_number(criteria[key], key, 0, 1_000_000)
+    finite_number(
+        criteria["maximum_comparison_gap_seconds"],
+        "maximum_comparison_gap_seconds",
+        0.1,
+        300.0,
+    )
     integer(criteria["maximum_daemon_rss_bytes"], "maximum_daemon_rss_bytes", 1, 1 << 50)
     integer(
         criteria["network_only_maximum_queue_hits"],
@@ -825,7 +842,12 @@ def validate_config(document: dict[str, Any]) -> dict[str, Any]:
         0,
         1_000_000,
     )
-    for key in ("require_zero_nic_errors", "require_zero_nfqueue_drops", "require_burst_capacity"):
+    for key in (
+        "require_zero_nic_errors",
+        "require_zero_nfqueue_drops",
+        "require_burst_capacity",
+        "cpu_latency_relative_regressions_are_advisory",
+    ):
         boolean(criteria[key], key)
     if (
         criteria["application_tcp_minimum_queue_hits_per_connection"]
@@ -1112,17 +1134,14 @@ def validate_tcp_server_capacity(
 
 
 def estimate_workload_seconds(config: dict[str, Any]) -> float:
-    phases = config["phases"]
-    phase_seconds = (
-        float(phases["warmup"]["duration_seconds"])
-        + len(phases["ramp"]["scales"]) * float(phases["ramp"]["duration_seconds"])
-        + int(phases["steady"]["repetitions"]) * float(phases["steady"]["duration_seconds"])
-        + float(phases["burst"]["duration_seconds"])
-        + float(phases["cooldown_seconds"])
-    )
-    first_backend = config["backends"][0]
-    blocks_per_backend = sum(1 for _ in paired_load_plan(config, first_backend))
-    total = phase_seconds * blocks_per_backend * len(config["backends"])
+    total = 0.0
+    for backend in config["backends"]:
+        for scenario, _load_level in paired_load_plan(config, backend):
+            total += sum(
+                float(phase["duration"])
+                for phase in comparison_phase_plan(config, scenario)
+            )
+            total += float(config["phases"]["cooldown_seconds"])
     overload = config.get("overload", {})
     if overload.get("enabled"):
         overload_window = (
@@ -1184,6 +1203,45 @@ def phase_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
         }
     )
     return plan
+
+
+def comparison_phase_plan(
+    config: dict[str, Any], scenario: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return the bounded phases for one independent comparison block.
+
+    ``steady.repetitions`` is the number of independent baseline/protected
+    pairs, not a set of adjacent windows inside one long-lived load block.
+    Every pair gets its own warm-up and one steady window.  The first pair
+    performs the configured ramp and the last pair performs the mandatory
+    burst, keeping all four phase roles while avoiding redundant bursts and a
+    threefold CI runtime expansion.
+    """
+
+    repetition = scenario.get("comparison_repetition")
+    repetitions = int(config["phases"]["steady"]["repetitions"])
+    if (
+        not isinstance(repetition, int)
+        or isinstance(repetition, bool)
+        or not 1 <= repetition <= repetitions
+    ):
+        raise HarnessError("comparison repetition is missing or invalid")
+    phases = phase_plan(config)
+    selected: list[dict[str, Any]] = []
+    for phase in phases:
+        role = phase["role"]
+        if role == "steady":
+            if phase["repetition"] == repetition:
+                selected.append(phase)
+        elif role == "ramp":
+            if repetition == 1:
+                selected.append(phase)
+        elif role == "burst":
+            if repetition == repetitions:
+                selected.append(phase)
+        else:
+            selected.append(phase)
+    return selected
 
 
 def scenario_plan(config: dict[str, Any], policy_filter: str) -> Iterable[dict[str, Any]]:
@@ -1279,12 +1337,13 @@ def validate_runtime_compatibility(
 def paired_load_plan(
     config: dict[str, Any], backend: str
 ) -> Iterable[tuple[dict[str, Any], float]]:
-    """Yield the fixed nearest-baseline AB/BA schedule for one backend.
+    """Yield independent, order-balanced baseline/protected comparison pairs.
 
-    A pristine sample may bracket at most two protected blocks: the preceding
-    protected block uses it as BA and the following block uses it as AB.  Pair
-    identity and order are fixed before measurement, so observed values cannot
-    influence baseline selection.
+    Each exact backend/policy/mode/profile/load group gets at least three
+    independent pairs.  A baseline block belongs to exactly one protected
+    block, both carry a unique pair identity, and the deterministic AB/BA order
+    alternates within the group.  Alternating the starting order between
+    groups also balances the complete matrix when the repetition count is odd.
     """
 
     sequence = 0
@@ -1296,8 +1355,16 @@ def paired_load_plan(
         sample_index += 1
         return value
 
+    pair_index = 0
+
+    def next_pair_id() -> str:
+        nonlocal pair_index
+        value = f"p{pair_index:05d}"
+        pair_index += 1
+        return value
+
     def baseline(
-        profile: dict[str, Any], sample: str
+        profile: dict[str, Any], sample: str, pair: str, repetition: int
     ) -> dict[str, Any]:
         return {
             "profile": profile,
@@ -1306,41 +1373,51 @@ def paired_load_plan(
             "learning_variant": None,
             "backend": backend,
             "baseline_sample_id": sample,
+            "comparison_pair_id": pair,
+            "comparison_repetition": repetition,
             "comparison_order": None,
             "topology_role": "baseline",
         }
 
+    group_index = 0
+    repetitions = int(config["phases"]["steady"]["repetitions"])
     for profile in config["profiles"]:
         protected = protected_scenarios_for_profile(config, profile)
         for load_level_value in config["load_levels"]:
             load_level = float(load_level_value)
-            current_sample = sample_id()
-            first = baseline(profile, current_sample)
-            first["execution_sequence"] = sequence
-            sequence += 1
-            yield first, load_level
-            for index, original in enumerate(protected):
-                scenario = dict(original)
-                scenario["backend"] = backend
-                scenario["topology_role"] = "protected"
-                if index % 2 == 0:
-                    scenario["baseline_sample_id"] = current_sample
-                    scenario["comparison_order"] = "ab"
-                    scenario["execution_sequence"] = sequence
+            for original in protected:
+                for repetition in range(1, repetitions + 1):
+                    sample = sample_id()
+                    pair = next_pair_id()
+                    order = (
+                        "ab"
+                        if (group_index + repetition - 1) % 2 == 0
+                        else "ba"
+                    )
+                    scenario = dict(original)
+                    scenario.update(
+                        {
+                            "backend": backend,
+                            "topology_role": "protected",
+                            "baseline_sample_id": sample,
+                            "comparison_pair_id": pair,
+                            "comparison_repetition": repetition,
+                            "comparison_order": order,
+                        }
+                    )
+                    pristine = baseline(profile, sample, pair, repetition)
+                    first, second = (
+                        (pristine, scenario)
+                        if order == "ab"
+                        else (scenario, pristine)
+                    )
+                    first["execution_sequence"] = sequence
                     sequence += 1
-                    yield scenario, load_level
-                    continue
-                next_sample = sample_id()
-                scenario["baseline_sample_id"] = next_sample
-                scenario["comparison_order"] = "ba"
-                scenario["execution_sequence"] = sequence
-                sequence += 1
-                yield scenario, load_level
-                following = baseline(profile, next_sample)
-                following["execution_sequence"] = sequence
-                sequence += 1
-                yield following, load_level
-                current_sample = next_sample
+                    yield first, load_level
+                    second["execution_sequence"] = sequence
+                    sequence += 1
+                    yield second, load_level
+                group_index += 1
 
 
 def safe_tail(value: str, maximum: int = 4_096) -> str:
@@ -4888,6 +4965,8 @@ class DockerBackendRun:
             "phase_scale": phase["scale"],
             "repetition": phase["repetition"],
             "baseline_sample_id": scenario["baseline_sample_id"],
+            "comparison_pair_id": scenario["comparison_pair_id"],
+            "comparison_repetition": scenario["comparison_repetition"],
             "comparison_order": scenario["comparison_order"],
             "execution_sequence": scenario["execution_sequence"],
             "topology_role": self.topology_role,
@@ -4938,7 +5017,7 @@ class DockerBackendRun:
 
         profile = scenario["profile"]
         self.prepare_policy(scenario)
-        phases = phase_plan(self.config)
+        phases = comparison_phase_plan(self.config, scenario)
         total_phase_time = sum(float(phase["duration"]) for phase in phases)
         maximum_duration = total_phase_time + 30
         start_index = len(results)
@@ -4947,6 +5026,7 @@ class DockerBackendRun:
             self.config["seed"],
             profile["name"],
             f"{load_level:g}",
+            f"comparison-{scenario['comparison_repetition']}",
         )
         process, server_pid, prefix = self.start_server(profile, seed, maximum_duration)
         server_container = (
@@ -7395,6 +7475,69 @@ def evaluate_result(result: dict[str, Any], criteria: dict[str, Any]) -> None:
 
     metric_sides = (("dut_metrics", "DUT"), ("peer_metrics", "peer"))
     for side, description in metric_sides:
+        metric_document = result.get(side)
+        cgroup = nested(result, side, "cgroup", default={})
+        elapsed_seconds = (
+            numeric(metric_document.get("elapsed_seconds"))
+            if isinstance(metric_document, dict)
+            else None
+        )
+        raw_cgroup_cpu = (
+            numeric(cgroup.get("raw_cpu_seconds"))
+            if isinstance(cgroup, dict)
+            else None
+        )
+        excluded_collector_cpu = (
+            numeric(cgroup.get("collector_cpu_seconds_excluded"))
+            if isinstance(cgroup, dict)
+            else None
+        )
+        authoritative_cgroup_cpu = (
+            numeric(cgroup.get("cpu_seconds"))
+            if isinstance(cgroup, dict)
+            else None
+        )
+        authoritative_cgroup_percent = (
+            numeric(cgroup.get("cpu_percent_one_core"))
+            if isinstance(cgroup, dict)
+            else None
+        )
+        if (
+            not isinstance(metric_document, dict)
+            or metric_document.get("schema") != METRICS_SCHEMA
+            or elapsed_seconds is None
+            or elapsed_seconds <= 0
+            or not isinstance(cgroup, dict)
+            or cgroup.get("accounting")
+            != "container_cgroup_minus_metric_collector"
+            or raw_cgroup_cpu is None
+            or excluded_collector_cpu is None
+            or authoritative_cgroup_cpu is None
+            or authoritative_cgroup_percent is None
+            or min(
+                raw_cgroup_cpu,
+                excluded_collector_cpu,
+                authoritative_cgroup_cpu,
+                authoritative_cgroup_percent,
+            )
+            < 0
+            or excluded_collector_cpu > raw_cgroup_cpu + 1e-6
+            or not math.isclose(
+                authoritative_cgroup_cpu,
+                max(0.0, raw_cgroup_cpu - excluded_collector_cpu),
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                authoritative_cgroup_percent,
+                authoritative_cgroup_cpu * 100.0 / elapsed_seconds,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+        ):
+            unreliable.append(
+                f"{description} authoritative collector-excluded cgroup CPU evidence is invalid"
+            )
         for name in ("rx_pps", "tx_pps", "rx_mbps", "tx_mbps"):
             value = numeric(nested(result, side, "network", name))
             if value is None or value < 0:
@@ -8185,6 +8328,141 @@ def relative_reduction_percent(baseline: Any, current: Any) -> float | None:
     return None if increase is None else -increase
 
 
+def steady_measurement_intervals(
+    result: dict[str, Any],
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+    """Return bounded DUT, peer, and authenticated-workload steady intervals.
+
+    Pair proximity must be measured between the windows which contribute the
+    paired delta, not between the outer workload blocks.  The latter include
+    policy preparation, warm-up, ramp, burst, server teardown, and cooldown and
+    can therefore make a distant comparison look adjacent.  The DUT and peer
+    collectors intentionally bracket the workload; retaining all three
+    intervals prevents a wider envelope from understating controller delay
+    between real workloads.
+    """
+
+    if result.get("phase_role") != "steady":
+        return None
+    dut_metrics = result.get("dut_metrics")
+    peer_metrics = result.get("peer_metrics")
+    if not isinstance(dut_metrics, dict) or not isinstance(peer_metrics, dict):
+        return None
+    dut_started = dut_metrics.get("started_at_monotonic_ns")
+    dut_finished = dut_metrics.get("finished_at_monotonic_ns")
+    peer_started = peer_metrics.get("started_at_monotonic_ns")
+    peer_finished = peer_metrics.get("finished_at_monotonic_ns")
+    workload_started = nested(
+        result, "workload_started", "boundary_monotonic_ns"
+    )
+    workload_finished = nested(
+        result, "workload_finished", "boundary_monotonic_ns"
+    )
+    block_started = result.get("block_started_monotonic_ns")
+    block_finished = result.get("block_finished_monotonic_ns")
+    values = (
+        dut_started,
+        peer_started,
+        workload_started,
+        workload_finished,
+        dut_finished,
+        peer_finished,
+        block_started,
+        block_finished,
+    )
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in values
+    ):
+        return None
+    dut_bounded = (
+        block_started
+        <= dut_started
+        <= workload_started
+        < workload_finished
+        <= dut_finished
+        <= block_finished
+    )
+    peer_bounded = (
+        block_started
+        <= peer_started
+        <= workload_started
+        < workload_finished
+        <= peer_finished
+        <= block_finished
+    )
+    if not dut_bounded or not peer_bounded:
+        return None
+    return (
+        (dut_started, dut_finished),
+        (peer_started, peer_finished),
+        (workload_started, workload_finished),
+    )
+
+
+def paired_steady_measurement_gap_seconds(
+    baseline: dict[str, Any], current: dict[str, Any], order: Any
+) -> float | None:
+    """Return the conservative gap between actual paired steady windows."""
+
+    baseline_intervals = steady_measurement_intervals(baseline)
+    current_intervals = steady_measurement_intervals(current)
+    if baseline_intervals is None or current_intervals is None:
+        return None
+    gaps: list[int] = []
+    for baseline_interval, current_interval in zip(
+        baseline_intervals, current_intervals, strict=True
+    ):
+        baseline_started, baseline_finished = baseline_interval
+        current_started, current_finished = current_interval
+        if order == "ab" and baseline_finished <= current_started:
+            gaps.append(current_started - baseline_finished)
+        elif order == "ba" and current_finished <= baseline_started:
+            gaps.append(baseline_started - current_finished)
+        else:
+            return None
+    # The collector envelope is deliberately wider than the workload interval.
+    # Max is fail-closed if later instrumentation adds a differently bracketed
+    # interval, and today equals the real workload-to-workload gap.
+    return max(gaps) / 1_000_000_000.0
+
+
+def cgroup_cpu_relative_increase_percent(
+    baseline_result: dict[str, Any],
+    current_result: dict[str, Any],
+    maximum_increase_percent: float,
+) -> float | None:
+    """Return CPU overhead only when its baseline resolves the threshold.
+
+    Both endpoints can contribute one ``usage_usec`` unit.  If that bounded
+    quantization alone could equal the configured relative limit, treating the
+    percentage as evidence would turn a near-zero denominator into a false
+    regression.  The caller consequently marks this pair incomplete/invalid.
+    """
+
+    baseline_seconds = numeric(
+        nested(baseline_result, "dut_metrics", "cgroup", "cpu_seconds")
+    )
+    baseline_percent = nested(
+        baseline_result, "derived", "cgroup_cpu_percent_one_core"
+    )
+    current_percent = nested(
+        current_result, "derived", "cgroup_cpu_percent_one_core"
+    )
+    threshold = numeric(maximum_increase_percent)
+    if baseline_seconds is None or threshold is None or threshold <= 0:
+        return None
+    minimum_resolved_baseline = (
+        2.0
+        * CGROUP_CPU_ACCOUNTING_RESOLUTION_SECONDS
+        * 100.0
+        / threshold
+    )
+    if baseline_seconds < minimum_resolved_baseline:
+        return None
+    return relative_increase_percent(baseline_percent, current_percent)
+
+
 def relative_metric_specs(transport: Any) -> tuple[tuple[str, str, str], ...]:
     """Return (measurement, criterion, human description) gate definitions."""
 
@@ -8228,6 +8506,27 @@ def relative_metric_specs(transport: Any) -> tuple[tuple[str, str, str], ...]:
     )
 
 
+def relative_metric_is_advisory(
+    criterion_name: str, criteria: dict[str, Any]
+) -> bool:
+    """Return whether this relative crossing is deliberately non-blocking.
+
+    The short shared-runner smoke keeps the original ten-percent observation
+    thresholds, but may classify CPU and latency deltas as advisory while an
+    operator evaluates usability. Throughput and PPS regressions are never
+    covered by this exception, and absolute resource/safety limits remain
+    independent hard gates.
+    """
+
+    return bool(criteria["cpu_latency_relative_regressions_are_advisory"]) and (
+        criterion_name
+        in {
+            "maximum_latency_increase_vs_baseline_percent",
+            "maximum_cgroup_cpu_increase_vs_baseline_percent",
+        }
+    )
+
+
 def one_sided_mean_lower_bound(values: list[float]) -> float | None:
     """Return a one-sided 95% lower bound for independent paired deltas."""
 
@@ -8249,10 +8548,14 @@ def apply_confirmed_relative_gates(
 
     Per-window deltas remain in ``overhead_vs_baseline`` and threshold
     crossings remain in ``relative_performance_observation_reasons``. A
-    crossing becomes a release failure only when the one-sided 95% lower
-    confidence bound of at least three steady paired deltas is itself above
-    the unchanged configured threshold. A single burst remains a capacity and
-    safety gate, but is explicitly insufficient for a relative claim.
+    group becomes a release failure when the arithmetic mean of at least three
+    independent steady paired deltas exceeds the unchanged configured
+    threshold, except for criteria explicitly assigned the ``observe`` action.
+    The one-sided 95% lower confidence bound is retained as stronger
+    confirmation, not as a loophole through which a high-variance blocking
+    mean regression can pass. A single burst cannot establish a statistical
+    regression claim, but its direct threshold crossing still blocks metrics
+    assigned the ``fail`` action.
     """
 
     groups: dict[
@@ -8273,19 +8576,74 @@ def apply_confirmed_relative_gates(
         groups.setdefault(key, []).append(result)
 
     for rows in groups.values():
+        eligible_rows = [
+            row
+            for row in rows
+            if row.get("baseline", {}).get("eligible") is True
+            and row.get("valid") is True
+        ]
+        pair_ids = [row.get("comparison_pair_id") for row in eligible_rows]
+        baseline_ids = [row.get("baseline_sample_id") for row in eligible_rows]
+        repetitions = [row.get("comparison_repetition") for row in eligible_rows]
+        orders = [row.get("comparison_order") for row in eligible_rows]
+        independent_pairs_valid = (
+            len(eligible_rows) >= MINIMUM_RELATIVE_PAIRED_SAMPLES
+            and all(
+                isinstance(value, str) and NAME_PATTERN.fullmatch(value)
+                for value in (*pair_ids, *baseline_ids)
+            )
+            and len(set(pair_ids)) == len(pair_ids)
+            and len(set(baseline_ids)) == len(baseline_ids)
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in repetitions
+            )
+            and len(set(repetitions)) == len(repetitions)
+            and set(orders) == {"ab", "ba"}
+            and abs(orders.count("ab") - orders.count("ba")) <= 1
+        )
+        if not independent_pairs_valid:
+            for row in rows:
+                row.setdefault("unreliable_reasons", []).append(
+                    "independent paired relative-performance evidence is "
+                    "insufficient, duplicated, or not AB/BA balanced"
+                )
         evidence: list[dict[str, Any]] = []
         for metric_name, criterion_name, description in relative_metric_specs(
             rows[0].get("transport")
         ):
             values = [
                 numeric(row.get("overhead_vs_baseline", {}).get(metric_name))
-                for row in rows
-                if row.get("baseline", {}).get("eligible") is True
-                and row.get("valid") is True
+                for row in eligible_rows
             ]
             paired_values = [value for value in values if value is not None]
-            lower_bound = one_sided_mean_lower_bound(paired_values)
+            metric_evidence_complete = (
+                independent_pairs_valid
+                and len(paired_values) == len(eligible_rows)
+            )
+            if not metric_evidence_complete:
+                for row in rows:
+                    row.setdefault("unreliable_reasons", []).append(
+                        f"independent paired evidence for {description} is incomplete"
+                    )
+            lower_bound = (
+                one_sided_mean_lower_bound(paired_values)
+                if metric_evidence_complete
+                else None
+            )
             threshold = float(criteria[criterion_name])
+            mean_percent = (
+                sum(paired_values) / len(paired_values)
+                if paired_values
+                else None
+            )
+            mean_exceeded = (
+                metric_evidence_complete
+                and mean_percent is not None
+                and mean_percent > threshold
+            )
             confirmed = lower_bound is not None and lower_bound > threshold
             evidence.append(
                 {
@@ -8295,23 +8653,33 @@ def apply_confirmed_relative_gates(
                     "sample_count": len(paired_values),
                     "minimum_sample_count": MINIMUM_RELATIVE_PAIRED_SAMPLES,
                     "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
-                    "method": "one_sided_paired_student_t_mean_lower_bound",
-                    "mean_percent": (
-                        sum(paired_values) / len(paired_values)
-                        if paired_values
-                        else None
+                    "method": "arithmetic_mean_of_independent_paired_deltas",
+                    "confirmation_method": (
+                        "one_sided_paired_student_t_mean_lower_bound"
                     ),
+                    "independent_pair_ids": pair_ids,
+                    "baseline_sample_ids": baseline_ids,
+                    "comparison_orders": orders,
+                    "independent_pairs_valid": metric_evidence_complete,
+                    "mean_percent": mean_percent,
+                    "mean_exceeded_threshold": mean_exceeded,
                     "lower_confidence_bound_percent": lower_bound,
                     "confirmed_regression": confirmed,
+                    "release_action": (
+                        "observe"
+                        if relative_metric_is_advisory(criterion_name, criteria)
+                        else "fail"
+                    ),
                 }
             )
-            if confirmed:
+            if mean_exceeded:
                 reason = (
-                    "paired-sample 95% lower confidence bound for "
+                    "independent paired mean for "
                     f"{description} exceeded the configured bound"
                 )
                 for row in rows:
-                    row["relative_performance_failure_reasons"].append(reason)
+                    if not relative_metric_is_advisory(criterion_name, criteria):
+                        row["relative_performance_failure_reasons"].append(reason)
         for row in rows:
             row["relative_performance_evidence"] = evidence
             recompute_result_outcome(row, criteria)
@@ -8319,28 +8687,42 @@ def apply_confirmed_relative_gates(
     for result in results:
         if result.get("policy") == "baseline" or result.get("phase_role") != "burst":
             continue
-        result["relative_performance_evidence"] = [
-            {
+        burst_evidence: list[dict[str, Any]] = []
+        for metric_name, criterion_name, description in relative_metric_specs(
+            result.get("transport")
+        ):
+            observed = numeric(
+                result.get("overhead_vs_baseline", {}).get(metric_name)
+            )
+            threshold = float(criteria[criterion_name])
+            mean_exceeded = observed is not None and observed > threshold
+            release_action = (
+                "observe"
+                if relative_metric_is_advisory(criterion_name, criteria)
+                else "fail"
+            )
+            burst_evidence.append(
+                {
                 "metric": metric_name,
                 "description": description,
-                "threshold_percent": float(criteria[criterion_name]),
-                "sample_count": 1
-                if numeric(result.get("overhead_vs_baseline", {}).get(metric_name))
-                is not None
-                else 0,
+                "threshold_percent": threshold,
+                "sample_count": 1 if observed is not None else 0,
                 "minimum_sample_count": MINIMUM_RELATIVE_PAIRED_SAMPLES,
                 "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
-                "method": "single_burst_observation_not_a_relative_gate",
-                "mean_percent": numeric(
-                    result.get("overhead_vs_baseline", {}).get(metric_name)
-                ),
+                "method": "single_paired_burst_threshold_gate",
+                "mean_percent": observed,
+                "mean_exceeded_threshold": mean_exceeded,
                 "lower_confidence_bound_percent": None,
                 "confirmed_regression": False,
-            }
-            for metric_name, criterion_name, description in relative_metric_specs(
-                result.get("transport")
+                "release_action": release_action,
+                }
             )
-        ]
+            if mean_exceeded and release_action == "fail":
+                result["relative_performance_failure_reasons"].append(
+                    "single paired burst for "
+                    f"{description} exceeded the configured bound"
+                )
+        result["relative_performance_evidence"] = burst_evidence
         recompute_result_outcome(result, criteria)
 
 
@@ -8397,6 +8779,19 @@ def add_baseline_comparisons(
                 result["phase"],
             )
             baselines.setdefault(key, []).append(result)
+    steady_blocks: dict[
+        tuple[str, str | None, str | None, str], list[dict[str, Any]]
+    ] = {}
+    for result in results:
+        if result.get("phase_role") != "steady":
+            continue
+        key = (
+            result["backend"],
+            result.get("baseline_sample_id"),
+            result.get("comparison_pair_id"),
+            result.get("topology_role"),
+        )
+        steady_blocks.setdefault(key, []).append(result)
     for result in results:
         if result["policy"] == "baseline":
             continue
@@ -8417,7 +8812,12 @@ def add_baseline_comparisons(
                 "paired baseline is ambiguous",
                 "paired baseline is saturated or invalid",
                 "paired baseline is not the predetermined adjacent sample",
+                "paired baseline comparison gap exceeded the configured bound",
+                "paired steady measurement boundaries are missing, invalid, or out of AB/BA order",
+                "paired baseline has a mismatched independent-pair identity",
+                "independent paired relative-performance evidence is insufficient, duplicated, or not AB/BA balanced",
             }
+            and not reason.startswith("independent paired evidence for ")
         ]
         result["relative_performance_failure_reasons"] = []
         result["relative_performance_observation_reasons"] = []
@@ -8468,22 +8868,41 @@ def add_baseline_comparisons(
                 and baseline_started <= baseline_finished <= current_started
                 and current_started <= current_finished
             )
-            if temporal_valid:
-                gap_seconds = (current_started - baseline_finished) / 1_000_000_000
         elif temporal_valid and order == "ba":
             temporal_valid = (
                 baseline_sequence == current_sequence + 1
                 and current_started <= current_finished <= baseline_started
                 and baseline_started <= baseline_finished
             )
-            if temporal_valid:
-                gap_seconds = (baseline_started - current_finished) / 1_000_000_000
         else:
             temporal_valid = False
-        result["comparison_gap_seconds"] = gap_seconds
         if not temporal_valid:
             result["unreliable_reasons"].append(
                 "paired baseline is not the predetermined adjacent sample"
+            )
+
+        steady_key = (
+            result["backend"],
+            result.get("baseline_sample_id"),
+            result.get("comparison_pair_id"),
+        )
+        baseline_steady = steady_blocks.get((*steady_key, "baseline"), [])
+        current_steady = steady_blocks.get((*steady_key, "protected"), [])
+        steady_temporal_valid = len(baseline_steady) == 1 and len(current_steady) == 1
+        if steady_temporal_valid:
+            gap_seconds = paired_steady_measurement_gap_seconds(
+                baseline_steady[0], current_steady[0], order
+            )
+            steady_temporal_valid = gap_seconds is not None
+        result["comparison_gap_seconds"] = gap_seconds
+        if not steady_temporal_valid:
+            result["unreliable_reasons"].append(
+                "paired steady measurement boundaries are missing, invalid, or out of AB/BA order"
+            )
+        elif gap_seconds > float(criteria["maximum_comparison_gap_seconds"]):
+            steady_temporal_valid = False
+            result["unreliable_reasons"].append(
+                "paired baseline comparison gap exceeded the configured bound"
             )
         baseline_eligible = baseline.get("valid") is True and (
             not gated_phase
@@ -8491,11 +8910,13 @@ def add_baseline_comparisons(
                 baseline.get("capacity_pass") is True
                 and baseline.get("safety_pass") is True
             )
-        ) and temporal_valid
+        ) and temporal_valid and steady_temporal_valid
         if not baseline_eligible:
             result["unreliable_reasons"].append("paired baseline is saturated or invalid")
         result["baseline"] = {
             "sample_id": baseline.get("baseline_sample_id"),
+            "comparison_pair_id": baseline.get("comparison_pair_id"),
+            "comparison_repetition": baseline.get("comparison_repetition"),
             "comparison_order": order,
             "execution_sequence": baseline_sequence,
             "comparison_gap_seconds": gap_seconds,
@@ -8528,18 +8949,23 @@ def add_baseline_comparisons(
                 baseline, "derived", "connect_latency_p99_ms"
             ),
         }
+        if (
+            baseline.get("comparison_pair_id")
+            != result.get("comparison_pair_id")
+            or baseline.get("comparison_repetition")
+            != result.get("comparison_repetition")
+        ):
+            result["unreliable_reasons"].append(
+                "paired baseline has a mismatched independent-pair identity"
+            )
+            result["baseline"]["eligible"] = False
+            baseline_eligible = False
         baseline_rate = nested(baseline, "derived", "actual_application_ops_per_second")
         current_rate = nested(result, "derived", "actual_application_ops_per_second")
         baseline_throughput = nested(baseline, "derived", "actual_application_mbps")
         current_throughput = nested(result, "derived", "actual_application_mbps")
         baseline_pps = nested(baseline, "derived", "aggregate_dut_pps")
         current_pps = nested(result, "derived", "aggregate_dut_pps")
-        baseline_cgroup_cpu = nested(
-            baseline, "derived", "cgroup_cpu_percent_one_core"
-        )
-        current_cgroup_cpu = nested(
-            result, "derived", "cgroup_cpu_percent_one_core"
-        )
         overhead: dict[str, Any] = {
             "application_ops_reduction_percent": relative_reduction_percent(
                 baseline_rate, current_rate
@@ -8550,8 +8976,10 @@ def add_baseline_comparisons(
             "aggregate_dut_pps_reduction_percent": relative_reduction_percent(
                 baseline_pps, current_pps
             ),
-            "cgroup_cpu_increase_percent": relative_increase_percent(
-                baseline_cgroup_cpu, current_cgroup_cpu
+            "cgroup_cpu_increase_percent": cgroup_cpu_relative_increase_percent(
+                baseline,
+                result,
+                float(criteria["maximum_cgroup_cpu_increase_vs_baseline_percent"]),
             ),
         }
         for percentile in ("p50", "p95", "p99"):
@@ -8605,7 +9033,7 @@ def baseline_pairing_evidence(
     protected_environments: list[dict[str, Any]],
     generation_pairs: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Validate the predetermined nearest pristine-baseline schedule."""
+    """Validate independent, predetermined and order-balanced comparison pairs."""
 
     failures: list[str] = []
     expected_backends = list(config["backends"])
@@ -8704,11 +9132,16 @@ def baseline_pairing_evidence(
             last_sequence[backend] = sequence
         block_rows.setdefault(block_key, []).append(result)
 
-    expected_phases = [phase["name"] for phase in phase_plan(config)]
     comparison_count = 0
     baseline_sample_count = 0
     order_counts = {"ab": 0, "ba": 0}
     gaps: list[float] = []
+    protected_groups: dict[
+        tuple[str, str, str | None, str | None, str, float],
+        list[tuple[int, str, str, str]],
+    ] = {}
+    baseline_ids: set[tuple[str, str]] = set()
+    pair_ids: set[tuple[str, str]] = set()
     for backend in config["backends"]:
         actual_sequences = observed_block_order.get(backend, [])
         if not actual_sequences:
@@ -8727,6 +9160,8 @@ def baseline_pairing_evidence(
                 first.get("learning_variant"),
                 first.get("load_level"),
                 first.get("baseline_sample_id"),
+                first.get("comparison_pair_id"),
+                first.get("comparison_repetition"),
                 first.get("comparison_order"),
                 first.get("topology_role"),
                 first.get("block_started_monotonic_ns"),
@@ -8740,6 +9175,8 @@ def baseline_pairing_evidence(
                     row.get("learning_variant"),
                     row.get("load_level"),
                     row.get("baseline_sample_id"),
+                    row.get("comparison_pair_id"),
+                    row.get("comparison_repetition"),
                     row.get("comparison_order"),
                     row.get("topology_role"),
                     row.get("block_started_monotonic_ns"),
@@ -8756,17 +9193,23 @@ def baseline_pairing_evidence(
                 expected_scenario.get("learning_variant"),
                 expected_load,
                 expected_scenario["baseline_sample_id"],
+                expected_scenario["comparison_pair_id"],
+                expected_scenario["comparison_repetition"],
                 expected_scenario["comparison_order"],
                 expected_scenario["topology_role"],
             )
-            if identity[:8] != expected_identity:
+            if identity[:10] != expected_identity:
                 failures.append(f"{backend}: block {sequence} differs from the AB/BA plan")
+            expected_phases = [
+                phase["name"]
+                for phase in comparison_phase_plan(config, expected_scenario)
+            ]
             phases = [row.get("phase") for row in rows]
             if sorted(phases) != sorted(expected_phases) or len(phases) != len(
                 set(phases)
             ):
                 failures.append(f"{backend}: block {sequence} has an incomplete phase set")
-            started, finished = identity[8:]
+            started, finished = identity[10:]
             if (
                 not isinstance(started, int)
                 or isinstance(started, bool)
@@ -8778,6 +9221,18 @@ def baseline_pairing_evidence(
                 failures.append(f"{backend}: block {sequence} timestamps are invalid")
             if first.get("policy") == "baseline":
                 baseline_sample_count += 1
+                sample = first.get("baseline_sample_id")
+                pair = first.get("comparison_pair_id")
+                sample_key = (backend, sample) if isinstance(sample, str) else None
+                pair_key = (backend, pair) if isinstance(pair, str) else None
+                if sample_key is None or sample_key in baseline_ids:
+                    failures.append(f"{backend}: baseline sample identity is duplicated")
+                else:
+                    baseline_ids.add(sample_key)
+                if pair_key is None or pair_key in pair_ids:
+                    failures.append(f"{backend}: comparison pair identity is duplicated")
+                else:
+                    pair_ids.add(pair_key)
                 if any(row.get("comparison_gap_seconds") is not None for row in rows):
                     failures.append(f"{backend}: baseline block exposes a comparison gap")
             else:
@@ -8787,6 +9242,30 @@ def baseline_pairing_evidence(
                     order_counts[order] += 1
                 else:
                     failures.append(f"{backend}: protected block has invalid pair order")
+                repetition = first.get("comparison_repetition")
+                pair = first.get("comparison_pair_id")
+                sample = first.get("baseline_sample_id")
+                if (
+                    not isinstance(repetition, int)
+                    or isinstance(repetition, bool)
+                    or not isinstance(pair, str)
+                    or not isinstance(sample, str)
+                ):
+                    failures.append(
+                        f"{backend}: protected block has invalid independent-pair identity"
+                    )
+                else:
+                    group = (
+                        backend,
+                        first.get("policy"),
+                        first.get("mode"),
+                        first.get("learning_variant"),
+                        first.get("profile"),
+                        float(first.get("load_level")),
+                    )
+                    protected_groups.setdefault(group, []).append(
+                        (repetition, pair, sample, order)
+                    )
                 block_gaps = [row.get("comparison_gap_seconds") for row in rows]
                 reported_gap = block_gaps[0] if block_gaps else None
                 if (
@@ -8807,46 +9286,103 @@ def baseline_pairing_evidence(
                         or adjacent.get("topology_role") != "baseline"
                         or adjacent.get("baseline_sample_id")
                         != first.get("baseline_sample_id")
+                        or adjacent.get("comparison_pair_id")
+                        != first.get("comparison_pair_id")
+                        or adjacent.get("comparison_repetition")
+                        != first.get("comparison_repetition")
                     ):
                         failures.append(
                             f"{backend}: protected block {sequence} lacks its adjacent baseline"
                         )
                     else:
-                        protected_boundary = started if order == "ab" else finished
-                        baseline_boundary = adjacent.get(
-                            "block_finished_monotonic_ns"
-                            if order == "ab"
-                            else "block_started_monotonic_ns"
+                        baseline_started = adjacent.get("block_started_monotonic_ns")
+                        baseline_finished = adjacent.get("block_finished_monotonic_ns")
+                        block_order_valid = (
+                            isinstance(started, int)
+                            and not isinstance(started, bool)
+                            and isinstance(finished, int)
+                            and not isinstance(finished, bool)
+                            and isinstance(baseline_started, int)
+                            and not isinstance(baseline_started, bool)
+                            and isinstance(baseline_finished, int)
+                            and not isinstance(baseline_finished, bool)
+                            and (
+                                baseline_finished <= started
+                                if order == "ab"
+                                else finished <= baseline_started
+                            )
                         )
-                        if any(
-                            not isinstance(value, int) or isinstance(value, bool)
-                            for value in (protected_boundary, baseline_boundary)
-                        ):
+                        if not block_order_valid:
                             failures.append(
                                 f"{backend}: protected block {sequence} has invalid adjacent timestamps"
                             )
                         else:
-                            gap_ns = (
-                                protected_boundary - baseline_boundary
-                                if order == "ab"
-                                else baseline_boundary - protected_boundary
+                            baseline_steady = [
+                                row
+                                for row in baseline_rows
+                                if row.get("phase_role") == "steady"
+                            ]
+                            protected_steady = [
+                                row
+                                for row in rows
+                                if row.get("phase_role") == "steady"
+                            ]
+                            expected_gap = (
+                                paired_steady_measurement_gap_seconds(
+                                    baseline_steady[0], protected_steady[0], order
+                                )
+                                if len(baseline_steady) == 1
+                                and len(protected_steady) == 1
+                                else None
                             )
-                            expected_gap = gap_ns / 1_000_000_000.0
-                            if gap_ns < 0 or not math.isclose(
+                            if expected_gap is None:
+                                failures.append(
+                                    f"{backend}: protected block {sequence} has invalid paired steady measurement boundaries"
+                                )
+                            elif not math.isclose(
                                 float(reported_gap),
                                 expected_gap,
                                 rel_tol=0.0,
                                 abs_tol=1e-9,
                             ):
                                 failures.append(
-                                    f"{backend}: protected block {sequence} gap differs from timestamps"
+                                    f"{backend}: protected block {sequence} gap differs from steady measurement timestamps"
                                 )
                             else:
                                 gaps.append(float(reported_gap))
+                                if float(reported_gap) > float(
+                                    config["criteria"][
+                                        "maximum_comparison_gap_seconds"
+                                    ]
+                                ):
+                                    failures.append(
+                                        f"{backend}: protected block {sequence} "
+                                        "comparison gap exceeds the configured bound"
+                                    )
+
+    repetitions = int(config["phases"]["steady"]["repetitions"])
+    expected_repetitions = set(range(1, repetitions + 1))
+    for group, samples in protected_groups.items():
+        label = "/".join(str(component) for component in group)
+        observed_repetitions = {sample[0] for sample in samples}
+        observed_pairs = {sample[1] for sample in samples}
+        observed_baselines = {sample[2] for sample in samples}
+        observed_orders = [sample[3] for sample in samples]
+        if (
+            len(samples) != repetitions
+            or observed_repetitions != expected_repetitions
+            or len(observed_pairs) != repetitions
+            or len(observed_baselines) != repetitions
+        ):
+            failures.append(f"{label}: independent comparison pair set is incomplete")
+        ab_count = observed_orders.count("ab")
+        ba_count = observed_orders.count("ba")
+        if {"ab", "ba"} - set(observed_orders) or abs(ab_count - ba_count) > 1:
+            failures.append(f"{label}: comparison pair order is not AB/BA balanced")
 
     return {
         "schema": BASELINE_PAIRING_SCHEMA,
-        "strategy": "nearest_pristine_ab_ba",
+        "strategy": "independent_order_balanced_ab_ba",
         "valid": not failures,
         "failure_reasons": sorted(set(failures)),
         "baseline_environments": baseline_environments,
@@ -9020,6 +9556,8 @@ CSV_FIELDS = [
     "phase_role",
     "phase_scale",
     "baseline_sample_id",
+    "comparison_pair_id",
+    "comparison_repetition",
     "comparison_order",
     "execution_sequence",
     "topology_role",
@@ -9381,6 +9919,12 @@ def write_overload_csv(path: Path, results: list[dict[str, Any]]) -> None:
 
 def markdown_report(report: dict[str, Any]) -> str:
     outcome = "PASS" if report["passed"] and report["valid"] else "FAIL"
+    cpu_latency_action = nested(
+        report,
+        "relative_performance_methodology",
+        "cpu_latency_release_action",
+        default="fail",
+    )
     pairing = report.get("baseline_pairing", {})
     pairing_gap = numeric(pairing.get("maximum_gap_seconds"))
     pairing_gap_display = (
@@ -9402,9 +9946,9 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- Environment consistency: {nested(report, 'environment_consistency', 'valid', default=False)}",
         f"- Pristine AB/BA pairing: {pairing.get('valid', False)}",
         f"- Baseline samples/protected comparisons: {pairing.get('baseline_sample_count', 0)}/{pairing.get('comparison_count', 0)}",
-        f"- Maximum baseline comparison gap: {pairing_gap_display}",
+        f"- Maximum paired steady-window gap: {pairing_gap_display}",
         f"- Estimated configured workload time: {report['estimated_workload_seconds']:.1f} s",
-        "- Relative performance method: adjacent AB/BA paired deltas; a regression is blocking only when the one-sided 95% Student-t lower confidence bound from at least three steady repetitions exceeds the unchanged threshold.",
+        f"- Relative performance method: adjacent independent AB/BA paired deltas; the arithmetic mean from at least three steady pairs gates metrics assigned `fail`. CPU/latency action for this profile: `{cpu_latency_action}`; throughput/PPS remain blocking. A one-sided 95% Student-t lower confidence bound records stronger confirmation.",
         "",
         "## Environment evidence",
         "",
@@ -9572,7 +10116,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             "",
             "## Per-window relative observations",
             "",
-            "These paired windows crossed a 10% threshold. They remain visible whether or not the repeated steady sample established a blocking 95% lower confidence bound; the single burst is diagnostic for relative performance and remains a capacity and safety gate.",
+            "These paired windows crossed a configured threshold. They remain visible; an independent steady-pair mean blocks only metrics assigned `fail` (throughput/PPS are always blocking, while CPU/latency follow this profile's explicit action). The 95% lower confidence bound records stronger confirmation. A single burst cannot establish statistical confidence, but directly blocks every threshold crossing assigned `fail` and remains a capacity and safety gate.",
             "",
         ]
     )
@@ -9904,19 +10448,12 @@ def backend_passed(results: list[dict[str, Any]], criteria: dict[str, Any]) -> b
     bursts = [result for result in results if result["phase_role"] == "burst"]
     if not steady or not bursts:
         return False
-    # Integrity and fail-closed evidence applies to every ordinary phase,
-    # including diagnostic warm-up and ramp windows.
-    if any(not result["safety_pass"] for result in results):
+    # The release wrapper requires every executed sample to be valid and
+    # passing. Keep the runner's own exit status identical: a malformed or
+    # saturated warm-up/ramp sample must not produce report.valid=true only to
+    # be rejected by the independent validator afterwards.
+    if any(not result["valid"] or not result["passed"] for result in results):
         return False
-    if not all(result["valid"] and result["passed"] for result in steady):
-        return False
-    for result in bursts:
-        if not result["valid"] or not result["safety_pass"]:
-            return False
-        if result.get("relative_performance_pass") is False:
-            return False
-        if criteria["require_burst_capacity"] and not result["capacity_pass"]:
-            return False
     return True
 
 
@@ -10145,7 +10682,9 @@ def run_harness(
                     f"==> OpenShield perf: {backend} seq={scenario['execution_sequence']} "
                     f"{scenario['topology_role']} {scenario['policy']} "
                     f"{scenario['mode'] or 'none'} {scenario['profile']['name']} "
-                    f"load={load_level:g} baseline={scenario['baseline_sample_id']}",
+                    f"load={load_level:g} pair={scenario['comparison_pair_id']} "
+                    f"repeat={scenario['comparison_repetition']} "
+                    f"baseline={scenario['baseline_sample_id']}",
                     flush=True,
                 )
                 target.run_load_block(scenario, load_level, current)
@@ -10252,9 +10791,7 @@ def run_harness(
         )
         for backend in backend_results
     )
-    required_valid_results = [
-        result for result in all_results if result["phase_role"] in {"steady", "burst"}
-    ]
+    required_valid_results = list(all_results)
     # Per-backend checks above correctly account for an explicitly optional,
     # unsupported iptables fallback.  Here every executed overload proof must
     # still be valid and closed.
@@ -10274,18 +10811,13 @@ def run_harness(
         and environment_consistency["valid"] is True
         and baseline_pairing["valid"] is True
     )
-    passed = baseline_pairing["valid"] is True and environment_consistency["valid"] is True and required_backends_pass and all(
-        result["safety_pass"] for result in all_results
-    ) and all(
-        result["safety_pass"]
-        and result.get("relative_performance_pass", True)
-        and (
-            result["capacity_pass"]
-            if result["phase_role"] == "steady" or config["criteria"]["require_burst_capacity"]
-            else True
-        )
-        for result in required_valid_results
-    ) and all(result.get("passed") is True for result in all_overload_results)
+    passed = (
+        baseline_pairing["valid"] is True
+        and environment_consistency["valid"] is True
+        and required_backends_pass
+        and all(result.get("passed") is True for result in required_valid_results)
+        and all(result.get("passed") is True for result in all_overload_results)
+    )
     return {
         "schema": REPORT_SCHEMA,
         "run_id": run_id,
@@ -10305,13 +10837,23 @@ def run_harness(
         "estimated_workload_seconds": config["estimated_workload_seconds"],
         "criteria": config["criteria"],
         "relative_performance_methodology": {
-            "pairing": "predetermined_adjacent_pristine_ab_ba",
+            "pairing": "independent_order_balanced_adjacent_ab_ba",
             "gate_phase": "steady",
-            "burst_relative_role": "diagnostic_only",
+            "burst_relative_role": "single_sample_threshold_gate",
             "minimum_paired_samples": MINIMUM_RELATIVE_PAIRED_SAMPLES,
             "confidence_level": RELATIVE_CONFIDENCE_LEVEL,
-            "method": "one_sided_paired_student_t_mean_lower_bound",
+            "method": "arithmetic_mean_of_independent_paired_deltas",
+            "confirmation_method": (
+                "one_sided_paired_student_t_mean_lower_bound"
+            ),
             "thresholds_unchanged": True,
+            "cpu_latency_release_action": (
+                "observe"
+                if config["criteria"][
+                    "cpu_latency_relative_regressions_are_advisory"
+                ]
+                else "fail"
+            ),
         },
         "backends": backend_results,
         "maximum_sustainable": maxima,
@@ -10324,6 +10866,7 @@ def run_harness(
             "capacity is certified only when at least three steady windows and any required matching burst pass",
             "controlled overload uses SIGSTOP/SIGCONT only inside the disposable DUT namespace",
             "daemon state uses the disposable container writable layer so learning includes persistence and fsync",
+            "the protected daemon remains resident during pristine-baseline measurements, so shared-host scheduling may bias throughput and latency despite separate DUT-cgroup accounting",
             "the signed live Tumbleweed repository is recorded per run but is not immutable across runs",
             "publish-grade numeric comparisons require a prebuilt pinned performance image and dedicated runner",
         ],
@@ -10418,7 +10961,7 @@ def main() -> int:
             },
             "baseline_pairing": {
                 "schema": BASELINE_PAIRING_SCHEMA,
-                "strategy": "nearest_pristine_ab_ba",
+                "strategy": "independent_order_balanced_ab_ba",
                 "valid": False,
                 "failure_reasons": ["harness terminated before baseline pairing"],
                 "baseline_environments": [],

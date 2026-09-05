@@ -73,8 +73,8 @@ and pauses automatic persistence; an unsafe outcome enters fail-closed
 
 ## Dynamic active-policy path
 
-OpenShield 0.1.31 reports a dynamically recomputed active-policy path
-classification in its `StatusV2` response. This is not kernel-capability
+Since OpenShield 0.1.31, the daemon reports a dynamically recomputed
+active-policy path classification in its `StatusV2` response. This is not kernel-capability
 attestation, compatibility negotiation, the policy mode, or the selected
 firewall backend. It identifies the most expensive active path required by the
 current policy. A lower-numbered value describes a more userspace-intensive
@@ -149,6 +149,20 @@ owners, changing identity, or exhausted bounds. NFQUEUE number 1337 has no
 fail-open bypass flag. TCP authorization is tied to a persisted 30-bit policy
 generation that increases by one and is not reused before exhaustion; UDP and
 ICMP are re-attributed for every otherwise-unmatched outbound packet.
+
+OpenShield 0.1.32 can drain at most 32 already-ready NFQUEUE packets into one
+bounded attribution batch; it never waits to fill a batch. Each packet still
+gets an independent `SOCK_DIAG` socket lookup. Only the complete procfs owner
+enumerations are shared: one snapshot before identity capture and one after it.
+The entire batch has one absolute 250 ms deadline, and each shared snapshot has
+a global cap of 131,072 owner records across all targets. An identity may be
+reused only inside that batch for the same socket
+inode, socket UID, and capture requirements, and duplicate requests must agree
+on PID, process start time, executable path and complete file version, and UID.
+A typed timeout remains visible in NFQUEUE counters. Any ambiguity, changed
+owner snapshot, missed deadline, or exceeded bound denies the affected packet;
+there is no cross-batch identity or authorization cache, so unmatched UDP/ICMP
+traffic is attributed again in every later batch.
 
 These selectors identify observed process metadata, not all code executing in
 the process. The version pin detects ordinary in-place rewrites through size or
@@ -278,12 +292,31 @@ concurrency, latency percentiles, loss/retransmits, daemon CPU/RSS, softirq,
 conntrack, NIC/NFQUEUE evidence, fail-closed probes, paired overhead, and
 sustainable points. Generator or peer saturation invalidates a result. The
 bounded release smoke runs only after functional firewall E2E; it validates
-paths and safety but is not a portable capacity claim. Its unchanged 10%
-relative thresholds block only a regression confirmed from at least three
-steady adjacent AB/BA pairs by a one-sided 95% Student-t lower confidence
-bound. Every individual delta and crossing remains visible; a single burst is
-relative-performance diagnostics only, while burst capacity, drops, NFQUEUE
-errors, and fail-closed safety remain mandatory gates.
+paths and safety but is not a portable capacity claim. Configuration,
+synchronized metric documents, and pairing evidence use
+`openshield.perf.config.v2`, `openshield.perf.metrics.v3`, and
+`openshield.perf.baseline-pairing.v2`, respectively. Each exact comparison
+group uses three predetermined, independent, single-use baseline/protected
+pairs from separate pristine DUT generations. Pair order is balanced AB/BA,
+and the protected block may use only its uniquely identified adjacent
+baseline. The conservative comparison gap is the maximum separation across
+the authenticated workload interval and synchronized DUT and peer metric
+intervals; it is capped at 15 seconds for CI and 90 seconds for the
+production-like profile. Any executed invalid result row fails the report.
+
+The CI profile retains 10% relative thresholds and records every individual
+delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
+confidence bound. During the v0.1.32 field-evaluation period, relative
+DUT-cgroup CPU and request/connect-latency crossings are explicitly advisory;
+relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
+p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
+safety also remain mandatory gates. The production-like profile keeps CPU and
+latency regressions blocking. A single burst has no confidence claim, but
+directly blocks throughput/PPS crossings; CPU/latency follows the profile's
+explicit action. The
+retained full v0.1.31 run was structurally valid but failed its performance
+gate. A full v0.1.32 performance result is not claimed before its report is
+completed and retained.
 
 ## Installation and init systems
 
@@ -394,19 +427,30 @@ bits can invalidate either policy. The daemon's
 health checks are backend-specific but do not establish safe coexistence with
 arbitrary privileged ruleset editors.
 
+For nftables, the once-per-second health observation requests tables, chains,
+and counters in one fixed `nft` process and parses three ordered bounded JSON
+documents. This removes two process launches per observation without changing
+the cadence, table/base-chain/default-drop/counter checks, or fail-closed repair
+behavior. The iptables fallback retains its backend-specific full owned-chain
+comparison.
+
 ## Compatibility evidence
 
 Compatibility claims are intentionally scoped:
 
-- the recorded Rust 1.98.0 workspace verification passed formatting, locked
-  all-target checks, clippy with warnings denied, and the complete test suite
-  present in that revision. These are component tests, not a live-firewall
-  end-to-end result;
-- the locally built v0.1.31 x86-64 daemon passed the isolated Debian Bookworm
-  scenario with both nftables and the iptables fallback, including Learning,
+- local v0.1.32 verification on Rust 1.98.0 passed
+  `cargo fmt --all -- --check` and locked
+  workspace all-target clippy with warnings denied. The complete Rust suite in
+  a container passed 350 tests, with six live tests ignored by the normal run;
+  all six then passed in a separate live-test invocation. The Python
+  performance-harness suite passed 188 tests and reported 11 intentional
+  sandbox socket skips. These are component results, not a performance-gate
+  result;
+- the locally built v0.1.32 x86-64 daemon passed the isolated openSUSE
+  Tumbleweed scenario with both nftables and the iptables fallback, including Learning,
   TCP-only L2 and mixed UDP/TCP L1 application attribution, inbound default
   deny and explicit allow, fail-closed shutdown, and restart with the persisted
-  policy;
+  policy. Both disposable container runs left the host firewall untouched;
 - both v0.1.28 static-PIE musl binaries completed a no-network, read-only,
   capability-free `--version` smoke test in all 60 container image rows in
   `tests/compat/distros.tsv`;

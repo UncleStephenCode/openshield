@@ -34,6 +34,9 @@ def load_module(name: str, path: Path):
 
 runner = load_module("openshield_perf_runner", PERF_ROOT / "run.py")
 collector = load_module("openshield_perf_metrics", PERF_ROOT / "metrics.py")
+release_validator = load_module(
+    "openshield_perf_release_validator", PERF_ROOT / "validate_report.py"
+)
 
 
 def nft_block_all_fixture() -> dict:
@@ -572,6 +575,65 @@ class KernelBlockAllObservationTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_checked_in_configs_use_v2_and_bound_measured_steady_pair_gap(self) -> None:
+        expected_gaps = {"ci-smoke.json": 15.0, "production-like.json": 90.0}
+        for name, expected_gap in expected_gaps.items():
+            with self.subTest(name=name):
+                document = runner.load_json_object(PERF_ROOT / "config" / name)
+                self.assertEqual(document["schema"], runner.CONFIG_SCHEMA)
+                self.assertEqual(
+                    document["criteria"]["maximum_comparison_gap_seconds"],
+                    expected_gap,
+                )
+                self.assertIs(
+                    document["criteria"][
+                        "cpu_latency_relative_regressions_are_advisory"
+                    ],
+                    name == "ci-smoke.json",
+                )
+                runner.validate_config(document)
+
+                if name == "production-like.json":
+                    # Repetition one can place teardown/cooldown plus a fresh
+                    # warm-up and full ramp between adjacent steady workloads.
+                    # Keep that intentional cost visible while bounding drift.
+                    phases = document["phases"]
+                    planned_between_steady = (
+                        float(phases["cooldown_seconds"])
+                        + float(phases["warmup"]["duration_seconds"])
+                        + len(phases["ramp"]["scales"])
+                        * float(phases["ramp"]["duration_seconds"])
+                    )
+                    self.assertLess(planned_between_steady, expected_gap)
+
+        document = runner.load_json_object(
+            PERF_ROOT / "config" / "ci-smoke.json"
+        )
+        document["criteria"]["maximum_comparison_gap_seconds"] = 301.0
+        with self.assertRaisesRegex(
+            runner.HarnessError, "maximum_comparison_gap_seconds"
+        ):
+            runner.validate_config(document)
+
+        for value in (None, 0, 1, "true"):
+            with self.subTest(advisory=value):
+                candidate = runner.load_json_object(
+                    PERF_ROOT / "config" / "ci-smoke.json"
+                )
+                if value is None:
+                    candidate["criteria"].pop(
+                        "cpu_latency_relative_regressions_are_advisory"
+                    )
+                else:
+                    candidate["criteria"][
+                        "cpu_latency_relative_regressions_are_advisory"
+                    ] = value
+                with self.assertRaisesRegex(
+                    runner.HarnessError,
+                    "criteria|cpu_latency_relative_regressions_are_advisory",
+                ):
+                    runner.validate_config(candidate)
+
     def test_runtime_compatibility_expectations_cover_every_policy_path(self) -> None:
         cases = (
             ("network_only", "enforcing", "kernel_native", "network_only"),
@@ -637,35 +699,34 @@ class ConfigTests(unittest.TestCase):
 
     def test_checked_in_profiles_have_bounded_exact_plans(self) -> None:
         expected = {
-            "ci-smoke.json": (363.2, 384, False),
-            "production-like.json": (63_587.0, 3_840, True),
+            "ci-smoke.json": (609.6, 576, False),
+            "production-like.json": (90_707.0, 5_568, True),
         }
         for name, (seconds, rows, capacity_certification) in expected.items():
             with self.subTest(name=name):
                 document = runner.validate_config(
                     runner.load_json_object(PERF_ROOT / "config" / name)
                 )
-                phases = len(runner.phase_plan(document))
-                scenarios = sum(
-                    1
+                rows = sum(
+                    len(runner.comparison_phase_plan(document, scenario))
                     for backend in document["backends"]
-                    for _scenario in runner.paired_load_plan(document, backend)
+                    for scenario, _load in runner.paired_load_plan(document, backend)
                 )
                 self.assertAlmostEqual(document["estimated_workload_seconds"], seconds)
-                self.assertEqual(scenarios * phases, rows)
+                self.assertEqual(rows, expected[name][1])
                 self.assertIs(
                     document["capacity_certification"], capacity_certification
                 )
 
-    def test_ci_smoke_uses_a_fixed_nearest_pristine_ab_ba_schedule(self) -> None:
+    def test_ci_smoke_uses_independent_order_balanced_pairs(self) -> None:
         document = runner.validate_config(
             runner.load_json_object(PERF_ROOT / "config" / "ci-smoke.json")
         )
         plan = list(runner.paired_load_plan(document, "nftables"))
-        self.assertEqual(len(plan), 32)
+        self.assertEqual(len(plan), 108)
         self.assertEqual(
             [scenario["execution_sequence"] for scenario, _load in plan],
-            list(range(32)),
+            list(range(108)),
         )
         self.assertEqual(
             [
@@ -674,25 +735,35 @@ class ConfigTests(unittest.TestCase):
                     scenario["policy"],
                     scenario["mode"],
                     scenario["baseline_sample_id"],
+                    scenario["comparison_pair_id"],
+                    scenario["comparison_repetition"],
                     scenario["comparison_order"],
                 )
-                for scenario, _load in plan[:4]
+                for scenario, _load in plan[:6]
             ],
             [
-                ("baseline", "baseline", None, "b00000", None),
-                ("protected", "network_only", "enforcing", "b00000", "ab"),
-                ("protected", "network_only", "learning", "b00001", "ba"),
-                ("baseline", "baseline", None, "b00001", None),
+                ("baseline", "baseline", None, "b00000", "p00000", 1, None),
+                ("protected", "network_only", "enforcing", "b00000", "p00000", 1, "ab"),
+                ("protected", "network_only", "enforcing", "b00001", "p00001", 2, "ba"),
+                ("baseline", "baseline", None, "b00001", "p00001", 2, None),
+                ("baseline", "baseline", None, "b00002", "p00002", 3, None),
+                ("protected", "network_only", "enforcing", "b00002", "p00002", 3, "ab"),
             ],
         )
         baselines = [item for item in plan if item[0]["topology_role"] == "baseline"]
         protected = [item for item in plan if item[0]["topology_role"] == "protected"]
-        self.assertEqual((len(baselines), len(protected)), (14, 18))
+        self.assertEqual((len(baselines), len(protected)), (54, 54))
         self.assertEqual(
-            [item[0]["comparison_order"] for item in protected].count("ab"), 9
+            len({item[0]["baseline_sample_id"] for item in baselines}), 54
         )
         self.assertEqual(
-            [item[0]["comparison_order"] for item in protected].count("ba"), 9
+            len({item[0]["comparison_pair_id"] for item in protected}), 54
+        )
+        self.assertEqual(
+            [item[0]["comparison_order"] for item in protected].count("ab"), 27
+        )
+        self.assertEqual(
+            [item[0]["comparison_order"] for item in protected].count("ba"), 27
         )
 
     def test_baseline_topology_cannot_start_daemon_or_run_protected_policy(self) -> None:
@@ -723,6 +794,10 @@ class ConfigTests(unittest.TestCase):
                     "load_level": load_level,
                     "started": sequence * 1_000 + 100,
                     "finished": sequence * 1_000 + 600,
+                    "steady_started": sequence * 1_000 + 200,
+                    "steady_finished": sequence * 1_000 + 500,
+                    "workload_started": sequence * 1_000 + 210,
+                    "workload_finished": sequence * 1_000 + 490,
                 }
             )
         results = []
@@ -731,11 +806,15 @@ class ConfigTests(unittest.TestCase):
             gap = None
             if scenario["comparison_order"] == "ab":
                 baseline = blocks[scenario["execution_sequence"] - 1]
-                gap = (block["started"] - baseline["finished"]) / 1_000_000_000
+                gap = (
+                    block["workload_started"] - baseline["workload_finished"]
+                ) / 1_000_000_000
             elif scenario["comparison_order"] == "ba":
                 baseline = blocks[scenario["execution_sequence"] + 1]
-                gap = (baseline["started"] - block["finished"]) / 1_000_000_000
-            for phase in runner.phase_plan(document):
+                gap = (
+                    baseline["workload_started"] - block["workload_finished"]
+                ) / 1_000_000_000
+            for phase in runner.comparison_phase_plan(document, scenario):
                 results.append(
                     {
                         "backend": "nftables",
@@ -745,6 +824,10 @@ class ConfigTests(unittest.TestCase):
                         "learning_variant": scenario.get("learning_variant"),
                         "load_level": block["load_level"],
                         "baseline_sample_id": scenario["baseline_sample_id"],
+                        "comparison_pair_id": scenario["comparison_pair_id"],
+                        "comparison_repetition": scenario[
+                            "comparison_repetition"
+                        ],
                         "comparison_order": scenario["comparison_order"],
                         "execution_sequence": scenario["execution_sequence"],
                         "topology_role": scenario["topology_role"],
@@ -752,6 +835,21 @@ class ConfigTests(unittest.TestCase):
                         "block_finished_monotonic_ns": block["finished"],
                         "comparison_gap_seconds": gap,
                         "phase": phase["name"],
+                        "phase_role": phase["role"],
+                        "dut_metrics": {
+                            "started_at_monotonic_ns": block["steady_started"],
+                            "finished_at_monotonic_ns": block["steady_finished"],
+                        },
+                        "peer_metrics": {
+                            "started_at_monotonic_ns": block["steady_started"],
+                            "finished_at_monotonic_ns": block["steady_finished"],
+                        },
+                        "workload_started": {
+                            "boundary_monotonic_ns": block["workload_started"]
+                        },
+                        "workload_finished": {
+                            "boundary_monotonic_ns": block["workload_finished"]
+                        },
                     }
                 )
         environment = {"backend": "nftables", "manifest": "same"}
@@ -770,9 +868,9 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertTrue(evidence["valid"])
         self.assertEqual(evidence["schema"], runner.BASELINE_PAIRING_SCHEMA)
-        self.assertEqual(evidence["baseline_sample_count"], 2)
-        self.assertEqual(evidence["comparison_count"], 2)
-        self.assertEqual(evidence["orders"], {"ab": 1, "ba": 1})
+        self.assertEqual(evidence["baseline_sample_count"], 6)
+        self.assertEqual(evidence["comparison_count"], 6)
+        self.assertEqual(evidence["orders"], {"ab": 3, "ba": 3})
 
         changed_environment = {**environment, "manifest": "different"}
         rejected = runner.baseline_pairing_evidence(
@@ -789,11 +887,10 @@ class ConfigTests(unittest.TestCase):
         )
 
         reordered = json.loads(json.dumps(results))
-        phase_count = len(runner.phase_plan(document))
-        reordered[: 2 * phase_count] = (
-            reordered[phase_count : 2 * phase_count]
-            + reordered[:phase_count]
-        )
+        first_block = [row for row in reordered if row["execution_sequence"] == 0]
+        second_block = [row for row in reordered if row["execution_sequence"] == 1]
+        remainder = [row for row in reordered if row["execution_sequence"] > 1]
+        reordered = second_block + first_block + remainder
         rejected = runner.baseline_pairing_evidence(
             reordered,
             document,
@@ -820,7 +917,57 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertFalse(rejected["valid"])
         self.assertIn(
-            "nftables: protected block 1 gap differs from timestamps",
+            "nftables: protected block 1 gap differs from steady measurement timestamps",
+            rejected["failure_reasons"],
+        )
+
+        excessive_gap = json.loads(json.dumps(results))
+        baseline_block_finish = next(
+            row["block_finished_monotonic_ns"]
+            for row in excessive_gap
+            if row["execution_sequence"] == 0
+        )
+        baseline_steady_finish = next(
+            row["workload_finished"]["boundary_monotonic_ns"]
+            for row in excessive_gap
+            if row["execution_sequence"] == 0 and row["phase_role"] == "steady"
+        )
+        # The blocks remain closely adjacent, but a long warm-up/ramp before
+        # the protected steady window must count toward comparison drift.
+        protected_start = baseline_block_finish + 1_000_000_000
+        protected_steady_start = baseline_steady_finish + 16_000_000_000
+        for row in excessive_gap:
+            if row["execution_sequence"] == 1:
+                row["block_started_monotonic_ns"] = protected_start
+                row["block_finished_monotonic_ns"] = protected_steady_start + 1_000
+                for side in ("dut_metrics", "peer_metrics"):
+                    baseline_metric_finish = next(
+                        candidate[side]["finished_at_monotonic_ns"]
+                        for candidate in excessive_gap
+                        if candidate["execution_sequence"] == 0
+                        and candidate["phase_role"] == "steady"
+                    )
+                    row[side]["started_at_monotonic_ns"] = (
+                        baseline_metric_finish + 14_000_000_000
+                    )
+                    row[side]["finished_at_monotonic_ns"] = protected_steady_start + 600
+                row["workload_started"][
+                    "boundary_monotonic_ns"
+                ] = protected_steady_start
+                row["workload_finished"][
+                    "boundary_monotonic_ns"
+                ] = protected_steady_start + 500
+                row["comparison_gap_seconds"] = 16.0
+        rejected = runner.baseline_pairing_evidence(
+            excessive_gap,
+            document,
+            [environment],
+            [dict(environment)],
+            [generation],
+        )
+        self.assertFalse(rejected["valid"])
+        self.assertIn(
+            "nftables: protected block 1 comparison gap exceeds the configured bound",
             rejected["failure_reasons"],
         )
 
@@ -916,7 +1063,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_ci_wrapper_cleanup_is_scoped_to_the_exact_run_label(self) -> None:
         source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
-        self.assertIn("readonly MAX_TIMEOUT_SECONDS=1200", source)
+        self.assertIn("readonly MAX_TIMEOUT_SECONDS=1800", source)
         self.assertIn("readonly RUN_LABEL_KEY='org.openshield.perf.run'", source)
         self.assertIn('--run-token "$run_token"', source)
         self.assertIn(
@@ -1004,6 +1151,10 @@ class ConfigTests(unittest.TestCase):
             "maximum_cgroup_cpu_increase_vs_baseline_percent",
         ):
             self.assertIn(f".criteria.{criterion} == 10", source)
+        self.assertIn(
+            ".criteria.cpu_latency_relative_regressions_are_advisory == true",
+            source,
+        )
         self.assertIn(".criteria.require_burst_capacity == true", source)
         self.assertIn(".criteria == .configuration.criteria", source)
         self.assertIn(
@@ -1012,9 +1163,83 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("minimum_paired_samples: 3", source)
         self.assertIn("confidence_level: 0.95", source)
         self.assertIn(
-            'method: "one_sided_paired_student_t_mean_lower_bound"', source
+            'method: "arithmetic_mean_of_independent_paired_deltas"', source
         )
+        self.assertIn(
+            'confirmation_method: "one_sided_paired_student_t_mean_lower_bound"',
+            source,
+        )
+        self.assertIn('cpu_latency_release_action: "observe"', source)
+        self.assertIn('burst_relative_role: "single_sample_threshold_gate"', source)
+        self.assertIn('.method == "single_paired_burst_threshold_gate"', source)
+        self.assertIn(".mean_exceeded_threshold == false", source)
         self.assertIn(".confirmed_regression == false", source)
+        for absolute_gate in (
+            ".derived.target_attainment_ratio",
+            ".criteria.minimum_target_ratio",
+            ".derived.latency_p99_ms",
+            ".criteria.maximum_latency_p99_ms",
+            ".dut_metrics.daemon.cpu_percent_one_core",
+            ".criteria.maximum_daemon_cpu_percent_one_core",
+            ".dut_metrics.daemon.rss_bytes_peak",
+            ".criteria.maximum_daemon_rss_bytes",
+        ):
+            self.assertIn(absolute_gate, source)
+        self.assertIn(".criteria.maximum_comparison_gap_seconds == 15", source)
+        self.assertIn("steady_measurement_intervals", source)
+        self.assertIn("paired_steady_measurement_gap_seconds", source)
+        self.assertIn("workload_started", source)
+        self.assertIn("workload_finished", source)
+        self.assertIn("return max(gaps)", source)
+        self.assertIn(
+            '.configuration.schema == "openshield.perf.config.v2"', source
+        )
+        self.assertIn("MAX_JSON_BYTES=$((20 * 1024 * 1024))", source)
+        self.assertIn("expected_row_count != 576", source)
+
+    def test_ci_wrapper_runs_source_manifested_independent_validator(self) -> None:
+        source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'release_validator="$script_directory/validate_report.py"', source
+        )
+        self.assertIn(
+            'python3 -I -B -S "$release_validator" \\\n'
+            '    "$config" \\\n'
+            '    "$report_json"',
+            source,
+        )
+        self.assertEqual(
+            runner.HARNESS_COMPONENT_PATHS.count(
+                "tests/perf/validate_report.py"
+            ),
+            1,
+        )
+        self.assertIn(
+            '    "tests/perf/validate_report.py",', source
+        )
+
+    def test_ci_wrapper_authenticates_main_metric_cpu_documents(self) -> None:
+        source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
+        for contract in (
+            '.dut_metrics.schema == "openshield.perf.metrics.v3"',
+            '.peer_metrics.schema == "openshield.perf.metrics.v3"',
+            "collector_excluded_cgroup_cpu($metrics.elapsed_seconds)",
+            ".cpu_percent_one_core - (.cpu_seconds * 100 / $elapsed)",
+        ):
+            self.assertIn(contract, source)
+
+    def test_ci_wrapper_authenticates_workload_normalized_network_rates(self) -> None:
+        source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
+        for contract in (
+            "workload_normalized_network_rates",
+            ".collector_elapsed_seconds - $collector_elapsed",
+            ".rate_denominator_seconds - $workload_wall",
+            ".rx_packets / $workload_wall",
+            ".tx_packets / $workload_wall",
+            ".rx_bytes * 8 / $workload_wall / 1000000",
+            ".tx_bytes * 8 / $workload_wall / 1000000",
+        ):
+            self.assertIn(contract, source)
 
     def test_ci_wrapper_accepts_only_the_rpm_signing_key_none_architecture(self) -> None:
         source = (PERF_ROOT / "ci-smoke.sh").read_text(encoding="utf-8")
@@ -1127,6 +1352,12 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
         "starttime": 456,
         "exe": runner.CONTAINER_DAEMON,
     }
+    block_started = 100 if policy == "baseline" else 300
+    block_finished = 200 if policy == "baseline" else 400
+    metric_started = block_started + 20
+    metric_finished = block_finished - 20
+    workload_started = metric_started + 10
+    workload_finished = metric_finished - 10
     return {
         "backend": "nftables",
         "policy": policy,
@@ -1141,12 +1372,16 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
         "phase_scale": 1.0,
         "repetition": 1,
         "baseline_sample_id": "b00000",
+        "comparison_pair_id": "p00000",
+        "comparison_repetition": 1,
         "comparison_order": None if policy == "baseline" else "ab",
         "execution_sequence": 0 if policy == "baseline" else 1,
         "topology_role": "baseline" if policy == "baseline" else "protected",
-        "block_started_monotonic_ns": 100 if policy == "baseline" else 300,
-        "block_finished_monotonic_ns": 200 if policy == "baseline" else 400,
+        "block_started_monotonic_ns": block_started,
+        "block_finished_monotonic_ns": block_finished,
         "comparison_gap_seconds": None,
+        "workload_started": {"boundary_monotonic_ns": workload_started},
+        "workload_finished": {"boundary_monotonic_ns": workload_finished},
         "offered": {
             "response_mix": "128:1",
             "request_bytes": 64,
@@ -1160,11 +1395,19 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
             "metrics": metrics,
         },
         "dut_metrics": {
+            "schema": runner.METRICS_SCHEMA,
+            "started_at_monotonic_ns": metric_started,
+            "finished_at_monotonic_ns": metric_finished,
+            "elapsed_seconds": 1.0,
             "daemon": {"cpu_percent_one_core": 15.0, "rss_bytes_peak": 16 * 1024 * 1024},
             "workload_process": {"cpu_percent_one_core": 10.0},
             "network": {
-                "tx_packets": 500,
-                "rx_packets": 500,
+                "collector_elapsed_seconds": 1.0,
+                "rate_denominator_seconds": 1.0,
+                "tx_packets": 550,
+                "rx_packets": 450,
+                "rx_bytes": 1_250_000,
+                "tx_bytes": 1_500_000,
                 "rx_pps": 450.0,
                 "tx_pps": 550.0,
                 "rx_mbps": 10.0,
@@ -1189,14 +1432,28 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
                 "kernel_dropped": 0,
                 "user_dropped": 0,
             },
-            "cgroup": {"cpu_percent_one_core": 50.0},
+            "cgroup": {
+                "accounting": "container_cgroup_minus_metric_collector",
+                "raw_cpu_seconds": 0.55,
+                "collector_cpu_seconds_excluded": 0.05,
+                "cpu_seconds": 0.5,
+                "cpu_percent_one_core": 50.0,
+            },
         },
         "peer_metrics": {
+            "schema": runner.METRICS_SCHEMA,
+            "started_at_monotonic_ns": metric_started,
+            "finished_at_monotonic_ns": metric_finished,
+            "elapsed_seconds": 1.0,
             "daemon": {"cpu_percent_one_core": 10.0},
             "workload_process": {"cpu_percent_one_core": 10.0},
             "network": {
-                "tx_packets": 500,
-                "rx_packets": 500,
+                "collector_elapsed_seconds": 1.0,
+                "rate_denominator_seconds": 1.0,
+                "tx_packets": 450,
+                "rx_packets": 550,
+                "rx_bytes": 1_500_000,
+                "tx_bytes": 1_250_000,
                 "rx_pps": 550.0,
                 "tx_pps": 450.0,
                 "rx_mbps": 12.0,
@@ -1216,6 +1473,13 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
             "softirq": {"net_rx": 100, "net_tx": 100},
             "conntrack_count_start": 2,
             "conntrack_count_peak": 10,
+            "cgroup": {
+                "accounting": "container_cgroup_minus_metric_collector",
+                "raw_cpu_seconds": 0.55,
+                "collector_cpu_seconds_excluded": 0.05,
+                "cpu_seconds": 0.5,
+                "cpu_percent_one_core": 50.0,
+            },
         },
         "daemon_log_events": {"terminal_queue_error_lower_bound": 0},
         "status_before": None
@@ -1233,6 +1497,606 @@ def synthetic_result(policy: str, transport: str = "tcp") -> dict:
         "kernel_block_all_after": None,
         "identity_probe": None,
     }
+
+
+def identify_independent_pair(
+    baseline: dict, measured: dict, repetition: int
+) -> None:
+    """Assign one unique, temporally adjacent AB/BA synthetic pair."""
+
+    order = "ab" if repetition % 2 else "ba"
+    pair_id = f"p{repetition:05d}"
+    baseline_id = f"b{repetition:05d}"
+    phase = f"steady_{repetition}"
+    for row in (baseline, measured):
+        row["phase"] = phase
+        row["repetition"] = repetition
+        row["baseline_sample_id"] = baseline_id
+        row["comparison_pair_id"] = pair_id
+        row["comparison_repetition"] = repetition
+    measured["comparison_order"] = order
+    sequence = (repetition - 1) * 2
+    if order == "ab":
+        baseline["execution_sequence"] = sequence
+        measured["execution_sequence"] = sequence + 1
+        baseline["block_started_monotonic_ns"] = sequence * 1_000 + 100
+        baseline["block_finished_monotonic_ns"] = sequence * 1_000 + 200
+        measured["block_started_monotonic_ns"] = sequence * 1_000 + 300
+        measured["block_finished_monotonic_ns"] = sequence * 1_000 + 400
+    else:
+        measured["execution_sequence"] = sequence
+        baseline["execution_sequence"] = sequence + 1
+        measured["block_started_monotonic_ns"] = sequence * 1_000 + 100
+        measured["block_finished_monotonic_ns"] = sequence * 1_000 + 200
+        baseline["block_started_monotonic_ns"] = sequence * 1_000 + 300
+        baseline["block_finished_monotonic_ns"] = sequence * 1_000 + 400
+    for row in (baseline, measured):
+        metric_started = row["block_started_monotonic_ns"] + 20
+        metric_finished = row["block_finished_monotonic_ns"] - 20
+        workload_started = metric_started + 10
+        workload_finished = metric_finished - 10
+        for side in ("dut_metrics", "peer_metrics"):
+            row[side]["started_at_monotonic_ns"] = metric_started
+            row[side]["finished_at_monotonic_ns"] = metric_finished
+        row["workload_started"]["boundary_monotonic_ns"] = workload_started
+        row["workload_finished"]["boundary_monotonic_ns"] = workload_finished
+
+
+def set_dut_cgroup_cpu_percent(result: dict, percent: float) -> None:
+    elapsed = result["dut_metrics"]["elapsed_seconds"]
+    cpu_seconds = percent * elapsed / 100.0
+    excluded = result["dut_metrics"]["cgroup"][
+        "collector_cpu_seconds_excluded"
+    ]
+    result["dut_metrics"]["cgroup"].update(
+        {
+            "raw_cpu_seconds": cpu_seconds + excluded,
+            "cpu_seconds": cpu_seconds,
+            "cpu_percent_one_core": percent,
+        }
+    )
+
+
+def independent_validation_fixture(
+    throughput_reductions: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    *,
+    profile_name: str = "ingress_http_mixed",
+    protected_policy: str = "network_only",
+    cpu_latency_multiplier: float | None = None,
+) -> tuple[dict, dict]:
+    """Build a small runner-produced report for the independent release gate."""
+
+    raw_config = runner.load_json_object(PERF_ROOT / "config" / "ci-smoke.json")
+    raw_config["backends"] = ["nftables"]
+    profile = next(
+        item for item in raw_config["profiles"] if item["name"] == profile_name
+    )
+    profile["policy_cases"] = ["baseline", "network_only"]
+    if protected_policy != "network_only":
+        profile["policy_cases"].append(protected_policy)
+    raw_config["profiles"] = [profile]
+    raw_config["overload"]["enabled"] = False
+    validated_config = runner.validate_config(
+        json.loads(json.dumps(raw_config, allow_nan=False))
+    )
+    results: list[dict] = []
+    sequence = 0
+    pair_index = 0
+    profile = validated_config["profiles"][0]
+    for scenario in runner.protected_scenarios_for_profile(
+        validated_config, profile
+    ):
+        for repetition, reduction in enumerate(throughput_reductions, start=1):
+            baseline = synthetic_result("baseline", profile["transport"])
+            measured = synthetic_result(
+                scenario["policy"], profile["transport"]
+            )
+            identify_independent_pair(baseline, measured, repetition)
+            for row in (baseline, measured):
+                row["profile"] = profile["name"]
+                row["direction"] = profile["direction"]
+                row["transport"] = profile["transport"]
+                row["baseline_sample_id"] = f"b{pair_index:05d}"
+                row["comparison_pair_id"] = f"p{pair_index:05d}"
+            measured["mode"] = scenario["mode"]
+            measured["learning_variant"] = scenario["learning_variant"]
+            measured["status_before"]["mode"] = scenario["mode"]
+            measured["status_after"]["mode"] = scenario["mode"]
+            if scenario["policy"].startswith("application_"):
+                measured["identity_probe"] = {
+                    "blocked": True,
+                    "blocked_all": True,
+                    "fail_open": False,
+                    "attempts_completed": 1,
+                }
+                measured["dut_metrics"]["nfqueue"]["hits"] = (
+                    11 if profile["transport"] == "tcp" else 105
+                )
+            measured["workload"]["metrics"]["application_mbps"] = (
+                baseline["workload"]["metrics"]["application_mbps"]
+                * (1.0 - reduction / 100.0)
+            )
+            if cpu_latency_multiplier is not None:
+                set_dut_cgroup_cpu_percent(
+                    measured,
+                    baseline["dut_metrics"]["cgroup"][
+                        "cpu_percent_one_core"
+                    ]
+                    * cpu_latency_multiplier,
+                )
+                for latency_name in ("latency_ms", "connect_latency_ms"):
+                    measured_latency = measured["workload"]["metrics"][
+                        latency_name
+                    ]
+                    for percentile in ("p50", "p95", "p99"):
+                        measured_latency[percentile] *= cpu_latency_multiplier
+            for row in (baseline, measured):
+                workload_metrics = row["workload"]["metrics"]
+                row["workload"].update(
+                    {
+                        "schema": runner.WORKLOAD_SCHEMA,
+                        "event": "summary",
+                        "role": "client",
+                        "transport": profile["transport"],
+                        "port": profile["port"],
+                    }
+                )
+                workload_metrics["wall_seconds"] = 1.0
+                workload_metrics["operations"] = 90
+                workload_metrics["application_ops_per_second"] = 90.0
+                transferred_bytes = round(
+                    workload_metrics["application_mbps"] * 1_000_000.0 / 8.0
+                )
+                workload_metrics["bytes_sent"] = transferred_bytes // 2
+                workload_metrics["bytes_received"] = (
+                    transferred_bytes - workload_metrics["bytes_sent"]
+                )
+            if measured["comparison_order"] == "ab":
+                baseline["execution_sequence"] = sequence
+                measured["execution_sequence"] = sequence + 1
+                first, second = baseline, measured
+            else:
+                measured["execution_sequence"] = sequence
+                baseline["execution_sequence"] = sequence + 1
+                first, second = measured, baseline
+
+            def set_measurement_interval(row: dict, metric_start: int) -> None:
+                metric_finish = metric_start + 1_000_000_000
+                row["block_started_monotonic_ns"] = metric_start - 100_000_000
+                row["block_finished_monotonic_ns"] = metric_finish + 100_000_000
+                for side in ("dut_metrics", "peer_metrics"):
+                    row[side]["started_at_monotonic_ns"] = metric_start
+                    row[side]["finished_at_monotonic_ns"] = metric_finish
+                    row[side]["elapsed_seconds"] = 1.0
+                row["workload_started"]["boundary_monotonic_ns"] = (
+                    metric_start + 10_000_000
+                )
+                row["workload_finished"]["boundary_monotonic_ns"] = (
+                    metric_finish - 10_000_000
+                )
+
+            first_metric_start = 10_000_000_000 + pair_index * 4_000_000_000
+            set_measurement_interval(first, first_metric_start)
+            set_measurement_interval(second, first_metric_start + 1_500_000_000)
+            sequence += 2
+            pair_index += 1
+            runner.evaluate_result(baseline, validated_config["criteria"])
+            runner.evaluate_result(measured, validated_config["criteria"])
+            results.extend((baseline, measured))
+            if repetition == len(throughput_reductions):
+                burst_baseline = json.loads(json.dumps(baseline, allow_nan=False))
+                burst_measured = json.loads(json.dumps(measured, allow_nan=False))
+                for row in (burst_baseline, burst_measured):
+                    row["phase"] = "burst"
+                    row["phase_role"] = "burst"
+                    row["phase_scale"] = validated_config["phases"]["burst"][
+                        "scale"
+                    ]
+                    row["repetition"] = None
+                    runner.evaluate_result(row, validated_config["criteria"])
+                results.extend((burst_baseline, burst_measured))
+    runner.add_baseline_comparisons(results, validated_config["criteria"])
+    passed = all(row.get("passed") is True for row in results)
+    canonical_config = json.dumps(
+        validated_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    report = {
+        "schema": runner.REPORT_SCHEMA,
+        "seed": validated_config["seed"],
+        "description": validated_config.get("description"),
+        "configuration_sha256": hashlib.sha256(canonical_config).hexdigest(),
+        "configuration": validated_config,
+        "estimated_workload_seconds": validated_config[
+            "estimated_workload_seconds"
+        ],
+        "criteria": validated_config["criteria"],
+        "valid": all(row.get("valid") is True for row in results),
+        "passed": passed,
+        "backends": [
+            {
+                "name": "nftables",
+                "status": "passed" if passed else "failed",
+            }
+        ],
+        "results": results,
+    }
+    return raw_config, report
+
+
+class IndependentReleaseValidationTests(unittest.TestCase):
+    def test_runner_report_passes_independent_recomputation(self) -> None:
+        config, report = independent_validation_fixture()
+        summary = release_validator.validate_documents(config, report)
+        self.assertTrue(summary["valid"])
+        self.assertEqual(summary["group_count"], 2)
+        self.assertEqual(summary["pair_count"], 6)
+        self.assertEqual(summary["regressed_group_count"], 0)
+        self.assertEqual(summary["regressed_burst_count"], 0)
+
+    def test_advisory_cpu_and_latency_crossings_remain_authenticated(self) -> None:
+        config, report = independent_validation_fixture(
+            cpu_latency_multiplier=2.0
+        )
+        summary = release_validator.validate_documents(config, report)
+        self.assertEqual(summary["regressed_group_count"], 0)
+        protected = next(
+            row for row in report["results"] if row["policy"] != "baseline"
+        )
+        crossed = [
+            item
+            for item in protected["relative_performance_evidence"]
+            if item["mean_exceeded_threshold"]
+        ]
+        self.assertTrue(crossed)
+        self.assertTrue(
+            all(item["release_action"] == "observe" for item in crossed)
+        )
+        self.assertTrue(protected["relative_performance_pass"])
+
+    def test_configuration_identity_cannot_be_rewritten_with_a_new_digest(self) -> None:
+        config, report = independent_validation_fixture()
+        report["configuration"]["phases"]["steady"]["duration_seconds"] += 1.0
+        report["configuration_sha256"] = hashlib.sha256(
+            json.dumps(
+                report["configuration"],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaises(release_validator.ValidationError):
+            release_validator.validate_documents(config, report)
+
+    def test_configuration_digest_tampering_is_rejected(self) -> None:
+        config, report = independent_validation_fixture()
+        report["configuration_sha256"] = "0" * 64
+        with self.assertRaises(release_validator.ValidationError):
+            release_validator.validate_documents(config, report)
+
+    def test_empty_backend_or_pair_coverage_cannot_pass(self) -> None:
+        config, report = independent_validation_fixture()
+        config["backends"] = ["iptables"]
+        config["allow_unsupported_iptables"] = True
+        enriched_config = json.loads(json.dumps(config, allow_nan=False))
+        workload_estimate = release_validator.estimate_workload_seconds(config)
+        enriched_config["estimated_workload_seconds"] = workload_estimate
+        canonical_config = json.dumps(
+            enriched_config,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        report.update(
+            {
+                "configuration": enriched_config,
+                "configuration_sha256": hashlib.sha256(
+                    canonical_config
+                ).hexdigest(),
+                "estimated_workload_seconds": workload_estimate,
+                "backends": [{"name": "iptables", "status": "unsupported"}],
+                "results": [],
+                "valid": True,
+                "passed": True,
+            }
+        )
+        with self.assertRaisesRegex(
+            release_validator.ValidationError,
+            "no active performance backend",
+        ):
+            release_validator.validate_documents(config, report)
+
+        config, report = independent_validation_fixture()
+        report["results"] = []
+        with self.assertRaisesRegex(
+            release_validator.ValidationError, "no normal performance results"
+        ):
+            release_validator.validate_documents(config, report)
+
+    def test_primary_derived_and_pair_overhead_tampering_are_rejected(self) -> None:
+        for defect in (
+            "primary",
+            "derived",
+            "overhead",
+            "PPS raw",
+            "PPS rate",
+            "Mbps rate",
+            "collector elapsed",
+            "rate denominator",
+            "CPU raw",
+        ):
+            with self.subTest(defect=defect):
+                config, report = independent_validation_fixture()
+                measured = next(
+                    row for row in report["results"] if row["policy"] != "baseline"
+                )
+                if defect == "primary":
+                    measured["workload"]["metrics"]["application_mbps"] += 1.0
+                elif defect == "derived":
+                    measured["derived"]["actual_application_mbps"] += 1.0
+                elif defect == "overhead":
+                    measured["overhead_vs_baseline"][
+                        "throughput_reduction_percent"
+                    ] += 1.0
+                elif defect == "PPS raw":
+                    measured["dut_metrics"]["network"]["rx_packets"] += 1
+                elif defect == "PPS rate":
+                    measured["dut_metrics"]["network"]["rx_pps"] += 1.0
+                elif defect == "Mbps rate":
+                    measured["dut_metrics"]["network"]["rx_mbps"] += 1.0
+                elif defect == "collector elapsed":
+                    measured["dut_metrics"]["network"][
+                        "collector_elapsed_seconds"
+                    ] += 0.1
+                elif defect == "rate denominator":
+                    measured["dut_metrics"]["network"][
+                        "rate_denominator_seconds"
+                    ] += 0.1
+                else:
+                    measured["dut_metrics"]["cgroup"][
+                        "raw_cpu_seconds"
+                    ] += 0.01
+                with self.assertRaises(release_validator.ValidationError):
+                    release_validator.validate_documents(config, report)
+
+    def test_absolute_capacity_gates_are_recomputed_from_primary_evidence(self) -> None:
+        mutations = {
+            "target attainment": lambda row, criteria: (
+                row["workload"]["config"].update(
+                    {"target_application_ops_per_second": 1000.0}
+                ),
+                row["derived"].update(
+                    {
+                        "expected_application_ops_per_second": 1000.0,
+                        "target_attainment_ratio": 0.09,
+                    }
+                ),
+            ),
+            "absolute p99": lambda row, criteria: (
+                row["workload"]["metrics"]["latency_ms"].update(
+                    {"p99": criteria["maximum_latency_p99_ms"] + 1.0}
+                ),
+                row["derived"].update(
+                    {"latency_p99_ms": criteria["maximum_latency_p99_ms"] + 1.0}
+                ),
+            ),
+            "daemon CPU": lambda row, criteria: row["dut_metrics"]["daemon"].update(
+                {
+                    "cpu_percent_one_core": criteria[
+                        "maximum_daemon_cpu_percent_one_core"
+                    ]
+                    + 1.0
+                }
+            ),
+            "daemon RSS": lambda row, criteria: row["dut_metrics"]["daemon"].update(
+                {"rss_bytes_peak": criteria["maximum_daemon_rss_bytes"] + 1}
+            ),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                config, report = independent_validation_fixture()
+                measured = next(
+                    row
+                    for row in report["results"]
+                    if row["policy"] != "baseline" and row["phase_role"] == "steady"
+                )
+                mutate(measured, config["criteria"])
+                with self.assertRaisesRegex(
+                    release_validator.ValidationError,
+                    "capacity_pass ignored independently recomputed absolute gate",
+                ):
+                    release_validator.validate_documents(config, report)
+
+    def test_burst_throughput_gate_is_independently_recomputed(self) -> None:
+        config, report = independent_validation_fixture((0.0, 0.0, 20.0))
+        summary = release_validator.validate_documents(
+            config, report, require_passing=False
+        )
+        self.assertEqual(summary["regressed_group_count"], 0)
+        self.assertEqual(summary["regressed_burst_count"], 2)
+        candidate = json.loads(json.dumps(report, allow_nan=False))
+        burst = next(
+            row
+            for row in candidate["results"]
+            if row["policy"] != "baseline" and row["phase_role"] == "burst"
+        )
+        burst.update(
+            {
+                "relative_performance_failure_reasons": [],
+                "relative_performance_pass": True,
+                "passed": True,
+            }
+        )
+        with self.assertRaisesRegex(
+            release_validator.ValidationError,
+            "burst relative failure reasons",
+        ):
+            release_validator.validate_documents(
+                config, candidate, require_passing=False
+            )
+
+    def test_client_workload_and_profile_identity_are_authenticated(self) -> None:
+        mutations = {
+            "event": lambda row: row["workload"].update({"event": "started"}),
+            "role": lambda row: row["workload"].update({"role": "server"}),
+            "transport": lambda row: row["workload"].update(
+                {"transport": "udp"}
+            ),
+            "port": lambda row: row["workload"].update(
+                {"port": row["workload"]["port"] + 1}
+            ),
+            "profile": lambda row: row.update({"profile": "unconfigured"}),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                config, report = independent_validation_fixture()
+                measured = next(
+                    row for row in report["results"] if row["policy"] != "baseline"
+                )
+                mutate(measured)
+                with self.assertRaises(release_validator.ValidationError):
+                    release_validator.validate_documents(config, report)
+
+    def test_application_udp_full_plan_is_validated_and_cannot_change_port(self) -> None:
+        config, report = independent_validation_fixture(
+            profile_name="egress_udp_stream",
+            protected_policy="application_udp",
+        )
+        summary = release_validator.validate_documents(config, report)
+        self.assertEqual(summary["group_count"], 4)
+        self.assertEqual(summary["pair_count"], 12)
+        candidate = json.loads(json.dumps(report, allow_nan=False))
+        application_row = next(
+            row
+            for row in candidate["results"]
+            if row["policy"] == "application_udp"
+        )
+        application_row["workload"]["port"] += 1
+        with self.assertRaises(release_validator.ValidationError):
+            release_validator.validate_documents(config, candidate)
+
+    def test_paired_gap_is_recomputed_from_authenticated_intervals(self) -> None:
+        config, report = independent_validation_fixture()
+        measured = next(
+            row
+            for row in report["results"]
+            if row["policy"] != "baseline"
+            and row["comparison_order"] == "ab"
+        )
+        displacement = 20_000_000_000
+        for field in (
+            "block_started_monotonic_ns",
+            "block_finished_monotonic_ns",
+        ):
+            measured[field] += displacement
+        for side in ("dut_metrics", "peer_metrics"):
+            measured[side]["started_at_monotonic_ns"] += displacement
+            measured[side]["finished_at_monotonic_ns"] += displacement
+        measured["workload_started"]["boundary_monotonic_ns"] += displacement
+        measured["workload_finished"]["boundary_monotonic_ns"] += displacement
+        measured["comparison_gap_seconds"] += displacement / 1_000_000_000.0
+        measured["baseline"]["comparison_gap_seconds"] = measured[
+            "comparison_gap_seconds"
+        ]
+        with self.assertRaisesRegex(
+            release_validator.ValidationError,
+            "comparison gap exceeded",
+        ):
+            release_validator.validate_documents(config, report)
+
+    def test_strict_validator_loader_rejects_ambiguous_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            duplicate = root / "duplicate.json"
+            duplicate.write_text('{"value":1,"value":2}', encoding="utf-8")
+            with self.assertRaisesRegex(
+                release_validator.ValidationError, "duplicate JSON key"
+            ):
+                release_validator.load_json_object(
+                    duplicate, maximum_bytes=1024, context="fixture"
+                )
+
+            source = root / "source.json"
+            source.write_text('{"value":1}', encoding="utf-8")
+            symlink = root / "symlink.json"
+            symlink.symlink_to(source)
+            with self.assertRaises(release_validator.ValidationError):
+                release_validator.load_json_object(
+                    symlink, maximum_bytes=1024, context="fixture"
+                )
+
+            hardlink = root / "hardlink.json"
+            os.link(source, hardlink)
+            with self.assertRaisesRegex(
+                release_validator.ValidationError, "singly-linked"
+            ):
+                release_validator.load_json_object(
+                    hardlink, maximum_bytes=1024, context="fixture"
+                )
+
+    def test_regressed_mean_and_failure_linkage_are_recomputed(self) -> None:
+        config, report = independent_validation_fixture((0.0, 0.0, 31.0))
+        summary = release_validator.validate_documents(
+            config, report, require_passing=False
+        )
+        self.assertEqual(summary["regressed_group_count"], 2)
+        self.assertEqual(summary["regressed_burst_count"], 2)
+        protected = [
+            row for row in report["results"] if row["policy"] != "baseline"
+        ]
+        evidence = next(
+            item
+            for item in protected[0]["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        )
+        self.assertGreater(evidence["mean_percent"], 10.0)
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertFalse(evidence["confirmed_regression"])
+
+        mutations = {
+            "mean": lambda row: next(
+                item
+                for item in row["relative_performance_evidence"]
+                if item["metric"] == "throughput_reduction_percent"
+            ).update({"mean_percent": 0.0}),
+            "mean flag": lambda row: next(
+                item
+                for item in row["relative_performance_evidence"]
+                if item["metric"] == "throughput_reduction_percent"
+            ).update({"mean_exceeded_threshold": False}),
+            "confidence bound": lambda row: next(
+                item
+                for item in row["relative_performance_evidence"]
+                if item["metric"] == "throughput_reduction_percent"
+            ).update({"lower_confidence_bound_percent": 100.0}),
+            "release action": lambda row: next(
+                item
+                for item in row["relative_performance_evidence"]
+                if item["metric"] == "throughput_reduction_percent"
+            ).update({"release_action": "observe"}),
+            "failure linkage": lambda row: row.update(
+                {
+                    "relative_performance_failure_reasons": [],
+                    "relative_performance_pass": True,
+                    "passed": True,
+                }
+            ),
+        }
+        for defect, mutate in mutations.items():
+            with self.subTest(defect=defect):
+                candidate = json.loads(json.dumps(report, allow_nan=False))
+                candidate_row = next(
+                    row
+                    for row in candidate["results"]
+                    if row["policy"] != "baseline"
+                )
+                mutate(candidate_row)
+                with self.assertRaises(release_validator.ValidationError):
+                    release_validator.validate_documents(
+                        config, candidate, require_passing=False
+                    )
 
 
 class EvaluationTests(unittest.TestCase):
@@ -1263,6 +2127,26 @@ class EvaluationTests(unittest.TestCase):
                 self.assertTrue(result["capacity_pass"])
                 self.assertTrue(result["passed"])
 
+    def test_metric_schema_and_cpu_percent_identity_are_authoritative(self) -> None:
+        cases = {
+            "stale metrics schema": lambda result: result["dut_metrics"].update(
+                {"schema": "openshield.perf.metrics.v2"}
+            ),
+            "tampered CPU percent": lambda result: result["dut_metrics"][
+                "cgroup"
+            ].update({"cpu_percent_one_core": 49.0}),
+        }
+        for description, mutate in cases.items():
+            with self.subTest(case=description):
+                result = synthetic_result("baseline")
+                mutate(result)
+                runner.evaluate_result(result, self.criteria)
+                self.assertFalse(result["valid"])
+                self.assertIn(
+                    "DUT authoritative collector-excluded cgroup CPU evidence is invalid",
+                    result["unreliable_reasons"],
+                )
+
     def test_relative_confidence_bound_requires_three_paired_samples(self) -> None:
         self.assertIsNone(runner.one_sided_mean_lower_bound([20.0, 20.0]))
         self.assertAlmostEqual(
@@ -1272,6 +2156,32 @@ class EvaluationTests(unittest.TestCase):
         noisy = runner.one_sided_mean_lower_bound([11.0, 30.0, -5.0])
         self.assertIsNotNone(noisy)
         self.assertLess(noisy, 10.0)
+
+    def test_cgroup_relative_percent_rejects_near_zero_denominator(self) -> None:
+        baseline = synthetic_result("baseline")
+        measured = synthetic_result("network_only")
+        baseline["dut_metrics"]["cgroup"].update(
+            {
+                "raw_cpu_seconds": 0.000_011,
+                "collector_cpu_seconds_excluded": 0.000_001,
+                "cpu_seconds": 0.000_010,
+                "cpu_percent_one_core": 0.001,
+            }
+        )
+        baseline["derived"] = {"cgroup_cpu_percent_one_core": 0.001}
+        measured["derived"] = {"cgroup_cpu_percent_one_core": 0.002}
+        self.assertIsNone(
+            runner.cgroup_cpu_relative_increase_percent(
+                baseline, measured, 10.0
+            )
+        )
+        baseline["dut_metrics"]["cgroup"]["cpu_seconds"] = 0.000_020
+        self.assertEqual(
+            runner.cgroup_cpu_relative_increase_percent(
+                baseline, measured, 10.0
+            ),
+            100.0,
+        )
 
     def test_unauthorized_round_trip_is_a_hard_fail_open_failure(self) -> None:
         result = synthetic_result("application_tcp")
@@ -1915,7 +2825,7 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertFalse(result["safety_pass"])
 
-    def test_relative_performance_gates_cover_throughput_pps_latency_and_cpu(self) -> None:
+    def test_relative_performance_gates_keep_cpu_and_latency_advisory(self) -> None:
         cases = {
             "throughput": lambda result: result["workload"]["metrics"].update(
                 {"application_mbps": 10.0}
@@ -1935,9 +2845,7 @@ class EvaluationTests(unittest.TestCase):
             "TCP connect latency p50": lambda result: result["workload"][
                 "metrics"
             ]["connect_latency_ms"].update({"p50": 1.11}),
-            "cgroup CPU": lambda result: result["dut_metrics"]["cgroup"].update(
-                {"cpu_percent_one_core": 55.5}
-            ),
+            "cgroup CPU": lambda result: set_dut_cgroup_cpu_percent(result, 55.5),
         }
         for expected_reason, mutate in cases.items():
             with self.subTest(metric=expected_reason):
@@ -1946,26 +2854,43 @@ class EvaluationTests(unittest.TestCase):
                 for repetition in range(1, 4):
                     baseline = synthetic_result("baseline")
                     measured = synthetic_result("network_only")
-                    for row, sequence in ((baseline, 0), (measured, 1)):
-                        row["phase"] = f"steady_{repetition}"
-                        row["repetition"] = repetition
-                        row["baseline_sample_id"] = f"b{repetition:05d}"
-                        row["execution_sequence"] = sequence
+                    identify_independent_pair(baseline, measured, repetition)
                     mutate(measured)
                     runner.evaluate_result(baseline, self.criteria)
                     runner.evaluate_result(measured, self.criteria)
                     results.extend((baseline, measured))
                     measured_rows.append(measured)
                 runner.add_baseline_comparisons(results, self.criteria)
+                advisory = expected_reason not in {
+                    "throughput",
+                    "aggregate DUT PPS",
+                }
                 for measured in measured_rows:
                     self.assertTrue(measured["capacity_pass"])
-                    self.assertFalse(measured["relative_performance_pass"])
-                    self.assertFalse(measured["passed"])
-                    self.assertIn(
-                        expected_reason,
-                        " ".join(
-                            measured["relative_performance_failure_reasons"]
-                        ),
+                    self.assertIs(
+                        measured["relative_performance_pass"], advisory
+                    )
+                    self.assertIs(measured["passed"], advisory)
+                    failure_text = " ".join(
+                        measured["relative_performance_failure_reasons"]
+                    )
+                    if advisory:
+                        self.assertNotIn(expected_reason, failure_text)
+                    else:
+                        self.assertIn(expected_reason, failure_text)
+                    evidence = next(
+                        item
+                        for item in measured["relative_performance_evidence"]
+                        if expected_reason in item["description"]
+                        or (
+                            expected_reason == "throughput"
+                            and item["metric"]
+                            == "throughput_reduction_percent"
+                        )
+                    )
+                    self.assertEqual(
+                        evidence["release_action"],
+                        "observe" if advisory else "fail",
                     )
 
     def test_relative_gate_keeps_the_strict_ten_percent_boundary(self) -> None:
@@ -1976,11 +2901,7 @@ class EvaluationTests(unittest.TestCase):
                 for repetition in range(1, 4):
                     baseline = synthetic_result("baseline")
                     measured = synthetic_result("network_only")
-                    for row, sequence in ((baseline, 0), (measured, 1)):
-                        row["phase"] = f"steady_{repetition}"
-                        row["repetition"] = repetition
-                        row["baseline_sample_id"] = f"b{repetition:05d}"
-                        row["execution_sequence"] = sequence
+                    identify_independent_pair(baseline, measured, repetition)
                     measured["workload"]["metrics"]["application_mbps"] = throughput
                     runner.evaluate_result(baseline, self.criteria)
                     runner.evaluate_result(measured, self.criteria)
@@ -1997,15 +2918,11 @@ class EvaluationTests(unittest.TestCase):
     def test_noisy_single_window_crossings_remain_visible_but_do_not_block(self) -> None:
         results = []
         measured_rows = []
-        for repetition, cpu in enumerate((55.5, 65.0, 47.5), start=1):
+        for repetition, cpu in enumerate((55.5, 60.0, 42.5), start=1):
             baseline = synthetic_result("baseline")
             measured = synthetic_result("network_only")
-            for row, sequence in ((baseline, 0), (measured, 1)):
-                row["phase"] = f"steady_{repetition}"
-                row["repetition"] = repetition
-                row["baseline_sample_id"] = f"b{repetition:05d}"
-                row["execution_sequence"] = sequence
-            measured["dut_metrics"]["cgroup"]["cpu_percent_one_core"] = cpu
+            identify_independent_pair(baseline, measured, repetition)
+            set_dut_cgroup_cpu_percent(measured, cpu)
             runner.evaluate_result(baseline, self.criteria)
             runner.evaluate_result(measured, self.criteria)
             results.extend((baseline, measured))
@@ -2023,6 +2940,92 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(cpu_evidence["confirmed_regression"])
         self.assertLessEqual(cpu_evidence["lower_confidence_bound_percent"], 10.0)
 
+    def test_high_variance_cpu_mean_remains_visible_when_advisory(self) -> None:
+        results = []
+        measured_rows = []
+        for repetition, increase in enumerate((20.0, 20.0, 100.0), start=1):
+            baseline = synthetic_result("baseline")
+            measured = synthetic_result("network_only")
+            identify_independent_pair(baseline, measured, repetition)
+            set_dut_cgroup_cpu_percent(measured, 50.0 * (1.0 + increase / 100.0))
+            runner.evaluate_result(baseline, self.criteria)
+            runner.evaluate_result(measured, self.criteria)
+            results.extend((baseline, measured))
+            measured_rows.append(measured)
+        runner.add_baseline_comparisons(results, self.criteria)
+        evidence = next(
+            item
+            for item in measured_rows[0]["relative_performance_evidence"]
+            if item["metric"] == "cgroup_cpu_increase_percent"
+        )
+        self.assertAlmostEqual(evidence["mean_percent"], 140.0 / 3.0)
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertFalse(evidence["confirmed_regression"])
+        self.assertLess(evidence["lower_confidence_bound_percent"], 10.0)
+        self.assertEqual(evidence["release_action"], "observe")
+        self.assertTrue(all(row["relative_performance_pass"] for row in measured_rows))
+
+    def test_production_cpu_mean_still_blocks_when_not_advisory(self) -> None:
+        criteria = dict(self.criteria)
+        criteria["cpu_latency_relative_regressions_are_advisory"] = False
+        results = []
+        measured_rows = []
+        for repetition in range(1, 4):
+            baseline = synthetic_result("baseline")
+            measured = synthetic_result("network_only")
+            identify_independent_pair(baseline, measured, repetition)
+            set_dut_cgroup_cpu_percent(measured, 60.0)
+            runner.evaluate_result(baseline, criteria)
+            runner.evaluate_result(measured, criteria)
+            results.extend((baseline, measured))
+            measured_rows.append(measured)
+        runner.add_baseline_comparisons(results, criteria)
+        evidence = next(
+            item
+            for item in measured_rows[0]["relative_performance_evidence"]
+            if item["metric"] == "cgroup_cpu_increase_percent"
+        )
+        self.assertEqual(evidence["release_action"], "fail")
+        self.assertTrue(evidence["mean_exceeded_threshold"])
+        self.assertTrue(all(not row["relative_performance_pass"] for row in measured_rows))
+        self.assertTrue(all(not row["passed"] for row in measured_rows))
+
+    def test_relative_gate_rejects_non_independent_or_single_order_evidence(self) -> None:
+        for defect in ("too_few", "duplicate_pair", "single_order"):
+            with self.subTest(defect=defect):
+                pair_count = 2 if defect == "too_few" else 3
+                results = []
+                measured_rows = []
+                for repetition in range(1, pair_count + 1):
+                    baseline = synthetic_result("baseline")
+                    measured = synthetic_result("network_only")
+                    identify_independent_pair(baseline, measured, repetition)
+                    if defect == "duplicate_pair" and repetition == 2:
+                        baseline["comparison_pair_id"] = "p00001"
+                        measured["comparison_pair_id"] = "p00001"
+                    if defect == "single_order" and repetition == 2:
+                        measured["comparison_order"] = "ab"
+                        baseline["execution_sequence"] = 2
+                        measured["execution_sequence"] = 3
+                        baseline["block_started_monotonic_ns"] = 2_100
+                        baseline["block_finished_monotonic_ns"] = 2_200
+                        measured["block_started_monotonic_ns"] = 2_300
+                        measured["block_finished_monotonic_ns"] = 2_400
+                    runner.evaluate_result(baseline, self.criteria)
+                    runner.evaluate_result(measured, self.criteria)
+                    results.extend((baseline, measured))
+                    measured_rows.append(measured)
+                runner.add_baseline_comparisons(results, self.criteria)
+                self.assertTrue(
+                    all(
+                        "independent paired relative-performance evidence is "
+                        "insufficient, duplicated, or not AB/BA balanced"
+                        in row["unreliable_reasons"]
+                        for row in measured_rows
+                    )
+                )
+                self.assertTrue(all(not row["valid"] for row in measured_rows))
+
     def test_paired_baseline_must_be_unique_and_temporally_adjacent(self) -> None:
         baseline = synthetic_result("baseline")
         duplicate = json.loads(json.dumps(baseline))
@@ -2034,6 +3037,80 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertIn("paired baseline is ambiguous", measured["unreliable_reasons"])
         self.assertFalse(measured["valid"])
+
+    def test_paired_baseline_gap_bound_is_fail_closed(self) -> None:
+        baseline = synthetic_result("baseline")
+        measured = synthetic_result("network_only")
+        measured["block_started_monotonic_ns"] = (
+            baseline["block_finished_monotonic_ns"] + 100
+        )
+        measured_steady_start = (
+            baseline["workload_finished"]["boundary_monotonic_ns"]
+            + 16_000_000_000
+        )
+        # Model a long warm-up/ramp before the protected steady workload.  Its
+        # outer blocks are adjacent and its collector-envelope gap is only 14s,
+        # but the authenticated workload-to-workload gap is 16s and must win.
+        for side in ("dut_metrics", "peer_metrics"):
+            measured[side]["started_at_monotonic_ns"] = (
+                baseline[side]["finished_at_monotonic_ns"] + 14_000_000_000
+            )
+            measured[side]["finished_at_monotonic_ns"] = measured_steady_start + 100
+        measured["workload_started"][
+            "boundary_monotonic_ns"
+        ] = measured_steady_start
+        measured["workload_finished"][
+            "boundary_monotonic_ns"
+        ] = measured_steady_start + 90
+        measured["block_finished_monotonic_ns"] = (
+            measured["dut_metrics"]["finished_at_monotonic_ns"] + 100
+        )
+        for result in (baseline, measured):
+            runner.evaluate_result(result, self.criteria)
+        runner.add_baseline_comparisons([baseline, measured], self.criteria)
+        self.assertEqual(measured["comparison_gap_seconds"], 16.0)
+        self.assertFalse(measured["baseline"]["eligible"])
+        self.assertFalse(measured["valid"])
+        self.assertIn(
+            "paired baseline comparison gap exceeded the configured bound",
+            measured["unreliable_reasons"],
+        )
+
+        # The configured ceiling is inclusive, and both AB and BA directions
+        # use the same conservative workload/DUT/peer maximum.
+        for order in ("ab", "ba"):
+            with self.subTest(order=order):
+                first = synthetic_result("baseline")
+                second = synthetic_result("network_only")
+                if order == "ab":
+                    later, earlier = second, first
+                else:
+                    later, earlier = first, second
+                    second["comparison_order"] = "ba"
+                target_start = (
+                    earlier["workload_finished"]["boundary_monotonic_ns"]
+                    + 15_000_000_000
+                )
+                for side in ("dut_metrics", "peer_metrics"):
+                    later[side]["started_at_monotonic_ns"] = target_start - 10
+                    later[side]["finished_at_monotonic_ns"] = target_start + 100
+                later["workload_started"]["boundary_monotonic_ns"] = target_start
+                later["workload_finished"]["boundary_monotonic_ns"] = target_start + 90
+                later["block_finished_monotonic_ns"] = target_start + 200
+                self.assertEqual(
+                    runner.paired_steady_measurement_gap_seconds(
+                        first, second, order
+                    ),
+                    15.0,
+                )
+
+        malformed = synthetic_result("network_only")
+        malformed["workload_started"]["boundary_monotonic_ns"] = True
+        self.assertIsNone(
+            runner.paired_steady_measurement_gap_seconds(
+                synthetic_result("baseline"), malformed, "ab"
+            )
+        )
 
         baseline = synthetic_result("baseline")
         measured = synthetic_result("network_only")
@@ -2047,30 +3124,61 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertFalse(measured["valid"])
 
-    def test_single_burst_relative_crossing_is_diagnostic_not_confirmation(self) -> None:
+    def test_single_burst_throughput_crossing_is_a_direct_gate(self) -> None:
         criteria = dict(self.criteria)
         criteria["require_burst_capacity"] = True
-        baseline = synthetic_result("baseline")
-        measured = synthetic_result("network_only")
+        baseline_steady = synthetic_result("baseline")
+        measured_steady = synthetic_result("network_only")
+        baseline = json.loads(json.dumps(baseline_steady))
+        measured = json.loads(json.dumps(measured_steady))
         for result in (baseline, measured):
             result["phase"] = "burst"
             result["phase_role"] = "burst"
             runner.evaluate_result(result, criteria)
         measured["workload"]["metrics"]["application_mbps"] = 9.0
         runner.evaluate_result(measured, criteria)
-        runner.add_baseline_comparisons([baseline, measured], criteria)
-        self.assertTrue(measured["relative_performance_pass"])
+        runner.add_baseline_comparisons(
+            [baseline_steady, baseline, measured_steady, measured], criteria
+        )
+        self.assertFalse(measured["relative_performance_pass"])
         self.assertTrue(measured["capacity_pass"])
         self.assertTrue(measured["safety_pass"])
-        self.assertTrue(measured["passed"])
+        self.assertFalse(measured["passed"])
         self.assertTrue(measured["relative_performance_observation_reasons"])
         self.assertTrue(
             all(
-                item["method"] == "single_burst_observation_not_a_relative_gate"
+                item["method"] == "single_paired_burst_threshold_gate"
                 and item["confirmed_regression"] is False
                 for item in measured["relative_performance_evidence"]
             )
         )
+        throughput = next(
+            item
+            for item in measured["relative_performance_evidence"]
+            if item["metric"] == "throughput_reduction_percent"
+        )
+        self.assertEqual(throughput["release_action"], "fail")
+        self.assertTrue(throughput["mean_exceeded_threshold"])
+
+    def test_single_burst_cpu_crossing_remains_advisory_in_ci_smoke(self) -> None:
+        baseline = synthetic_result("baseline")
+        measured = synthetic_result("network_only")
+        for result in (baseline, measured):
+            result["phase"] = "burst"
+            result["phase_role"] = "burst"
+            runner.evaluate_result(result, self.criteria)
+        set_dut_cgroup_cpu_percent(measured, 60.0)
+        runner.evaluate_result(measured, self.criteria)
+        runner.add_baseline_comparisons([baseline, measured], self.criteria)
+        cpu = next(
+            item
+            for item in measured["relative_performance_evidence"]
+            if item["metric"] == "cgroup_cpu_increase_percent"
+        )
+        self.assertEqual(cpu["release_action"], "observe")
+        self.assertTrue(cpu["mean_exceeded_threshold"])
+        self.assertTrue(measured["relative_performance_pass"])
+        self.assertTrue(measured["passed"])
 
     def test_burst_requires_a_paired_baseline(self) -> None:
         measured = synthetic_result("network_only")
@@ -2728,7 +3836,7 @@ class MetricAndOutputTests(unittest.TestCase):
             ".post_resume_dut_metrics.stop_reason",
             ".metric_starts",
             "$metric_starts.dut",
-            '== "openshield.perf.metrics.v2"',
+            '== "openshield.perf.metrics.v3"',
             ".post_resume_dut_metrics.nfqueue.kernel_dropped",
             ".post_resume_dut_metrics.nfqueue.user_dropped",
             ".post_resume_dut_metrics.nfqueue.depth_end",
@@ -2740,6 +3848,18 @@ class MetricAndOutputTests(unittest.TestCase):
             "zero_tcp_listen_errors",
         ):
             self.assertIn(contract, source)
+        compact = " ".join(source.split())
+        self.assertIn(
+            "([$metric_starts.dut.boundary_monotonic_ns, "
+            "$metric_starts.peer.boundary_monotonic_ns, "
+            "$metric_starts.canary.boundary_monotonic_ns] | max)",
+            compact,
+        )
+        self.assertIn(
+            ".metric_starts.dut.boundary_monotonic_ns <= "
+            ".pressure_started.boundary_monotonic_ns",
+            compact,
+        )
 
     def test_post_resume_recovery_waits_for_direct_nfqueue_drain(self) -> None:
         topology = object.__new__(runner.DockerBackendRun)
@@ -3074,9 +4194,94 @@ class MetricAndOutputTests(unittest.TestCase):
             {"source": "cgroup-v2/cpu.stat:usage_usec", "usage_seconds": 10.0},
             {"source": "cgroup-v2/cpu.stat:usage_usec", "usage_seconds": 10.5},
             2.0,
+            0.1,
         )
-        self.assertAlmostEqual(delta["cpu_seconds"], 0.5)
-        self.assertAlmostEqual(delta["cpu_percent_one_core"], 25.0)
+        self.assertAlmostEqual(delta["raw_cpu_seconds"], 0.5)
+        self.assertAlmostEqual(delta["collector_cpu_seconds_excluded"], 0.1)
+        self.assertAlmostEqual(delta["cpu_seconds"], 0.4)
+        self.assertAlmostEqual(delta["cpu_percent_one_core"], 20.0)
+
+        rounded = collector.cgroup_cpu_delta(
+            {"source": "cgroup-v2/cpu.stat:usage_usec", "usage_seconds": 10.0},
+            {
+                "source": "cgroup-v2/cpu.stat:usage_usec",
+                "usage_seconds": 10.000_000_5,
+            },
+            1.0,
+            0.000_001,
+        )
+        self.assertAlmostEqual(rounded["raw_cpu_seconds"], 0.000_000_5)
+        self.assertAlmostEqual(rounded["collector_cpu_seconds_excluded"], 0.000_001)
+        self.assertEqual(rounded["cpu_seconds"], 0.0)
+        self.assertEqual(rounded["cpu_percent_one_core"], 0.0)
+
+        impossible = collector.cgroup_cpu_delta(
+            {"source": "cgroup-v2/cpu.stat:usage_usec", "usage_seconds": 10.0},
+            {
+                "source": "cgroup-v2/cpu.stat:usage_usec",
+                "usage_seconds": 10.000_000_5,
+            },
+            1.0,
+            0.000_002,
+        )
+        self.assertIsNone(impossible["cpu_seconds"])
+        self.assertIsNone(impossible["cpu_percent_one_core"])
+
+    def test_cgroup_cpu_subtracts_only_the_boundary_bracketed_interval(self) -> None:
+        def observation(timestamp: int, usage: float) -> dict:
+            return {
+                "monotonic_ns": timestamp,
+                "cgroup_cpu": {
+                    "source": "cgroup-v2/cpu.stat:usage_usec",
+                    "usage_seconds": usage,
+                },
+                "interface": {},
+                "softirq": {},
+                "tcp_retransmits": 0,
+                "udp_errors": {},
+                "tcp_listen": {},
+                "conntrack_count": 0,
+                "nfqueue": {
+                    "sequence": 0,
+                    "kernel_dropped": 0,
+                    "user_dropped": 0,
+                    "depth": 0,
+                    "copy_mode": 2,
+                    "copy_range": 65535,
+                },
+            }
+
+        started = {
+            "snapshot": observation(1_000_000_000, 10.0),
+            "process_cpu_ticks": 0,
+            "workload_cpu_ticks": 0,
+            "collector_cpu_before_cgroup": 0.0,
+            "collector_cpu_after_cgroup": 5.0,
+        }
+        finished = {
+            "snapshot": observation(2_000_000_000, 10.000_001),
+            "process_cpu_ticks": 0,
+            "workload_cpu_ticks": 0,
+            "collector_cpu_before_cgroup": 5.000_001_5,
+            # A timestamp taken only after unrelated final-boundary work would
+            # exceed the raw cgroup delta. It must not enter the subtraction.
+            "collector_cpu_after_cgroup": 100.0,
+        }
+        document = collector._metrics_document(
+            0,
+            0,
+            started,
+            finished,
+            {"rss": [], "workload_rss": [], "conntrack": [], "queue_depth": []},
+            "requested",
+        )
+        self.assertEqual(document["schema"], collector.METRICS_SCHEMA)
+        self.assertAlmostEqual(
+            document["cgroup"]["collector_cpu_seconds_excluded"],
+            0.000_001_5,
+        )
+        self.assertEqual(document["cgroup"]["cpu_seconds"], 0.0)
+        self.assertEqual(document["cgroup"]["cpu_percent_one_core"], 0.0)
 
     def test_cgroup_v1_fallback_rejects_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3098,6 +4303,8 @@ class MetricAndOutputTests(unittest.TestCase):
         row = runner.csv_row(measured)
         for field in (
             "baseline_sample_id",
+            "comparison_pair_id",
+            "comparison_repetition",
             "comparison_order",
             "execution_sequence",
             "topology_role",

@@ -201,9 +201,10 @@ generations with their own peers and internal networks; only the DUTs receive
 the capabilities required for their private firewall namespaces. The daemon is
 never started on the baseline DUT. Its captured environment must exactly equal
 the protected environment while the immutable container IDs must differ. The
-wrapper limits the enlarged paired harness to 1200 seconds, the workflow leaves
-a 30-minute outer bound for cleanup and evidence upload, and report/log sizes
-are bounded. Neither the
+wrapper limits the enlarged paired harness to 1800 seconds, the workflow leaves
+a 45-minute outer bound for cleanup and evidence upload, and report/log sizes
+are bounded (`report.json` is capped at 20 MiB for the 576-row independent-pair
+evidence set). Neither the
 wrapper nor the harness runs `sudo`, `nft`, or `iptables` against the runner
 host.
 
@@ -222,39 +223,74 @@ backend's `finally` cleanup runs before the wrapper's bounded fallback cleanup.
 
 The checked-in `tests/perf/config/ci-smoke.json` profile is a short regression
 smoke, not a statistically portable benchmark. It retains every backend,
-mode, policy path, and workload profile, with one half-load ramp followed by
-three one-second steady windows. Offered rates are sized to produce hundreds
+mode, policy path, and workload profile, with one half-load ramp and three
+independent baseline/protected pairs containing one-second steady windows.
+Each pair performs its own warm-up; the first pair performs the ramp and the
+last performs the burst. Offered rates are sized to produce hundreds
 of operations in each steady window instead of deriving percentiles from
 single-digit samples. Every repeated window must pass. A pass requires all of
 the following:
 
-The comparison order is fixed before measurement and alternates nearest
-pristine baselines as `A0, B0, B1, A1, B2, B3, A2, ...`. A protected block can
-use only its predetermined immediately adjacent baseline; observed values
-never select a more favourable reference. `baseline_pairing` evidence records
-the schedule, exact environment equality, distinct DUT identities, order,
-monotonic block boundaries, and comparison gap. The CI wrapper independently
-reconstructs and validates that plan.
+The warm-up in every independent CI block is 1.0 second. The validator derives
+609.6 seconds of workload for the complete two-backend plan, below the explicit
+620-second `max_total_workload_seconds` bound. The TCP target uses a
+steady-state, worker-local Poisson competing-risk estimate for the lifetime
+renewal rate `X(r)`, rather than assuming that all concurrent sockets expire at
+`N / E[L]`. For pure keep-alive,
+`X(r) = r / (1 + r * E[L] / N)`; mixed mode additionally accounts for short
+requests that retire idle persistent sockets. Four close packets and a
+three-packet replacement handshake are charged through
+`P * r + 7 * X(r) <= configured_pps`, while CPS uses
+`(1 - k^2) * r + X(r) <= configured_cps`. The checked-in keep-alive values keep
+`pps = 1280` and `cps = 160` and yield `200.874426 operations/s`; neither those
+intensities nor the numerical 10% release thresholds are lowered. The advisory
+classification described below does not change those values.
+
+The comparison order is fixed before measurement. Each exact group receives
+three unique, single-use baseline/protected pairs whose order alternates AB/BA;
+the starting order alternates between groups for global balance. A protected
+block can use only its predetermined immediately adjacent baseline; observed
+values never select a more favourable reference. `baseline_pairing` evidence
+records the unique pair and baseline IDs, repetition, schedule, exact
+environment equality, distinct DUT identities, order, monotonic block
+boundaries, and comparison gap. The CI wrapper independently reconstructs and
+validates the 576-row plan. The conservative maximum gap between authenticated
+workload and DUT/peer collector steady-window boundaries is capped at 15 seconds;
+exceeding that bound invalidates the evidence and blocks publication without
+mislabeling environmental drift as a performance regression.
 
 - the runner exits successfully before the hard timeout;
 - `report.json` uses schema `openshield.perf.report.v2`, sets both `valid` and
   `passed` to `true`, contains valid
-  `openshield.perf.baseline-pairing.v1` evidence, and reports nftables as
+  `openshield.perf.baseline-pairing.v2` evidence, and reports nftables as
   `passed`;
 - iptables is also `passed`; an `unsupported` result is neutral only for a
   profile that explicitly sets `allow_unsupported_iptables` to `true`, which
   the release smoke profile does not do;
 - generator, pressure-peer, or canary resource saturation, socket-queue or NIC
-  errors, an invalid sample, a failed configured ceiling in a required
+  errors, an invalid sample, a failed blocking configured ceiling in a required
   steady/burst window, a missing backend, or a missing/malformed report fails
   the job;
-- all per-window relative deltas and threshold crossings are retained; the
-  release profile blocks an unchanged 10% relative regression only when at
-  least three valid steady adjacent pristine AB/BA pairs produce a one-sided
-  95% Student-t lower confidence bound above that threshold; the longer
-  production-like profile applies the same method with 5% limits;
-- a single burst relative observation is diagnostic only, while burst
-  validity, configured capacity ceilings, and safety remain mandatory;
+- all per-window relative deltas and threshold crossings are retained. For
+  throughput and DUT PPS, the release profile blocks when the arithmetic mean
+  of at least three valid, independent, adjacent pristine AB/BA pairs exceeds
+  the unchanged 10% reduction limit. With
+  `cpu_latency_relative_regressions_are_advisory: true`, the same calculation
+  and one-sided 95% Student-t bound for relative DUT-cgroup CPU and
+  request/TCP-connect latency are evidence only on the shared release runner;
+  exceeding 10% does not by itself block publication. Absolute daemon CPU/RSS
+  and p99-latency ceilings remain blocking. The longer production-like profile
+  sets `cpu_latency_relative_regressions_are_advisory: false`, so every
+  relative mean over its 5% limits remains blocking;
+- a separate source-manifested validator recomputes the canonical configuration
+  SHA-256 and workload-time estimate from the checked-in JSON, then derives all
+  steady paired deltas, means, strict threshold comparisons, advisory/blocking
+  disposition, Student-t bounds, and observation/failure linkage from primary
+  measurements; report-provided aggregate decisions are not trusted;
+- a single burst relative observation is a direct gate for throughput/PPS;
+  relative CPU and latency follow the profile's explicit advisory/blocking
+  setting, while burst validity, configured capacity ceilings, and safety
+  remain mandatory;
 - application errors/loss, TCP retransmits, NIC drops/errors, NFQUEUE
   drops/errors, or fail-open behavior block immediately and are never deferred
   to the repeated-sample relative decision;

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, ErrorKind, Read};
@@ -25,6 +25,7 @@ use openshield_core::{
 
 const MAX_PROC_ENTRIES: usize = 131_072;
 const MAX_FDS_PER_TASK: usize = 4_096;
+pub(crate) const MAX_ATTRIBUTION_BATCH_SIZE: usize = 32;
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STATUS_BYTES: usize = 256 * 1024;
 const MAX_STAT_BYTES: usize = 64 * 1024;
@@ -306,21 +307,21 @@ impl ApplicationDecisionPolicy {
 /// Optional process fields needed after the mandatory executable/socket
 /// identity has been established. The type is crate-private so external callers
 /// cannot request selective capture; the public resolver retains full capture.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct IdentityCaptureRequirements {
     command_line: bool,
     cgroups: bool,
 }
 
 impl IdentityCaptureRequirements {
-    const fn minimal() -> Self {
+    pub(crate) const fn minimal() -> Self {
         Self {
             command_line: false,
             cgroups: false,
         }
     }
 
-    const fn full() -> Self {
+    pub(crate) const fn full() -> Self {
         Self {
             command_line: true,
             cgroups: true,
@@ -397,9 +398,58 @@ pub struct ProcfsResolver {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OwnerTask {
+    process_id: u32,
     tid: u32,
     path: PathBuf,
     fd_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SocketOwnerKey {
+    inode: u64,
+    uid: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OwnerSnapshot {
+    unique: BTreeMap<SocketOwnerKey, Vec<OwnerTask>>,
+    failures: BTreeMap<SocketOwnerKey, String>,
+}
+
+/// Per-request failure retained while a batched attribution is assembled.
+///
+/// `anyhow` context is intentionally flattened only after recording whether
+/// the original chain contained the bounded-attribution timeout marker. The
+/// marker is reconstructed when the result is returned so NFQUEUE accounting
+/// can distinguish overload from ordinary deny decisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BatchResolutionFailure {
+    message: String,
+    attribution_timeout: bool,
+}
+
+impl BatchResolutionFailure {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            attribution_timeout: false,
+        }
+    }
+
+    fn from_error(error: &anyhow::Error) -> Self {
+        Self {
+            message: format!("{error:#}"),
+            attribution_timeout: is_attribution_timeout(error),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        if self.attribution_timeout {
+            anyhow::Error::new(ProcfsAttributionTimeout).context(self.message)
+        } else {
+            anyhow!(self.message)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -451,25 +501,250 @@ impl ProcfsResolver {
         }
     }
 
+    #[cfg(test)]
     pub fn resolve(&self, connection: &OutboundConnection) -> Result<ApplicationIdentity> {
         self.resolve_with_requirements(connection, IdentityCaptureRequirements::full())
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_for_enforcement(
         &self,
         connection: &OutboundConnection,
         requirements: IdentityCaptureRequirements,
     ) -> Result<ApplicationIdentity> {
+        if requirements == IdentityCaptureRequirements::full() {
+            return self.resolve(connection);
+        }
         self.resolve_with_requirements(connection, requirements)
     }
 
+    /// Resolves a bounded group of independently queued packets while sharing
+    /// only the exhaustive socket-owner discovery passes.
+    ///
+    /// `SOCK_DIAG` lookup remains per request. Identity capture is shared only
+    /// for requests in this batch which resolve to the same inode, UID and
+    /// capture requirements. Two complete procfs owner snapshots bracket those
+    /// captures, and every request is accepted only when its unique owner is
+    /// byte-for-byte stable across both snapshots. This amortizes directory
+    /// traversal without creating a long-lived authorization cache: a later
+    /// UDP batch starts attribution again from `SOCK_DIAG`.
+    pub(crate) fn resolve_batch_for_enforcement(
+        &self,
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+    ) -> Vec<Result<ApplicationIdentity>> {
+        self.resolve_batch_for_enforcement_until(requests, Instant::now() + PROC_SCAN_DEADLINE)
+    }
+
+    fn resolve_batch_for_enforcement_until(
+        &self,
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        deadline: Instant,
+    ) -> Vec<Result<ApplicationIdentity>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        if requests.len() == 1 {
+            return vec![self.resolve_with_requirements_until(
+                requests[0].0,
+                requests[0].1,
+                deadline,
+            )];
+        }
+        if requests.len() > MAX_ATTRIBUTION_BATCH_SIZE {
+            return requests
+                .iter()
+                .map(|_| {
+                    Err(anyhow!(
+                        "application attribution batch exceeds its fixed bound"
+                    ))
+                })
+                .collect();
+        }
+
+        let (keys, mut errors, targets) = self.resolve_batch_socket_keys(requests, deadline);
+
+        let before = if targets.is_empty() {
+            OwnerSnapshot::default()
+        } else {
+            match self.resolve_unique_process_tasks_batch(
+                &targets,
+                deadline,
+                MAX_FDS_PER_TASK,
+                MAX_PROC_ENTRIES,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let error =
+                        error.context("cannot establish the first batched socket-owner snapshot");
+                    let failure = BatchResolutionFailure::from_error(&error);
+                    for (key, slot) in keys.iter().zip(&mut errors) {
+                        if key.is_some() && slot.is_none() {
+                            *slot = Some(failure.clone());
+                        }
+                    }
+                    return batch_resolution_results(errors, vec![None; requests.len()]);
+                }
+            }
+        };
+
+        let mut identities = vec![None; requests.len()];
+        let mut capture_results = BTreeMap::<
+            (SocketOwnerKey, IdentityCaptureRequirements),
+            std::result::Result<ApplicationIdentity, BatchResolutionFailure>,
+        >::new();
+        for (index, ((_, requirements), key)) in requests.iter().zip(&keys).enumerate() {
+            let Some(key) = key else {
+                continue;
+            };
+            if let Some(failure) = before.failures.get(key) {
+                errors[index] = Some(BatchResolutionFailure::message(failure.clone()));
+                continue;
+            }
+            let Some(owners) = before.unique.get(key) else {
+                errors[index] = Some(BatchResolutionFailure::message(
+                    "batched socket-owner snapshot omitted a target",
+                ));
+                continue;
+            };
+            let capture_key = (*key, *requirements);
+            let captured = capture_results
+                .entry(capture_key)
+                .or_insert_with(|| {
+                    Self::capture_owner_identity(
+                        owners.clone(),
+                        key.inode,
+                        key.uid,
+                        deadline,
+                        *requirements,
+                    )
+                    .map_err(|error| BatchResolutionFailure::from_error(&error))
+                })
+                .clone();
+            match captured {
+                Ok(identity) => identities[index] = Some(identity),
+                Err(failure) => errors[index] = Some(failure),
+            }
+        }
+
+        reject_inconsistent_batch_identities(&keys, &mut errors, &mut identities);
+        self.revalidate_batch_owners(&keys, &before, deadline, &mut errors, &mut identities);
+
+        batch_resolution_results(errors, identities)
+    }
+
+    fn resolve_batch_socket_keys(
+        &self,
+        requests: &[(&OutboundConnection, IdentityCaptureRequirements)],
+        deadline: Instant,
+    ) -> (
+        Vec<Option<SocketOwnerKey>>,
+        Vec<Option<BatchResolutionFailure>>,
+        BTreeSet<SocketOwnerKey>,
+    ) {
+        let mut keys = Vec::with_capacity(requests.len());
+        let mut errors = Vec::with_capacity(requests.len());
+        let mut targets = BTreeSet::new();
+        for (connection, _) in requests {
+            let resolved = (|| {
+                connection.validate()?;
+                self.resolve_socket_inode(connection, deadline)
+                    .context("cannot resolve socket inode for batched attribution")
+            })();
+            match resolved {
+                Ok(inode) => {
+                    let key = SocketOwnerKey {
+                        inode,
+                        uid: connection.socket_uid,
+                    };
+                    targets.insert(key);
+                    keys.push(Some(key));
+                    errors.push(None);
+                }
+                Err(error) => {
+                    keys.push(None);
+                    errors.push(Some(BatchResolutionFailure::from_error(&error)));
+                }
+            }
+        }
+        (keys, errors, targets)
+    }
+
+    fn revalidate_batch_owners(
+        &self,
+        keys: &[Option<SocketOwnerKey>],
+        before: &OwnerSnapshot,
+        deadline: Instant,
+        errors: &mut [Option<BatchResolutionFailure>],
+        identities: &mut [Option<ApplicationIdentity>],
+    ) {
+        let successful_targets = keys
+            .iter()
+            .zip(identities.iter())
+            .filter_map(|(key, identity)| identity.as_ref().and(*key))
+            .collect::<BTreeSet<_>>();
+        if successful_targets.is_empty() {
+            return;
+        }
+        let after = match self.resolve_unique_process_tasks_batch(
+            &successful_targets,
+            deadline,
+            MAX_FDS_PER_TASK,
+            MAX_PROC_ENTRIES,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let error =
+                    error.context("cannot establish the final batched socket-owner snapshot");
+                let failure = BatchResolutionFailure::from_error(&error);
+                for (identity, slot) in identities.iter_mut().zip(errors) {
+                    if identity.take().is_some() {
+                        *slot = Some(failure.clone());
+                    }
+                }
+                return;
+            }
+        };
+        for (index, key) in keys.iter().enumerate() {
+            let Some(key) = key else {
+                continue;
+            };
+            if identities[index].is_none() {
+                continue;
+            }
+            if let Some(failure) = after.failures.get(key) {
+                identities[index] = None;
+                errors[index] = Some(BatchResolutionFailure::message(format!(
+                    "socket ownership became unsafe during batched attribution: {failure}"
+                )));
+            } else if before.unique.get(key) != after.unique.get(key) {
+                identities[index] = None;
+                errors[index] = Some(BatchResolutionFailure::message(
+                    "socket ownership changed during batched attribution",
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn resolve_with_requirements(
         &self,
         connection: &OutboundConnection,
         requirements: IdentityCaptureRequirements,
     ) -> Result<ApplicationIdentity> {
+        self.resolve_with_requirements_until(
+            connection,
+            requirements,
+            Instant::now() + PROC_SCAN_DEADLINE,
+        )
+    }
+
+    fn resolve_with_requirements_until(
+        &self,
+        connection: &OutboundConnection,
+        requirements: IdentityCaptureRequirements,
+        deadline: Instant,
+    ) -> Result<ApplicationIdentity> {
         connection.validate()?;
-        let deadline = Instant::now() + PROC_SCAN_DEADLINE;
         let inode = self.resolve_socket_inode(connection, deadline)?;
         let owners = self.resolve_unique_process_tasks(
             inode,
@@ -477,6 +752,16 @@ impl ProcfsResolver {
             deadline,
             MAX_FDS_PER_TASK,
         )?;
+        Self::capture_owner_identity(owners, inode, connection.socket_uid, deadline, requirements)
+    }
+
+    fn capture_owner_identity(
+        owners: Vec<OwnerTask>,
+        inode: u64,
+        uid: u32,
+        deadline: Instant,
+        requirements: IdentityCaptureRequirements,
+    ) -> Result<ApplicationIdentity> {
         let mut identities = owners
             .into_iter()
             .map(|owner| {
@@ -485,7 +770,7 @@ impl ProcfsResolver {
                     owner.tid,
                     &owner.fd_path,
                     inode,
-                    connection.socket_uid,
+                    uid,
                     deadline,
                     requirements,
                 )
@@ -653,6 +938,7 @@ impl ProcfsResolver {
                         );
                     }
                     owners.entry(process_id).or_default().push(OwnerTask {
+                        process_id,
                         tid,
                         path: task,
                         fd_path,
@@ -679,6 +965,215 @@ impl ProcfsResolver {
             .next()
             .map(|(_tgid, tasks)| tasks)
             .ok_or_else(|| anyhow!("no process owns the attributed socket inode"))
+    }
+
+    fn resolve_unique_process_tasks_batch(
+        &self,
+        targets: &BTreeSet<SocketOwnerKey>,
+        deadline: Instant,
+        maximum_fds: usize,
+        maximum_owner_records: usize,
+    ) -> Result<OwnerSnapshot> {
+        ensure!(!targets.is_empty(), "socket-owner batch is empty");
+        ensure!(
+            targets.len() <= MAX_ATTRIBUTION_BATCH_SIZE,
+            "socket-owner batch exceeds its fixed bound"
+        );
+        ensure!(maximum_fds > 0, "per-task fd bound is zero");
+        ensure!(
+            maximum_owner_records > 0,
+            "batched socket-owner record bound is zero"
+        );
+
+        let targets_by_uid = socket_targets_by_uid(targets);
+        let mut daemon_owned =
+            self.daemon_owned_targets_for_batch(&targets_by_uid, deadline, maximum_fds)?;
+
+        let mut owners = BTreeMap::<SocketOwnerKey, BTreeMap<u32, Vec<OwnerTask>>>::new();
+        let mut ambiguous_targets = BTreeSet::new();
+        let mut owner_records = 0_usize;
+        let process_ids = enumerate_process_ids(&self.root, deadline)?;
+        let mut task_count = 0_usize;
+        for process_id in process_ids {
+            ensure_within_deadline(deadline)?;
+            if self.daemon_process_id == Some(process_id) {
+                continue;
+            }
+            let process = self.root.join(process_id.to_string());
+            let task_root = process.join("task");
+            let Some(task_ids) =
+                enumerate_task_ids(&process, &task_root, process_id, deadline, &mut task_count)?
+            else {
+                continue;
+            };
+            for tid in task_ids {
+                ensure_within_deadline(deadline)?;
+                let task = task_root.join(tid.to_string());
+                let observed_uid = match read_process_fs_uid(&task, deadline) {
+                    Ok(uid) => uid,
+                    Err(error) => {
+                        if path_disappeared(&task)? {
+                            continue;
+                        }
+                        return Err(error).with_context(|| {
+                            format!("cannot inspect filesystem UID for task {tid}")
+                        });
+                    }
+                };
+                let Some(inodes) = targets_by_uid.get(&observed_uid) else {
+                    continue;
+                };
+                let matches = task_socket_fds_for_inodes(
+                    &task,
+                    process_id,
+                    tid,
+                    observed_uid,
+                    inodes,
+                    deadline,
+                    maximum_fds,
+                )?;
+                for (inode, fd_path) in matches {
+                    let key = SocketOwnerKey {
+                        inode,
+                        uid: observed_uid,
+                    };
+                    if ambiguous_targets.contains(&key) {
+                        continue;
+                    }
+                    let process_owners = owners.entry(key).or_default();
+                    if !process_owners.is_empty() && !process_owners.contains_key(&process_id) {
+                        process_owners.clear();
+                        ambiguous_targets.insert(key);
+                        continue;
+                    }
+                    owner_records = owner_records
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("batched socket-owner record count overflowed"))?;
+                    ensure!(
+                        owner_records <= maximum_owner_records,
+                        "batched socket-owner record bound exceeded"
+                    );
+                    process_owners
+                        .entry(process_id)
+                        .or_default()
+                        .push(OwnerTask {
+                            process_id,
+                            tid,
+                            path: task.clone(),
+                            fd_path,
+                        });
+                }
+            }
+        }
+
+        daemon_owned.extend(self.daemon_owned_targets_for_batch(
+            &targets_by_uid,
+            deadline,
+            maximum_fds,
+        )?);
+        ensure_within_deadline(deadline)?;
+
+        Self::finish_owner_snapshot(targets, &daemon_owned, &ambiguous_targets, owners)
+    }
+
+    fn daemon_owned_targets_for_batch(
+        &self,
+        targets_by_uid: &BTreeMap<u32, BTreeSet<u64>>,
+        deadline: Instant,
+        maximum_fds: usize,
+    ) -> Result<BTreeSet<SocketOwnerKey>> {
+        let Some(daemon_process_id) = self.daemon_process_id else {
+            return Ok(BTreeSet::new());
+        };
+        Self::daemon_owned_targets(
+            &self.root.join(daemon_process_id.to_string()),
+            targets_by_uid,
+            deadline,
+            maximum_fds,
+        )
+    }
+
+    fn finish_owner_snapshot(
+        targets: &BTreeSet<SocketOwnerKey>,
+        daemon_owned: &BTreeSet<SocketOwnerKey>,
+        ambiguous_targets: &BTreeSet<SocketOwnerKey>,
+        mut owners: BTreeMap<SocketOwnerKey, BTreeMap<u32, Vec<OwnerTask>>>,
+    ) -> Result<OwnerSnapshot> {
+        let mut snapshot = OwnerSnapshot::default();
+        for target in targets {
+            if daemon_owned.contains(target) {
+                snapshot.failures.insert(
+                    *target,
+                    "the firewall daemon unexpectedly owns the attributed application socket"
+                        .to_owned(),
+                );
+                continue;
+            }
+            if ambiguous_targets.contains(target) {
+                snapshot.failures.insert(
+                    *target,
+                    "socket is shared by multiple processes; attribution is ambiguous".to_owned(),
+                );
+                continue;
+            }
+            let Some(mut process_owners) = owners.remove(target) else {
+                snapshot.failures.insert(
+                    *target,
+                    "no process owns the attributed socket inode".to_owned(),
+                );
+                continue;
+            };
+            if process_owners.len() != 1 {
+                snapshot.failures.insert(
+                    *target,
+                    "socket is shared by multiple processes; attribution is ambiguous".to_owned(),
+                );
+                continue;
+            }
+            let owner_tasks = process_owners
+                .pop_first()
+                .map(|(_process_id, tasks)| tasks)
+                .ok_or_else(|| anyhow!("unique socket-owner process disappeared"))?;
+            snapshot.unique.insert(*target, owner_tasks);
+        }
+        Ok(snapshot)
+    }
+
+    fn daemon_owned_targets(
+        process: &Path,
+        targets_by_uid: &BTreeMap<u32, BTreeSet<u64>>,
+        deadline: Instant,
+        maximum_fds: usize,
+    ) -> Result<BTreeSet<SocketOwnerKey>> {
+        let uid_before = read_process_fs_uid(process, deadline)
+            .context("cannot verify the firewall daemon filesystem UID")?;
+        let Some(inodes) = targets_by_uid.get(&uid_before) else {
+            return Ok(BTreeSet::new());
+        };
+        let descriptors = fs::read_dir(process.join("fd"))
+            .context("cannot inspect the firewall daemon descriptor table")?;
+        let matches = scan_fd_entries_for_inodes(
+            descriptors,
+            inodes,
+            deadline,
+            maximum_fds,
+            "firewall daemon",
+        )?;
+        if !matches.is_empty() {
+            let uid_after = read_process_fs_uid(process, deadline)
+                .context("cannot re-verify the firewall daemon filesystem UID")?;
+            ensure!(
+                uid_before == uid_after,
+                "firewall daemon filesystem UID changed during descriptor scan"
+            );
+        }
+        Ok(matches
+            .into_keys()
+            .map(|inode| SocketOwnerKey {
+                inode,
+                uid: uid_before,
+            })
+            .collect())
     }
 
     fn reject_daemon_socket_owner(
@@ -994,6 +1489,178 @@ fn task_socket_fd(
         }
     }
     Ok(None)
+}
+
+fn task_socket_fds_for_inodes(
+    task: &Path,
+    process_id: u32,
+    task_id: u32,
+    observed_fsuid: u32,
+    target_inodes: &BTreeSet<u64>,
+    deadline: Instant,
+    maximum_fds: usize,
+) -> Result<BTreeMap<u64, PathBuf>> {
+    let descriptors = match fs::read_dir(task.join("fd")) {
+        Ok(entries) => entries,
+        Err(error) if procfs_enumeration_may_indicate_disappearance(&error) => {
+            if procfs_subject_disappeared_after(&error, task)? {
+                return Ok(BTreeMap::new());
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot prove batched socket ownership: descriptor table for live task {task_id} is unavailable"
+                )
+            });
+        }
+        Err(error) => {
+            if error.kind() == ErrorKind::PermissionDenied
+                && task_id == process_id
+                && task_is_stably_zombie(task, deadline)?
+            {
+                return Ok(BTreeMap::new());
+            }
+            return Err(error)
+                .with_context(|| format!("cannot enumerate descriptor table for task {task_id}"));
+        }
+    };
+    let matches = scan_fd_entries_for_inodes(
+        descriptors,
+        target_inodes,
+        deadline,
+        maximum_fds,
+        "application task",
+    )?;
+    if !matches.is_empty() {
+        verify_socket_owner_uid(task, task_id, observed_fsuid, observed_fsuid, deadline)?;
+    }
+    Ok(matches)
+}
+
+fn scan_fd_entries_for_inodes(
+    descriptors: fs::ReadDir,
+    target_inodes: &BTreeSet<u64>,
+    deadline: Instant,
+    maximum_fds: usize,
+    subject: &str,
+) -> Result<BTreeMap<u64, PathBuf>> {
+    let mut matches = BTreeMap::<u64, PathBuf>::new();
+    for (count, entry) in descriptors.enumerate() {
+        ensure!(
+            count < maximum_fds,
+            "cannot prove unique batched socket ownership: {subject} fd bound exceeded"
+        );
+        ensure_within_deadline(deadline)?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {subject} descriptor entry"));
+            }
+        };
+        let link = match fs::read_link(entry.path()) {
+            Ok(link) => link,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {subject} descriptor link"));
+            }
+        };
+        ensure_within_deadline(deadline)?;
+        let Some(inode) = socket_inode_from_link(&link) else {
+            continue;
+        };
+        if !target_inodes.contains(&inode) {
+            continue;
+        }
+        let path = entry.path();
+        matches
+            .entry(inode)
+            .and_modify(|current| {
+                if path < *current {
+                    current.clone_from(&path);
+                }
+            })
+            .or_insert(path);
+    }
+    Ok(matches)
+}
+
+fn socket_inode_from_link(link: &Path) -> Option<u64> {
+    let text = link.to_str()?;
+    let inode = text.strip_prefix("socket:[")?.strip_suffix(']')?;
+    if inode.is_empty() || !inode.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    inode.parse().ok()
+}
+
+fn socket_targets_by_uid(targets: &BTreeSet<SocketOwnerKey>) -> BTreeMap<u32, BTreeSet<u64>> {
+    let mut targets_by_uid = BTreeMap::<u32, BTreeSet<u64>>::new();
+    for target in targets {
+        targets_by_uid
+            .entry(target.uid)
+            .or_default()
+            .insert(target.inode);
+    }
+    targets_by_uid
+}
+
+fn reject_inconsistent_batch_identities(
+    keys: &[Option<SocketOwnerKey>],
+    errors: &mut [Option<BatchResolutionFailure>],
+    identities: &mut [Option<ApplicationIdentity>],
+) {
+    let mut first_identity_indexes = BTreeMap::<SocketOwnerKey, usize>::new();
+    let mut inconsistent = BTreeSet::new();
+    for (index, (key, identity)) in keys.iter().zip(identities.iter()).enumerate() {
+        let (Some(key), Some(identity)) = (key, identity) else {
+            continue;
+        };
+        if let Some(first_index) = first_identity_indexes.get(key) {
+            let Some(first_identity) = identities[*first_index].as_ref() else {
+                continue;
+            };
+            if !equivalent_mandatory_process_identity(first_identity, identity) {
+                inconsistent.insert(*key);
+            }
+        } else {
+            first_identity_indexes.insert(*key, index);
+        }
+    }
+    for ((key, error), identity) in keys.iter().zip(errors).zip(identities) {
+        if key.is_some_and(|key| inconsistent.contains(&key)) && identity.take().is_some() {
+            *error = Some(BatchResolutionFailure::message(
+                "mandatory process identity changed between captures for one socket",
+            ));
+        }
+    }
+}
+
+fn equivalent_mandatory_process_identity(
+    left: &ApplicationIdentity,
+    right: &ApplicationIdentity,
+) -> bool {
+    left.pid == right.pid
+        && left.process_start_time_ticks == right.process_start_time_ticks
+        && left.executable == right.executable
+        && left.executable_file == right.executable_file
+        && left.uid == right.uid
+}
+
+fn batch_resolution_results(
+    errors: Vec<Option<BatchResolutionFailure>>,
+    identities: Vec<Option<ApplicationIdentity>>,
+) -> Vec<Result<ApplicationIdentity>> {
+    errors
+        .into_iter()
+        .zip(identities)
+        .map(|(error, identity)| match (error, identity) {
+            (Some(error), _) => Err(error.into_error()),
+            (None, Some(identity)) => Ok(identity),
+            (None, None) => Err(anyhow!("batched application identity is unavailable")),
+        })
+        .collect()
 }
 
 fn verify_socket_owner_uid(
@@ -1819,6 +2486,7 @@ fn ensure_within_deadline(deadline: Instant) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fmt::Write as _;
     use std::io::{IoSlice, IoSliceMut, Write as _};
     use std::net::{SocketAddrV4, TcpListener, TcpStream, UdpSocket};
     use std::os::fd::RawFd;
@@ -1956,6 +2624,26 @@ mod tests {
             output_interface: InterfaceName::new("lo")?,
             socket_uid: uid,
         })
+    }
+
+    fn write_udp_socket_table(
+        root: &Path,
+        sockets: &[(u16, u16, u32, u64)],
+    ) -> Result<(), Box<dyn Error>> {
+        let net = root.join("self/net");
+        fs::create_dir_all(&net)?;
+        let mut table = String::from(
+            "sl local_address rem_address st tx_queue tr retrnsmt uid timeout inode\n",
+        );
+        for (index, (source_port, destination_port, uid, inode)) in sockets.iter().enumerate() {
+            writeln!(
+                table,
+                "{index}: 0100007F:{source_port:04X} 0100007F:{destination_port:04X} \
+                 01 00000000:00000000 00:00000000 00000000 {uid} 0 {inode}"
+            )?;
+        }
+        fs::write(net.join("udp"), table)?;
+        Ok(())
     }
 
     fn synthetic_sock_diag_payload(
@@ -3175,6 +3863,39 @@ mod tests {
     }
 
     #[test]
+    fn batched_owner_records_have_one_global_memory_bound() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        for task_id in [100, 101] {
+            let task = create_task_fixture(directory.path(), 100, task_id, 1_000)?;
+            symlink("socket:[77]", task.join("fd/3"))?;
+            symlink("socket:[78]", task.join("fd/4"))?;
+        }
+        let targets = BTreeSet::from([
+            SocketOwnerKey {
+                inode: 77,
+                uid: 1_000,
+            },
+            SocketOwnerKey {
+                inode: 78,
+                uid: 1_000,
+            },
+        ]);
+
+        let error = ProcfsResolver::at(directory.path())
+            .resolve_unique_process_tasks_batch(
+                &targets,
+                Instant::now() + Duration::from_secs(1),
+                4,
+                3,
+            )
+            .err()
+            .ok_or("tasks multiplied the bounded batch owner records")?;
+
+        assert!(error.to_string().contains("owner record bound exceeded"));
+        Ok(())
+    }
+
+    #[test]
     fn unrelated_uid_fd_bound_does_not_break_owner_search() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let known_owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
@@ -3394,6 +4115,278 @@ mod tests {
                 .err()
                 .is_some_and(|error| error.to_string().contains("multiple processes"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_batch_amortizes_owner_scans_for_the_maximum_target_count()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut sockets = Vec::with_capacity(MAX_ATTRIBUTION_BATCH_SIZE);
+        let mut connections = Vec::with_capacity(MAX_ATTRIBUTION_BATCH_SIZE);
+        for index in 0..MAX_ATTRIBUTION_BATCH_SIZE {
+            let offset = u16::try_from(index)?;
+            let source_port = 20_000_u16
+                .checked_add(offset)
+                .ok_or("source port overflow")?;
+            let destination_port = 40_000_u16
+                .checked_add(offset)
+                .ok_or("destination port overflow")?;
+            let process_id = 1_000_u32
+                .checked_add(u32::try_from(index)?)
+                .ok_or("process identifier overflow")?;
+            let inode = 10_000_u64
+                .checked_add(u64::try_from(index)?)
+                .ok_or("socket inode overflow")?;
+            let owner = create_task_fixture(directory.path(), process_id, process_id, 1_000)?;
+            complete_identity_fixture(&owner, process_id)?;
+            symlink(format!("socket:[{inode}]"), owner.join("fd/3"))?;
+            sockets.push((source_port, destination_port, 1_000, inode));
+            connections.push(loopback_connection(
+                TransportProtocol::Udp,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                source_port,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                destination_port,
+                1_000,
+            )?);
+        }
+        write_udp_socket_table(directory.path(), &sockets)?;
+
+        let resolver = ProcfsResolver::at(directory.path());
+        let requests = connections
+            .iter()
+            .map(|connection| (connection, IdentityCaptureRequirements::minimal()))
+            .collect::<Vec<_>>();
+        let identities = resolver.resolve_batch_for_enforcement_until(
+            &requests,
+            Instant::now() + Duration::from_secs(10),
+        );
+
+        assert_eq!(identities.len(), MAX_ATTRIBUTION_BATCH_SIZE);
+        for (index, identity) in identities.into_iter().enumerate() {
+            assert_eq!(identity?.pid, 1_000 + u32::try_from(index)?);
+        }
+
+        let oversized = (0..=MAX_ATTRIBUTION_BATCH_SIZE)
+            .map(|_| (&connections[0], IdentityCaptureRequirements::minimal()))
+            .collect::<Vec<_>>();
+        assert!(
+            resolver
+                .resolve_batch_for_enforcement_until(
+                    &oversized,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .into_iter()
+                .all(|result| result.is_err())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_batched_udp_attribution_rejects_a_new_ambiguous_holder()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let sockets = [(12_345, 54_321, 1_000, 77), (12_346, 54_322, 1_000, 78)];
+        write_udp_socket_table(directory.path(), &sockets)?;
+        let first_owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        complete_identity_fixture(&first_owner, 100)?;
+        symlink("socket:[77]", first_owner.join("fd/3"))?;
+        let second_owner = create_task_fixture(directory.path(), 200, 200, 1_000)?;
+        complete_identity_fixture(&second_owner, 200)?;
+        symlink("socket:[78]", second_owner.join("fd/3"))?;
+        let first = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            54_321,
+            1_000,
+        )?;
+        let second = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_346,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            54_322,
+            1_000,
+        )?;
+        let requests = [
+            (&first, IdentityCaptureRequirements::full()),
+            (&first, IdentityCaptureRequirements::full()),
+            (&second, IdentityCaptureRequirements::full()),
+        ];
+        let resolver = ProcfsResolver::at(directory.path());
+        let initial = resolver.resolve_batch_for_enforcement_until(
+            &requests,
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert_eq!(
+            initial[0]
+                .as_ref()
+                .map_err(|error| io::Error::other(format!("{error:#}")))?
+                .pid,
+            100
+        );
+        assert_eq!(
+            initial[1]
+                .as_ref()
+                .map_err(|error| io::Error::other(format!("{error:#}")))?
+                .pid,
+            100
+        );
+        assert_eq!(
+            initial[2]
+                .as_ref()
+                .map_err(|error| io::Error::other(format!("{error:#}")))?
+                .pid,
+            200
+        );
+
+        let additional_holder = create_task_fixture(directory.path(), 300, 300, 1_000)?;
+        symlink("socket:[77]", additional_holder.join("fd/9"))?;
+        let repeated = resolver.resolve_batch_for_enforcement_until(
+            &requests,
+            Instant::now() + Duration::from_secs(2),
+        );
+        for result in &repeated[..2] {
+            let first_error = result
+                .as_ref()
+                .err()
+                .ok_or("ambiguous UDP socket was authorized from a stale batch")?;
+            assert!(first_error.to_string().contains("multiple processes"));
+        }
+        assert_eq!(
+            repeated[2]
+                .as_ref()
+                .map_err(|error| io::Error::other(format!("{error:#}")))?
+                .pid,
+            200
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_identity_memo_never_crosses_capture_requirements() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        write_udp_socket_table(directory.path(), &[(12_345, 54_321, 1_000, 77)])?;
+        let owner = create_task_fixture(directory.path(), 100, 100, 1_000)?;
+        complete_identity_fixture(&owner, 100)?;
+        symlink("socket:[77]", owner.join("fd/3"))?;
+        fs::remove_file(owner.join("cmdline"))?;
+        fs::remove_file(owner.join("cgroup"))?;
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            54_321,
+            1_000,
+        )?;
+        let requests = [
+            (&connection, IdentityCaptureRequirements::full()),
+            (&connection, IdentityCaptureRequirements::minimal()),
+        ];
+
+        let results = ProcfsResolver::at(directory.path()).resolve_batch_for_enforcement_until(
+            &requests,
+            Instant::now() + Duration::from_secs(2),
+        );
+
+        assert!(results[0].is_err());
+        let minimal = results[1]
+            .as_ref()
+            .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        assert!(minimal.command_line.is_empty());
+        assert!(minimal.cgroups.is_empty());
+        assert_eq!(minimal.pid, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_consensus_rejects_pid_reuse_but_allows_optional_capture_differences()
+    -> Result<(), Box<dyn Error>> {
+        let key = SocketOwnerKey {
+            inode: 77,
+            uid: 1_000,
+        };
+        let base = ApplicationIdentity {
+            pid: 100,
+            process_start_time_ticks: 1_000,
+            executable: ApplicationPath::new("/usr/bin/example")?,
+            executable_file: ExecutableFileId {
+                device: 8,
+                inode: 9,
+                size: 10,
+                ctime_seconds: 11,
+                ctime_nanoseconds: 12,
+            },
+            command_line: vec![CommandArgument::new("example")?],
+            uid: 1_000,
+            cgroups: vec![CgroupPath::new("/example.scope")?],
+        };
+        let mut selective = base.clone();
+        selective.command_line.clear();
+        selective.cgroups.clear();
+        let keys = [Some(key), Some(key)];
+        let mut identities = [Some(base.clone()), Some(selective)];
+        let mut errors = [None, None];
+        reject_inconsistent_batch_identities(&keys, &mut errors, &mut identities);
+        assert!(identities.iter().all(Option::is_some));
+
+        let mut reused = base.clone();
+        reused.process_start_time_ticks += 1;
+        let mut identities = [Some(base), Some(reused)];
+        let mut errors = [None, None];
+        reject_inconsistent_batch_identities(&keys, &mut errors, &mut identities);
+        assert!(identities.iter().all(Option::is_none));
+        assert!(errors.iter().all(|error| {
+            error.as_ref().is_some_and(|failure| {
+                failure
+                    .message
+                    .contains("mandatory process identity changed")
+            })
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn batched_attribution_has_one_wall_time_bound_and_preserves_typed_timeout()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let resolver = ProcfsResolver::at(directory.path());
+        let connection = loopback_connection(
+            TransportProtocol::Udp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12_345,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            54_321,
+            1_000,
+        )?;
+        let requests = [
+            (&connection, IdentityCaptureRequirements::full()),
+            (&connection, IdentityCaptureRequirements::minimal()),
+        ];
+        let started = Instant::now();
+        let expired = started
+            .checked_sub(Duration::from_secs(1))
+            .ok_or("cannot construct expired batch deadline")?;
+        let results = resolver.resolve_batch_for_enforcement_until(&requests, expired);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "expired batch attribution did not respect its common wall-time bound: {elapsed:?}"
+        );
+        for result in results {
+            let error = result.err().ok_or("expired attribution was authorized")?;
+            assert!(is_attribution_timeout(&error));
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot resolve socket inode for batched attribution")
+            );
+        }
         Ok(())
     }
 

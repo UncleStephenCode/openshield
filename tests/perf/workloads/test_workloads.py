@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -539,6 +540,326 @@ class ProtocolUnitTests(unittest.TestCase):
             100.0 / udp_model["expected_packets_per_operation"],
             places=5,
         )
+
+    def test_tcp_keepalive_target_includes_finite_lifetime_turnover(self) -> None:
+        client = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(
+                host="127.0.0.1",
+                port=9,
+                duration=1.0,
+                operations=1,
+                seed=1,
+                pps=1280.0,
+                cps=160.0,
+                mbps=0.0,
+                io_timeout=0.1,
+                latency_samples=8,
+                concurrency=16,
+                mode="keepalive",
+                keepalive_ratio=1.0,
+                request_bytes=64,
+                response_mix=common.parse_weighted_mix("512:80,4096:20", 4096),
+                connection_lifetime_ms_mix=common.parse_bounded_weighted_mix(
+                    "100:1,250:2,500:1",
+                    50,
+                    3_600_000,
+                    "connection lifetime (ms)",
+                ),
+            )
+        )
+
+        model = client.target_rate_model()
+        # X(r) = r / (1 + r E[L] / concurrency).  Solve
+        # packets_per_op*r + 7*X(r) = PPS independently of the implementation.
+        lifetime_per_worker = 0.275 / 16.0
+        packets_per_op = model["expected_packets_per_operation"]
+        quadratic = packets_per_op * lifetime_per_worker
+        linear = packets_per_op + 7.0 - 1280.0 * lifetime_per_worker
+        expected_target = (
+            -linear + math.sqrt(linear * linear + 4.0 * quadratic * 1280.0)
+        ) / (2.0 * quadratic)
+        renewal_rate = expected_target / (
+            1.0 + expected_target * lifetime_per_worker
+        )
+        self.assertAlmostEqual(
+            model["expected_lifetime_expirations_per_second"],
+            renewal_rate,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            model["expected_lifetime_turnover_packets_per_second"],
+            7.0 * renewal_rate,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            model["target_application_ops_per_second"], expected_target, places=5
+        )
+        self.assertAlmostEqual(
+            model["target_application_ops_per_second"], 200.874426, places=5
+        )
+
+    def test_tcp_keepalive_low_rate_turnover_is_bounded_by_operations(self) -> None:
+        client = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(
+                host="127.0.0.1",
+                port=9,
+                duration=1.0,
+                operations=1,
+                seed=1,
+                pps=100.0,
+                cps=0.0,
+                mbps=0.0,
+                io_timeout=0.1,
+                latency_samples=8,
+                concurrency=16,
+                mode="keepalive",
+                keepalive_ratio=1.0,
+                request_bytes=64,
+                response_mix=common.parse_weighted_mix("512:80,4096:20", 4096),
+                connection_lifetime_ms_mix=common.parse_bounded_weighted_mix(
+                    "100:1,250:2,500:1",
+                    50,
+                    3_600_000,
+                    "connection lifetime (ms)",
+                ),
+            )
+        )
+
+        model = client.target_rate_model()
+        lifetime_per_worker = 0.275 / 16.0
+        packets_per_op = model["expected_packets_per_operation"]
+        quadratic = packets_per_op * lifetime_per_worker
+        linear = packets_per_op + 7.0 - 100.0 * lifetime_per_worker
+        expected_target = (
+            -linear + math.sqrt(linear * linear + 4.0 * quadratic * 100.0)
+        ) / (2.0 * quadratic)
+        expected_renewals = expected_target / (
+            1.0 + expected_target * lifetime_per_worker
+        )
+        self.assertAlmostEqual(
+            model["target_application_ops_per_second"], expected_target, places=5
+        )
+        self.assertAlmostEqual(
+            model["expected_lifetime_expirations_per_second"],
+            expected_renewals,
+            places=5,
+        )
+
+    def test_tcp_mixed_target_models_competing_short_and_lifetime_turnover(
+        self,
+    ) -> None:
+        config = tcp.TcpClientConfig(
+            host="127.0.0.1",
+            port=9,
+            duration=1.0,
+            operations=1,
+            seed=1,
+            pps=1600.0,
+            cps=400.0,
+            mbps=0.0,
+            io_timeout=0.1,
+            latency_samples=8,
+            concurrency=32,
+            mode="mixed",
+            keepalive_ratio=0.75,
+            request_bytes=64,
+            response_mix=common.parse_weighted_mix(
+                "512:70,4096:25,16384:5", 16384
+            ),
+            connection_lifetime_ms_mix=common.parse_bounded_weighted_mix(
+                "100:1,250:2,500:1",
+                50,
+                3_600_000,
+                "connection lifetime (ms)",
+            ),
+        )
+        client = tcp.TcpWorkloadClient(config)
+
+        model = client.target_rate_model()
+        self.assertAlmostEqual(
+            model["target_application_ops_per_second"], 153.097558, places=5
+        )
+        self.assertAlmostEqual(
+            model["expected_lifetime_expirations_per_second"],
+            34.738985,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            model["expected_lifetime_turnover_packets_per_second"],
+            243.172892,
+            places=5,
+        )
+        base_connections = (
+            model["target_application_ops_per_second"]
+            * model["expected_new_connections_per_operation"]
+        )
+        self.assertLess(
+            base_connections + model["expected_lifetime_expirations_per_second"],
+            400.0,
+        )
+
+        cps_limited = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(**{**config.__dict__, "cps": 90.0})
+        ).target_rate_model()
+        self.assertAlmostEqual(
+            cps_limited["target_application_ops_per_second"],
+            130.739567,
+            places=5,
+        )
+
+        # A simultaneous byte cap equivalent to 120 application operations/s
+        # must win over both the independently solved PPS and CPS candidates.
+        byte_limited_mbps = (
+            120.0
+            * model["expected_application_bytes_per_operation"]
+            * 8.0
+            / 1_000_000.0
+        )
+        all_caps = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(
+                **{
+                    **config.__dict__,
+                    "cps": 90.0,
+                    "mbps": byte_limited_mbps,
+                }
+            )
+        ).target_rate_model()
+        self.assertAlmostEqual(
+            all_caps["target_application_ops_per_second"], 120.0, places=5
+        )
+
+    def test_tcp_keepalive_cps_only_uses_finite_renewal_limit(self) -> None:
+        base = tcp.TcpClientConfig(
+            host="127.0.0.1",
+            port=9,
+            duration=1.0,
+            operations=1,
+            seed=1,
+            pps=0.0,
+            cps=40.0,
+            mbps=0.0,
+            io_timeout=0.1,
+            latency_samples=8,
+            concurrency=16,
+            mode="keepalive",
+            keepalive_ratio=1.0,
+            request_bytes=64,
+            response_mix=common.WeightedMix.fixed(512),
+            connection_lifetime_ms_mix=common.WeightedMix.fixed(275),
+        )
+        model = tcp.TcpWorkloadClient(base).target_rate_model()
+        expected_target = 40.0 / (1.0 - 40.0 * 0.275 / 16.0)
+        self.assertAlmostEqual(
+            model["target_application_ops_per_second"], expected_target, places=5
+        )
+        self.assertAlmostEqual(
+            model["expected_lifetime_expirations_per_second"], 40.0, places=5
+        )
+
+        # A CPS cap at the asymptotic renewal rate does not bound application
+        # operations. Undefined per-second target evidence must remain null,
+        # rather than being misreported as zero turnover.
+        asymptotic_cps = 16.0 / 0.275
+        unbounded = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(**{**base.__dict__, "cps": asymptotic_cps})
+        ).target_rate_model()
+        self.assertIsNone(unbounded["target_application_ops_per_second"])
+        self.assertIsNone(unbounded["expected_lifetime_expirations_per_second"])
+        self.assertIsNone(
+            unbounded["expected_lifetime_turnover_packets_per_second"]
+        )
+
+        # The greatest representable CPS below the renewal asymptote remains a
+        # finite (very high) rate rather than a divide-by-zero edge case.
+        edge_lifetime_ms = 1_063_130
+        edge_concurrency = 265
+        edge_asymptote = edge_concurrency / (edge_lifetime_ms / 1_000.0)
+        edge_cps = math.nextafter(edge_asymptote, 0.0)
+        edge = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(
+                **{
+                    **base.__dict__,
+                    "concurrency": edge_concurrency,
+                    "cps": edge_cps,
+                    "connection_lifetime_ms_mix": common.WeightedMix.fixed(
+                        edge_lifetime_ms
+                    ),
+                }
+            )
+        ).target_rate_model()
+        self.assertTrue(math.isfinite(edge["target_application_ops_per_second"]))
+        self.assertGreater(edge["target_application_ops_per_second"], 0.0)
+        self.assertAlmostEqual(
+            edge["expected_lifetime_expirations_per_second"], edge_cps
+        )
+
+    def test_tcp_rate_model_retains_cap_consistency_at_high_rates(self) -> None:
+        client = tcp.TcpWorkloadClient(
+            tcp.TcpClientConfig(
+                host="127.0.0.1",
+                port=9,
+                duration=1.0,
+                operations=1,
+                seed=1,
+                pps=0.0,
+                cps=68_256.77693882461,
+                mbps=0.0,
+                io_timeout=0.1,
+                latency_samples=8,
+                concurrency=16,
+                mode="mixed",
+                keepalive_ratio=0.9590575403064787,
+                request_bytes=2546,
+                response_mix=common.WeightedMix.fixed(1024),
+                connection_lifetime_ms_mix=common.parse_bounded_weighted_mix(
+                    "100:1,5000:2",
+                    50,
+                    3_600_000,
+                    "connection lifetime (ms)",
+                ),
+            )
+        )
+        model = client.target_rate_model()
+        target = model["target_application_ops_per_second"]
+        total_connections = (
+            target * model["expected_new_connections_per_operation"]
+            + model["expected_lifetime_expirations_per_second"]
+        )
+        self.assertLessEqual(total_connections, client.config.cps * (1.0 + 1e-12))
+        self.assertAlmostEqual(total_connections, client.config.cps, places=6)
+
+    def test_tcp_client_rejects_invalid_direct_rate_model_inputs(self) -> None:
+        base = tcp.TcpClientConfig(
+            host="127.0.0.1",
+            port=9,
+            duration=1.0,
+            operations=1,
+            seed=1,
+            pps=1.0,
+            cps=1.0,
+            mbps=1.0,
+            io_timeout=0.1,
+            latency_samples=8,
+            concurrency=1,
+            mode="mixed",
+            keepalive_ratio=0.5,
+            request_bytes=1,
+            response_mix=common.WeightedMix.fixed(1),
+        )
+        for field, value in (
+            ("pps", -1.0),
+            ("cps", math.nan),
+            ("mbps", math.inf),
+            ("keepalive_ratio", -0.1),
+            ("concurrency", 0),
+            ("concurrency", True),
+            ("mode", "invalid"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, "TCP client"):
+                    tcp.TcpWorkloadClient(
+                        tcp.TcpClientConfig(**{**base.__dict__, field: value})
+                    )
 
     def test_tcp_cross_product_memory_limit_rejects_unsafe_concurrency(self) -> None:
         with self.assertRaisesRegex(ValueError, "memory"):

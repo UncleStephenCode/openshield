@@ -191,8 +191,8 @@ mean a backend was selected or that real packets were filtered.
 
 ## Dynamic active-policy path evidence
 
-OpenShield 0.1.31 exposes a dynamically recomputed, conservative active-policy
-path classification through `StatusV2`:
+Since OpenShield 0.1.31, `StatusV2` exposes a dynamically recomputed,
+conservative active-policy path classification:
 L3 `KernelNative` for `BlockAll` or application-free `Enforcing`, L2
 `ConntrackHybrid` for TCP-only application `Enforcing`, L1 `Nfqueue` for
 `Learning` or an enabled UDP/ICMP/ICMPv6/`Any` application rule, and `Unknown`
@@ -205,10 +205,16 @@ scenarios must preserve identical rule semantics and fail closed if mandatory
 NFQUEUE setup is unavailable. A container result demonstrates the level
 calculation and packet paths on the runner kernel only. It does not certify the
 stock kernel, boot configuration, LSM, or Secure Boot state of the named
-distribution. Version 0.1.31 has no eBPF application data plane, so none of the
+distribution. OpenShield 0.1.32 has no eBPF application data plane, so none of the
 37 runtime rows or 49 build-only mappings is an eBPF support claim.
 The only automatic startup backend fallback is from nftables to the complete
 iptables/ip6tables bundle when nftables cannot be validated.
+
+The v0.1.32 bounded NFQUEUE micro-batch and single-process nftables observation
+are userspace changes. They add no architecture-specific kernel object,
+capability, LSM rule, Secure Boot key, or module requirement. This statement
+describes compatibility; it does not claim that v0.1.32 E2E or performance jobs
+have passed before their reports are retained.
 
 ## Real firewall end-to-end workflow
 

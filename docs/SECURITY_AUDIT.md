@@ -2,7 +2,7 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-04, OpenShield 0.1.31, Rust stable 1.98.0.
+Review snapshot: 2026-09-04, OpenShield 0.1.32 source tree, Rust stable 1.98.0.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -64,6 +64,12 @@ The normative boundary is defined by the
 - The nftables compiler emits validated syntax and checks it before an atomic
   transaction. It owns only `table inet openshield` and verifies its ownership
   sentinel before replacement.
+- The v0.1.32 nftables runtime observer invokes one fixed `nft` process for its
+  table, chain, and counter queries and requires exactly three ordered bounded
+  JSON documents. This preserves the one-second cadence, owned-table and base-
+  chain/default-drop/counter invariants, and fail-closed repair while avoiding
+  two additional process launches. It does not use a shell or broaden the
+  executable or argument trust boundary.
 - The compatibility compiler emits complete IPv4 and IPv6 restore programs. It
   uses `--noflush`, owns only `OPENSHIELD_*` chains, verifies ownership and full
   installed rule bodies, and keeps its dispatch jumps first in the relevant
@@ -140,6 +146,20 @@ The normative boundary is defined by the
   task if stale, and is rechecked after capture. The absence of a matching-UID
   holder, multiple matching TGIDs, an incomplete scan, an unstable identity, or
   exhausted bounds results in denial.
+- In v0.1.32 the consumer drains at most 32 already-ready NFQUEUE packets
+  without waiting to fill a batch. Each packet still performs its own
+  `SOCK_DIAG` lookup. The optimization shares only two complete bounded procfs
+  owner snapshots, one before and one after identity capture, under one absolute
+  250 ms deadline. Each snapshot has a global cap of 131,072 owner records
+  across all targets. Identity capture is
+  memoized only inside that batch for an identical inode, socket UID, and
+  capture requirement. Duplicate requests must reach consensus on PID, process
+  start time, executable path and complete file version, and filesystem UID.
+  The typed attribution-timeout marker is preserved into NFQUEUE accounting.
+  A changed snapshot, inconsistent identity, timeout, ambiguity, or exceeded
+  bound denies the affected packet. No identity or authorization result survives
+  into the next batch, so otherwise-unmatched UDP/ICMP remains repeatedly
+  attributed.
 - On cgroup v2, exactly one unified `0::/path` entry supplies the cgroup
   identity. On a v1-only host, bounded controller memberships are validated but
   no cgroup identity is returned. Executable path, full file version, filesystem
@@ -221,23 +241,47 @@ The evidence layers below are intentionally separate. Passing one layer does not
 establish the properties of another.
 
 Evidence below remains tied to the explicitly named revision and execution
-environment. Local 0.1.31 source verification is recorded here, but it does not
-predeclare a tag build successful: release artifacts must still pass the
-configured Quality Gate, package matrix, 74 firewall jobs, and performance
-gate. In particular, the recorded full 0.1.31 performance run is valid but
-failed its relative-performance gate, so neither that run nor this document
-certifies a v0.1.31 tag. Broader binary, packaging, cross-target, and Tumbleweed
-results identified as v0.1.28 do not certify newly built 0.1.31 artifacts.
+environment. The v0.1.32 source, component, local Tumbleweed x86-64 E2E, and
+local performance evidence retained below does not predeclare a tag build
+successful; release artifacts must still pass the configured Quality Gate,
+package matrix, 74 firewall jobs, and performance gate in GitHub Actions. The recorded full
+v0.1.31 performance run remains valid historical evidence, but failed its
+relative-performance gate, so neither that run nor this document certifies a
+v0.1.31 tag. Broader binary, packaging, cross-target, and Tumbleweed results
+identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
 
-- The local v0.1.31 Rust 1.98.0 verification passed
-  `cargo fmt --all -- --check`, locked workspace all-target checks, workspace
-  all-target clippy with warnings denied, and 340 Rust tests; six additional
-  Rust tests were intentionally ignored. The Python suite passed all 185 tests.
-  Coverage includes automatic-learning budgets, version pinning,
+- Local v0.1.32 verification on Rust 1.98.0 passed
+  `cargo fmt --all -- --check` and locked
+  workspace all-target clippy with warnings denied. The complete Rust suite in
+  a container passed 350 tests; the normal invocation ignored six live tests,
+  and a separate live-test invocation passed all six. The Python performance
+  harness suite passed 211 tests in an isolated Python 3.13 container; one
+  identity-probe build test was intentionally skipped because that minimal
+  image contains no C compiler. Coverage includes automatic-learning budgets, version pinning,
   fsuid-prefilter, immutable policy indexes, compatibility classification, and
   the performance-report confidence model. Daemon unit tests used mock backends
   and temporary Unix sockets and did not touch the host firewall. These are
-  component results, not a live-firewall result.
+  component results and remain distinct from the full performance-gate result
+  below.
+- The final local v0.1.32 x86-64 Tumbleweed CI-smoke performance gate completed
+  with `PASS` for both nftables and the iptables fallback. It used daemon SHA-256
+  `d3b824e680baebb30e30f65e2fa010cd0643d3272a2f370bc0001ee727487c29` and
+  configuration SHA-256
+  `b52b3a390a25a6cc611fb91a2ecb1b9df2cebd1bbef86cf6615ba7144fd7ed43`.
+  The independently recomputed result covered 36 comparison groups, 108
+  order-balanced adjacent AB/BA pairs, and 276 metric-evidence records, with no
+  blocking steady or burst regression. The worst steady mean reduction was
+  0.407% for throughput and 0.527% for PPS against their 10% limits; minimum
+  target attainment was 91.26%. Peak daemon CPU was 26.78% of one core, peak
+  RSS was 7.66 MiB, and peak request p99 was 2.717 ms. The retained advisory
+  evidence remains material: CPU/latency crossed the observation threshold in
+  29 of 36 steady groups, with maxima of +150.44% cgroup CPU, +242.62% request
+  p99, and +597.99% TCP-connect p99 relative to very small baselines. All four controlled NFQUEUE-overload
+  proofs passed fail-closed and recovery checks; ordinary windows reported no
+  NIC drops/errors, TCP retransmits, UDP loss, NFQUEUE drops/errors, attribution
+  timeout, terminal queue error, or fail-open behavior. This local result
+  validates the tested source snapshot and binary, not a future GitHub release
+  artifact.
 - For v0.1.28, `cargo-audit` checked the 152-dependency lock graph against 1,235
   advisories from the RustSec database revision dated 2026-09-01 and reported no
   applicable advisory. The offline cargo-deny advisories, bans, licenses, and
@@ -290,8 +334,9 @@ results identified as v0.1.28 do not certify newly built 0.1.31 artifacts.
   restart. The current scenario separately requires a TCP-only L2
   `ConntrackHybrid` status and proves its established-flow fast path with a
   real persistent socket while the daemon is paused, before adding UDP and
-  requiring the mixed policy to report L1 `Nfqueue`. The locally built v0.1.31
-  Rust 1.98.0 daemon passed both backends on Debian Bookworm x86-64. The
+  requiring the mixed policy to report L1 `Nfqueue`. The locally built v0.1.32
+  daemon passed both backends in isolated openSUSE Tumbleweed x86-64
+  containers. The
   successful scenarios printed:
 
   ```text
@@ -299,35 +344,52 @@ results identified as v0.1.28 do not certify newly built 0.1.31 artifacts.
   PASS server Learning -> TCP L2 -> UDP/TCP L1 -> inbound allow -> restart (iptables)
   ```
 
-  The nftables runs installed both frontends and selected nftables; the iptables
-  runs omitted `nft` and selected the fallback. These were local, isolated
+  The nftables run installed both frontends and selected nftables; the iptables
+  run omitted `nft` and selected the fallback. These were local, isolated
   Docker network/container-namespace tests. They did not exercise or modify the
   host firewall and are not production certification.
 - `tests/perf` and the release `performance` job define a bounded, isolated
   host-firewall load gate after all functional E2E jobs. The exact release
   daemon is compared with a no-daemon baseline for nftables and, when available,
   the iptables/ip6tables fallback, covering `Learning` and `Enforcing`,
-  network-only rules, application TCP, and application UDP. Baseline and policy
-  cases use identical offered parameters and a policy-independent deterministic
-  trace seed, with conntrack flushed for every load point. Each phase has a new
+  network-only rules, application TCP, and application UDP. Each exact group
+  receives three predetermined independent pairs with unique pair and baseline
+  sample identities. A baseline sample is single-use, both pair sides use
+  separate pristine DUT generations, and order is balanced AB/BA. The protected
+  block may use only its assigned immediately adjacent baseline. Both sides use
+  identical offered parameters and a policy-independent deterministic trace
+  seed, with conntrack flushed for every load point. The conservative comparison
+  gap is the maximum separation across the authenticated workload interval and
+  the synchronized DUT and peer metric intervals; its configured ceiling is 15
+  seconds for CI and 90 seconds for the production-like profile. Each phase has a new
   client process; established TCP fast-path behavior is therefore demonstrated
   by multiple keep-alive operations inside that phase, not by carrying sockets
   between phases. The real `/var/lib/openshield` directory is stored in the
   container's writable overlay, exercises atomic rename and `fsync`, retains
   learned state for the backend topology, and is discarded at cleanup. Formal
   validity checks invalidate generator or peer/server
-  saturation and propagate an invalid baseline to its pair. Separate capacity
+  saturation and propagate an invalid baseline to its pair. Every executed
+  invalid result row fails the complete report. Separate capacity
   and safety checks cover target attainment, latency, loss/retransmits,
   daemon CPU/RSS, NIC and NFQUEUE errors, expected NFQUEUE path shape,
   wrong-executable probes, and verified `BlockAll` quarantine. Invalid points
-  cannot become capacity maxima. Daemon-observed queue failures use deltas of
+  cannot become capacity maxima. Configuration, synchronized metric documents,
+  and pairing evidence use `openshield.perf.config.v2`,
+  `openshield.perf.metrics.v3`, and
+  `openshield.perf.baseline-pairing.v2`, respectively. Daemon-observed queue failures use deltas of
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The unchanged release threshold is 10%, but a relative regression blocks only
-  when at least three valid steady adjacent pristine AB/BA paired deltas have a
-  one-sided 95% Student-t lower confidence bound above that threshold. A single
-  burst relative observation is diagnostic only; burst validity, configured
+  The CI observation thresholds remain 10%. For the v0.1.32 field-evaluation
+  period, the authenticated criterion
+  `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
+  means to `observe`; throughput and PPS means retain the blocking `fail`
+  action. The production-like profile sets the criterion to `false` and keeps
+  all relative means blocking. A one-sided 95% Student-t lower confidence bound
+  records stronger confirmation without changing that action. A single
+  burst has no confidence claim, but throughput/PPS threshold crossings block
+  directly and CPU/latency follows the profile action; absolute CPU/RSS and p99
+  latency, burst validity, configured
   capacity bounds, and safety remain mandatory. Loss, retransmits, NIC or
   NFQUEUE drops/errors, and fail-open behavior are immediate failures rather
   than statistically aggregated relative decisions. The CI smoke has three short steady repetitions
@@ -353,9 +415,9 @@ results identified as v0.1.28 do not certify newly built 0.1.31 artifacts.
   windows had zero safety failures and zero authoritative NFQUEUE error-counter
   deltas. All four deliberate overload proofs (TCP and UDP on nftables and
   iptables) passed their fail-closed and recovery checks. Application-aware L2
-  and L1 groups contained regressions whose one-sided 95% lower confidence
-  bounds confirmed overhead above the unchanged 10% threshold. Two L3 groups
-  also failed the repeated CPU gate in this run: nftables
+  and L1 groups contained mean regressions above the unchanged 10% threshold,
+  with one-sided 95% lower confidence bounds providing stronger confirmation.
+  Two L3 groups also failed the repeated CPU gate in this run: nftables
   `ingress_http_mixed` and iptables `egress_tcp_mixed`, both with network-only
   `Enforcing` policy. Therefore the source-level safety evidence is useful,
   but the performance result does not certify publication of the v0.1.31 tag.
@@ -383,7 +445,7 @@ Commands and exact interpretation are documented in
 - The dynamically selected L3/L2/L1 value classifies the active policy path; it
   is not a distribution-kernel capability level. `KernelNative` is the
   nftables/iptables policy path, not an eBPF application
-  data plane or a claim about distribution kernel features. Version 0.1.31 does
+  data plane or a claim about distribution kernel features. OpenShield 0.1.32 does
   not add `CAP_BPF`, a kernel module, a boot-parameter change, or MOK enrollment.
   Exact application identity still uses the audited NFQUEUE/procfs path. A
   future kernel application fast path requires independent rule-equivalence,
@@ -425,9 +487,14 @@ Commands and exact interpretation are documented in
   Unrelated-UID fd tables are skipped, but global process/task pressure and
   matching-UID fd pressure can still deny application attribution. The v0.1.18
   self-TGID and scan-local fd-hint optimizations reduce the common-case scan cost.
-  Every completed owner scan still includes two shared self-table checks. The
-  optimizations do not cache authorization, skip the fresh external PID/TID scan
-  on each owner-resolution attempt, or alter its worst-case complexity. A
+  Every completed owner snapshot still includes two shared self-table checks.
+  The v0.1.32 micro-batch shares its before/after snapshots across at most 32
+  already-ready packets, retains per-packet `SOCK_DIAG`, and applies one 250 ms
+  deadline to the whole batch plus a 131,072-owner-record cap to each snapshot.
+  Intra-batch
+  identity reuse is keyed by inode, UID, and capture requirements and is accepted
+  only with mandatory-identity consensus and unchanged ownership; nothing is
+  cached across batches. These optimizations do not alter worst-case complexity. A
   sustained packet stream or hostile procfs cardinality
   can still saturate the queue consumer and deny legitimate traffic. The
   immutable packet-policy cache removes the previous per-packet full-state clone
@@ -492,6 +559,9 @@ Commands and exact interpretation are documented in
   not the complete rule body. The iptables backend compares full owned rule
   bodies, but its first-position dispatch can be displaced by another
   privileged editor. Neither check is protection from UID 0 or `CAP_NET_ADMIN`.
+  The v0.1.32 nftables observer obtains its table, chain, and counter documents
+  from one fixed `nft` process, but preserves the same one-second cadence,
+  ordered bounded parsing, validation set, and fail-closed repair behavior.
 - The fixed backend executable is checked before it is later run by path. A
   privileged package update can replace it in that interval. This TOCTOU remains
   inside the trusted UID-0/package-manager boundary.

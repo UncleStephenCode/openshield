@@ -21,8 +21,8 @@ rejects shell execution, configuration-selected executables, unbounded IPC
 frames, and NFQUEUE bypass. Executable paths in outbound rules are bounded,
 typed identity selectors; the daemon never executes them.
 
-OpenShield 0.1.31 reports its policy mode, selected firewall backend, and
-dynamically recomputed active-policy path classification as separate `StatusV2`
+Since OpenShield 0.1.31, the daemon reports its policy mode, selected firewall
+backend, and dynamically recomputed active-policy path classification as separate `StatusV2`
 fields. This classification is not kernel-capability attestation or fallback
 negotiation for an unchanged policy. `KernelNative` means nftables/iptables policy evaluation, not an eBPF
 application data plane. This release does not add `CAP_BPF`, a kernel module,
@@ -34,6 +34,17 @@ iptables/ip6tables bundle when nftables cannot be validated.
 When the running daemon has entered read-only fail-closed quarantine,
 `StatusV2` uses the distinct `EmergencyBlockAll` reason and the TUI presents it
 as an emergency; it is not confused with an operator-selected `BlockAll`.
+
+OpenShield 0.1.32 amortizes procfs owner enumeration across at most 32
+already-ready NFQUEUE packets without weakening attribution. `SOCK_DIAG` stays
+per packet; two bounded owner snapshots bracket capture; reuse is confined to
+one batch; mandatory process identity must reach consensus; and one absolute
+250 ms deadline covers the whole batch, while one global owner-record cap covers
+all targets in each snapshot. Typed
+timeouts remain auditable, and every ambiguity or exhausted bound denies rather
+than bypasses filtering. nftables runtime observation now obtains tables,
+chains, and counters from one fixed process while retaining the same checks,
+one-second cadence, and fail-closed repair policy.
 
 The operational boundary, fail-closed assumptions, and the material risks of
 the daemon's retained procfs-inspection capabilities are documented in the

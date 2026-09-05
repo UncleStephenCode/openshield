@@ -1,5 +1,5 @@
 {
-  "schema": "openshield.perf.config.v1",
+  "schema": "openshield.perf.config.v2",
   "description": "Editable production-like sweep. Replace offered rates with measured production percentiles before capacity qualification.",
   "capacity_certification": true,
   "seed": 2901337,
@@ -12,7 +12,7 @@
     "dut": "opensuse/tumbleweed@sha256:8f6397b7b7ebc78e111d9a13fb2b157664ad5524e1f3b908deb45938b3095045",
     "peer": "python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285"
   },
-  "max_total_workload_seconds": 65000,
+  "max_total_workload_seconds": 91000,
   "load_levels": [0.5, 1.0, 1.5, 2.0],
   "phases": {
     "warmup": {"duration_seconds": 10, "scale": 0.2},
@@ -36,6 +36,8 @@
     "maximum_dut_pps_reduction_vs_baseline_percent": 5.0,
     "maximum_latency_increase_vs_baseline_percent": 5.0,
     "maximum_cgroup_cpu_increase_vs_baseline_percent": 5.0,
+    "cpu_latency_relative_regressions_are_advisory": false,
+    "maximum_comparison_gap_seconds": 90.0,
     "require_zero_nic_errors": true,
     "require_zero_nfqueue_drops": true,
     "network_only_maximum_queue_hits": 0,

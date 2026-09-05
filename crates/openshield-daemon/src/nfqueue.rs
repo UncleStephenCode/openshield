@@ -20,7 +20,10 @@ use openshield_core::{
 };
 use tracing::{error, info, warn};
 
-use crate::application::{OutboundConnection, ProcfsResolver, is_attribution_timeout};
+use crate::application::{
+    ApplicationDecisionPolicy, IdentityCaptureRequirements, MAX_ATTRIBUTION_BATCH_SIZE,
+    OutboundConnection, ProcfsResolver, is_attribution_timeout,
+};
 use crate::backend::QueueVerdictStrategy;
 use crate::engine::{LearningQueueAdmission, NfqueueRuntimeCounters, SharedEngine};
 
@@ -62,6 +65,7 @@ const CONFIGURATION_POLL_MILLIS: u16 = 100;
 const LEARNING_QUEUE_CAPACITY: usize = 512;
 const LEARNING_BATCH_SIZE: usize = 256;
 const NFNETLINK_FAMILY_UNSPEC: u8 = 0;
+const MAX_PACKET_BATCH_SIZE: usize = MAX_ATTRIBUTION_BATCH_SIZE;
 
 #[derive(Debug)]
 pub struct QueueRuntime {
@@ -180,39 +184,62 @@ fn packet_loop(
                 errors.report("application packet queue overflowed; affected packets were denied");
             }
             Ok(QueueReceive::Datagram(size)) => {
-                for message in NetlinkMessages::new(&receive_buffer[..size]) {
-                    let message = match message {
-                        Ok(message) => message,
+                let mut batch = Vec::with_capacity(MAX_PACKET_BATCH_SIZE);
+                let collected = append_packet_datagram(&receive_buffer[..size], &mut batch);
+                if let Err(error) = collected {
+                    counters.record_terminal_queue_error();
+                    errors.report(&format!("invalid netfilter netlink message: {error:#}"));
+                    quarantine_engine(engine);
+                    shutdown.store(true, Ordering::Release);
+                    return;
+                }
+                let mut drained_datagrams = 1_usize;
+                while batch.len() < MAX_PACKET_BATCH_SIZE
+                    && drained_datagrams < MAX_PACKET_BATCH_SIZE
+                {
+                    match queue.receive_ready(&mut receive_buffer) {
+                        Ok(QueueReceive::Idle) => break,
+                        Ok(QueueReceive::Overflow) => {
+                            counters.record_queue_overflow();
+                            errors.report(
+                                "application packet queue overflowed; affected packets were denied",
+                            );
+                            drained_datagrams += 1;
+                        }
+                        Ok(QueueReceive::Datagram(ready_size)) => {
+                            drained_datagrams += 1;
+                            if let Err(error) =
+                                append_packet_datagram(&receive_buffer[..ready_size], &mut batch)
+                            {
+                                counters.record_terminal_queue_error();
+                                errors.report(&format!(
+                                    "invalid netfilter netlink message: {error:#}"
+                                ));
+                                quarantine_engine(engine);
+                                shutdown.store(true, Ordering::Release);
+                                return;
+                            }
+                        }
                         Err(error) => {
-                            // A malformed kernel datagram can hide the packet
-                            // identifier required to return a verdict.  Do not
-                            // continue with an unaccounted queued packet: make
-                            // the failure observable and move the whole policy
-                            // to the explicit fail-closed quarantine.
                             counters.record_terminal_queue_error();
-                            errors.report(&format!("invalid netfilter netlink message: {error:#}"));
+                            errors.report(&format!(
+                                "application packet queue failed while forming a batch: {error:#}"
+                            ));
                             quarantine_engine(engine);
                             shutdown.store(true, Ordering::Release);
                             return;
                         }
-                    };
-                    if message.message_type != queue_message_type(NFQNL_MSG_PACKET) {
-                        continue;
                     }
-                    let Some(packet_id) = packet_id(message.payload) else {
-                        counters.record_terminal_queue_error();
-                        errors.report("queued packet has no bounded packet identifier");
-                        quarantine_engine(engine);
-                        shutdown.store(true, Ordering::Release);
-                        return;
-                    };
-                    let decision = decide_packet(message.payload, engine, &resolver, learning);
+                }
+
+                let decisions = decide_packet_batch(&batch, engine, &resolver, learning);
+                for (packet, decision) in batch.into_iter().zip(decisions) {
                     if decision.as_ref().is_err_and(is_attribution_timeout) {
                         counters.record_attribution_timeout();
                     }
                     let returned = return_packet_verdict(
                         &mut queue,
-                        packet_id,
+                        packet.packet_id,
                         decision,
                         engine,
                         verdict_strategy,
@@ -309,51 +336,130 @@ fn return_packet_verdict(
     Ok((true, None))
 }
 
-fn decide_packet(
-    payload: &[u8],
+fn append_packet_datagram(bytes: &[u8], batch: &mut Vec<QueuedPacketWork>) -> Result<()> {
+    for message in NetlinkMessages::new(bytes) {
+        let message = message?;
+        if message.message_type != queue_message_type(NFQNL_MSG_PACKET) {
+            continue;
+        }
+        ensure!(
+            batch.len() < MAX_PACKET_BATCH_SIZE,
+            "queued packet batch exceeds its fixed bound"
+        );
+        let packet_id = packet_id(message.payload)
+            .ok_or_else(|| anyhow!("queued packet has no bounded packet identifier"))?;
+        batch.push(QueuedPacketWork {
+            packet_id,
+            packet: parse_queued_packet(message.payload).map_err(|error| format!("{error:#}")),
+        });
+    }
+    Ok(())
+}
+
+fn decide_packet_batch(
+    batch: &[QueuedPacketWork],
     engine: &SharedEngine,
     resolver: &ProcfsResolver,
     learning: &SyncSender<LearningObservation>,
-) -> Result<PacketAuthorization> {
-    let packet = parse_queued_packet(payload)?;
-    let snapshot = engine
-        .lock()
-        .map_err(|_| anyhow!("policy engine mutex is poisoned"))?
-        .application_decision_snapshot()
-        .map_err(|error| anyhow!(error.message))?;
-    ensure!(
-        snapshot.mode != Mode::BlockAll,
-        "BlockAll denies queued traffic"
-    );
-    ensure!(
-        packet.packet_mark == application_pending_mark(packet.packet_mark),
-        "queued packet does not carry the kernel pending-mark domain"
-    );
+) -> Vec<Result<PacketAuthorization>> {
+    let mut decisions = (0..batch.len()).map(|_| None).collect::<Vec<_>>();
+    let snapshot = (|| {
+        engine
+            .lock()
+            .map_err(|_| anyhow!("policy engine mutex is poisoned"))?
+            .application_decision_snapshot()
+            .map_err(|error| anyhow!(error.message))
+    })();
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let message = format!("{error:#}");
+            return batch
+                .iter()
+                .map(|packet| match &packet.packet {
+                    Ok(_) => Err(anyhow!(message.clone())),
+                    Err(error) => Err(anyhow!(error.clone())),
+                })
+                .collect();
+        }
+    };
 
+    let mut request_indexes = Vec::new();
+    let mut requests = Vec::new();
+    for (index, work) in batch.iter().enumerate() {
+        let packet = match &work.packet {
+            Ok(packet) => packet,
+            Err(error) => {
+                decisions[index] = Some(Err(anyhow!(error.clone())));
+                continue;
+            }
+        };
+        let requirements = (|| {
+            ensure!(
+                snapshot.mode != Mode::BlockAll,
+                "BlockAll denies queued traffic"
+            );
+            ensure!(
+                packet.packet_mark == application_pending_mark(packet.packet_mark),
+                "queued packet does not carry the kernel pending-mark domain"
+            );
+            match snapshot.mode {
+                Mode::BlockAll => Err(anyhow!("BlockAll denies queued traffic")),
+                Mode::Enforcing => snapshot
+                    .enforcement_capture_requirements(&packet.connection)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no enabled application rule matches the queued network endpoint and socket UID"
+                        )
+                    }),
+                Mode::Learning => Ok(IdentityCaptureRequirements::full()),
+            }
+        })();
+        match requirements {
+            Ok(requirements) => {
+                request_indexes.push(index);
+                requests.push((&packet.connection, requirements));
+            }
+            Err(error) => decisions[index] = Some(Err(error)),
+        }
+    }
+
+    let identities = resolver.resolve_batch_for_enforcement(&requests);
+    for (index, identity) in request_indexes.into_iter().zip(identities) {
+        let packet = batch[index]
+            .packet
+            .as_ref()
+            .map_err(|error| anyhow!(error.clone()));
+        decisions[index] = Some(match (packet, identity) {
+            (Ok(packet), Ok(identity)) => {
+                authorize_attributed_packet(&snapshot, packet, &identity, engine, learning)
+            }
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error.context("cannot establish race-checked process identity")),
+        });
+    }
+
+    decisions
+        .into_iter()
+        .map(|decision| {
+            decision.unwrap_or_else(|| Err(anyhow!("batched packet decision is unavailable")))
+        })
+        .collect()
+}
+
+fn authorize_attributed_packet(
+    snapshot: &ApplicationDecisionPolicy,
+    packet: &QueuedPacket,
+    identity: &openshield_core::ApplicationIdentity,
+    engine: &SharedEngine,
+    learning: &SyncSender<LearningObservation>,
+) -> Result<PacketAuthorization> {
     let accepted = match snapshot.mode {
         Mode::BlockAll => false,
-        Mode::Enforcing => {
-            let requirements = snapshot
-                .enforcement_capture_requirements(&packet.connection)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no enabled application rule matches the queued network endpoint and socket UID"
-                    )
-                })?;
-            let identity = resolver
-                .resolve_for_enforcement(&packet.connection, requirements)
-                .context("cannot establish race-checked process identity")?;
-            snapshot
-                .matching_rule(&packet.connection, &identity)
-                .is_some()
-        }
+        Mode::Enforcing => snapshot
+            .matching_rule(&packet.connection, identity)
+            .is_some(),
         Mode::Learning => {
-            // Learning persists an exact selector, so it must retain the full
-            // command line and cgroup capture even though Enforcing can omit
-            // optional fields which no candidate rule references.
-            let identity = resolver
-                .resolve(&packet.connection)
-                .context("cannot establish race-checked process identity")?;
             let selector = identity
                 .learned_selector()
                 .context("cannot create a stable learned application selector")?;
@@ -518,6 +624,12 @@ struct PacketAuthorization {
 struct QueuedPacket {
     connection: OutboundConnection,
     packet_mark: u32,
+}
+
+#[derive(Debug)]
+struct QueuedPacketWork {
+    packet_id: u32,
+    packet: std::result::Result<QueuedPacket, String>,
 }
 
 fn parse_queued_packet(payload: &[u8]) -> Result<QueuedPacket> {
@@ -918,11 +1030,27 @@ impl QueueSocket {
             Err(Errno::ENOBUFS) => return Ok(QueueReceive::Overflow),
             Err(error) => return Err(error).context("cannot receive queued packet"),
         };
-        ensure!(
-            size <= buffer.len(),
-            "queued netlink datagram exceeded its fixed buffer"
-        );
-        Ok(QueueReceive::Datagram(size))
+        Ok(QueueReceive::Datagram(validate_received_datagram_size(
+            size,
+            buffer.len(),
+        )?))
+    }
+
+    fn receive_ready(&mut self, buffer: &mut [u8]) -> Result<QueueReceive> {
+        let size = match recv(
+            self.socket.as_raw_fd(),
+            buffer,
+            MsgFlags::MSG_TRUNC | MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(size) => size,
+            Err(Errno::EINTR | Errno::EAGAIN) => return Ok(QueueReceive::Idle),
+            Err(Errno::ENOBUFS) => return Ok(QueueReceive::Overflow),
+            Err(error) => return Err(error).context("cannot drain a ready queued packet"),
+        };
+        Ok(QueueReceive::Datagram(validate_received_datagram_size(
+            size,
+            buffer.len(),
+        )?))
     }
 
     fn verdict(&mut self, packet_id: u32, verdict: u32) -> Result<()> {
@@ -950,6 +1078,15 @@ impl QueueSocket {
     fn next_sequence(&mut self) -> u32 {
         advance_netlink_sequence(&mut self.sequence)
     }
+}
+
+fn validate_received_datagram_size(size: usize, capacity: usize) -> Result<usize> {
+    ensure!(size != 0, "NFQUEUE returned an empty netlink datagram");
+    ensure!(
+        size <= capacity,
+        "queued netlink datagram exceeded its fixed buffer"
+    );
+    Ok(size)
 }
 
 fn advance_netlink_sequence(sequence: &mut u32) -> u32 {
@@ -1313,6 +1450,72 @@ mod tests {
                 .next()
                 .is_some_and(|item| item.is_err())
         );
+    }
+
+    #[test]
+    fn received_datagram_size_rejects_empty_and_truncated_input() {
+        assert!(
+            validate_received_datagram_size(0, RECEIVE_BUFFER_BYTES)
+                .is_err_and(|error| error.to_string().contains("empty netlink datagram"))
+        );
+        assert!(
+            validate_received_datagram_size(RECEIVE_BUFFER_BYTES + 1, RECEIVE_BUFFER_BYTES)
+                .is_err_and(|error| error.to_string().contains("exceeded its fixed buffer"))
+        );
+        assert_eq!(
+            validate_received_datagram_size(1, RECEIVE_BUFFER_BYTES).ok(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn packet_batch_preserves_every_bounded_packet_identifier() -> Result<(), Box<dyn Error>> {
+        let mut datagram = Vec::new();
+        for packet_id in [7_u32, 11_u32] {
+            let mut packet_header = [0_u8; PACKET_HEADER_BYTES];
+            packet_header[..4].copy_from_slice(&packet_id.to_be_bytes());
+            datagram.extend_from_slice(&build_message(
+                queue_message_type(NFQNL_MSG_PACKET),
+                0,
+                0,
+                NFNETLINK_FAMILY_UNSPEC,
+                APPLICATION_QUEUE_NUMBER,
+                &[(NFQA_PACKET_HDR, packet_header.as_slice())],
+            )?);
+        }
+
+        let mut batch = Vec::new();
+        append_packet_datagram(&datagram, &mut batch)?;
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].packet_id, 7);
+        assert_eq!(batch[1].packet_id, 11);
+        assert!(batch.iter().all(|packet| packet.packet.is_err()));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_batch_refuses_more_than_its_fixed_attribution_bound() -> Result<(), Box<dyn Error>> {
+        let mut datagram = Vec::new();
+        for packet_id in 0..=u32::try_from(MAX_PACKET_BATCH_SIZE)? {
+            let mut packet_header = [0_u8; PACKET_HEADER_BYTES];
+            packet_header[..4].copy_from_slice(&packet_id.to_be_bytes());
+            datagram.extend_from_slice(&build_message(
+                queue_message_type(NFQNL_MSG_PACKET),
+                0,
+                0,
+                NFNETLINK_FAMILY_UNSPEC,
+                APPLICATION_QUEUE_NUMBER,
+                &[(NFQA_PACKET_HDR, packet_header.as_slice())],
+            )?);
+        }
+
+        let mut batch = Vec::new();
+        let error = append_packet_datagram(&datagram, &mut batch)
+            .err()
+            .ok_or("oversized queued packet batch was accepted")?;
+        assert!(error.to_string().contains("exceeds its fixed bound"));
+        assert_eq!(batch.len(), MAX_PACKET_BATCH_SIZE);
+        Ok(())
     }
 
     #[test]

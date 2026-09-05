@@ -25,19 +25,39 @@ Validation
 Only after all 74 functional firewall jobs pass, one bounded performance smoke
 uses the exact `binary-tumbleweed-amd64` daemon from the release run on one
 openSUSE Tumbleweed `linux/amd64` stand. It exercises nftables and iptables in
-disposable Docker namespaces, has a 1200-second harness limit and a 30-minute job
+disposable Docker namespaces, has a 1800-second harness limit and a 45-minute job
 limit, and uploads validated JSON, CSV, and Markdown reports. The checked-in
 release profile requires both backends to pass and rejects invalid or saturated
-measurements. Its unchanged 10% relative thresholds retain every per-window
-delta and crossing, but block only a regression confirmed by at least three
-steady adjacent AB/BA pairs whose one-sided 95% Student-t lower confidence
-bound exceeds the threshold. A single burst relative crossing is diagnostic;
-burst capacity and safety remain mandatory. Drops, NFQUEUE errors, and
-fail-open behavior are immediate failures rather than statistical decisions.
+measurements. Its relative thresholds remain 10%, and every per-window delta
+and crossing remains in the evidence. In release smoke,
+`cpu_latency_relative_regressions_are_advisory: true` makes only the paired
+DUT-cgroup CPU and request/TCP-connect latency regressions advisory on the
+shared runner. Their means and one-sided 95% Student-t bounds are still
+reported, but do not by themselves block publication. A paired throughput or
+DUT-PPS reduction whose arithmetic mean over at least three independent,
+adjacent steady AB/BA pairs exceeds 10% remains blocking. Absolute daemon
+CPU/RSS and p99-latency ceilings, target attainment, validity, and burst
+capacity remain mandatory. A single burst has no confidence claim, but its
+throughput/PPS threshold crossings are directly blocking; CPU/latency follows
+the profile's explicit action.
+Drops, retransmits, NFQUEUE errors, and fail-open behavior are immediate
+failures rather than statistical decisions.
 Explicit fail-open behavior is also proven by the separate controlled-overload
 canary. This release-only smoke is not run by
 the pull-request workflow and is not a portable benchmark or a support claim
 for every architecture.
+
+Every independent CI block has a 1.0-second warm-up. The complete two-backend
+workload plan is estimated at 609.6 seconds and must remain below its explicit
+620-second workload bound. The finite keep-alive target model uses a
+worker-local Poisson competing-risk estimate instead of assuming simultaneous
+socket expiry. It charges four close packets plus a three-packet replacement
+handshake to the existing PPS and CPS caps; the checked-in pure keep-alive
+profile keeps `pps = 1280` and `cps = 160` and yields
+`200.874426 operations/s`. Configured intensities and the numerical 10% release
+thresholds are not reduced. Only the release-smoke classification of relative
+CPU and latency crossings is advisory; the production-like profile sets
+`cpu_latency_relative_regressions_are_advisory: false` and keeps them blocking.
 
 The overload pressure client uses an explicit ready/start barrier before the
 daemon is stopped. On the same canary veth, a separate same-transport

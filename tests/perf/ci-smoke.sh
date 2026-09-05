@@ -5,8 +5,8 @@ umask 077
 export LC_ALL=C.UTF-8
 export PYTHONDONTWRITEBYTECODE=1
 
-readonly MAX_TIMEOUT_SECONDS=1200
-readonly MAX_JSON_BYTES=$((12 * 1024 * 1024))
+readonly MAX_TIMEOUT_SECONDS=1800
+readonly MAX_JSON_BYTES=$((20 * 1024 * 1024))
 readonly MAX_CSV_BYTES=$((16 * 1024 * 1024))
 readonly MAX_MARKDOWN_BYTES=$((512 * 1024))
 readonly MAX_LOG_BYTES=$((16 * 1024 * 1024))
@@ -136,13 +136,18 @@ script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 repository_root=$(CDPATH='' cd -- "$script_directory/../.." && pwd -P)
 runner="$repository_root/tests/perf/run.py"
 config="$repository_root/tests/perf/config/ci-smoke.json"
+release_validator="$script_directory/validate_report.py"
 
 for required_command in awk docker grep install jq python3 sha256sum stat tee timeout; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required command is unavailable: $required_command"
 done
 
-for source_file in "$runner" "$script_directory/environment.py" "$config"; do
+for source_file in \
+    "$runner" \
+    "$script_directory/environment.py" \
+    "$release_validator" \
+    "$config"; do
     [[ -f "$source_file" && ! -L "$source_file" && -r "$source_file" ]] \
         || fail "required input is not a readable regular non-symlink file: $source_file"
 done
@@ -153,10 +158,12 @@ jq -e '
     and .criteria.maximum_dut_pps_reduction_vs_baseline_percent == 10
     and .criteria.maximum_latency_increase_vs_baseline_percent == 10
     and .criteria.maximum_cgroup_cpu_increase_vs_baseline_percent == 10
+    and .criteria.cpu_latency_relative_regressions_are_advisory == true
+    and .criteria.maximum_comparison_gap_seconds == 15
     and .criteria.require_burst_capacity == true
     and .capacity_certification == false
 ' "$config" >/dev/null \
-    || fail 'ci-smoke thresholds must be exactly 10 percent and burst capacity must be required'
+    || fail 'ci-smoke must retain 10-percent observations, advisory CPU/latency, and required burst capacity'
 
 daemon=${OPENSHIELD_DAEMON:-}
 [[ "$daemon" == /* ]] || fail 'OPENSHIELD_DAEMON must be an absolute path'
@@ -455,6 +462,40 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
             .tcp_listen.listen_drops,
             .tcp_listen.listen_overflows
         ] | all(.[]; nonnegative_integer and . == 0));
+    def collector_excluded_cgroup_cpu($elapsed):
+        type == "object"
+        and ($elapsed | type == "number" and . > 0)
+        and .accounting == "container_cgroup_minus_metric_collector"
+        and (.raw_cpu_seconds | type == "number" and . >= 0)
+        and (.collector_cpu_seconds_excluded | type == "number" and . >= 0)
+        and (.cpu_seconds | type == "number" and . >= 0)
+        and (.cpu_percent_one_core | type == "number" and . >= 0)
+        and .collector_cpu_seconds_excluded <= .raw_cpu_seconds + 0.000001
+        and ((.cpu_seconds
+              - ([0, (.raw_cpu_seconds - .collector_cpu_seconds_excluded)] | max))
+             | abs < 0.000001)
+        and ((.cpu_percent_one_core - (.cpu_seconds * 100 / $elapsed))
+             | abs < 0.000001);
+    def workload_normalized_network_rates($collector_elapsed; $workload_wall):
+        type == "object"
+        and ($collector_elapsed | type == "number" and . > 0)
+        and ($workload_wall | type == "number" and . > 0)
+        and (.collector_elapsed_seconds | type == "number" and . > 0)
+        and (.rate_denominator_seconds | type == "number" and . > 0)
+        and ((.collector_elapsed_seconds - $collector_elapsed)
+             | abs < 0.000001)
+        and ((.rate_denominator_seconds - $workload_wall)
+             | abs < 0.000001)
+        and ([.rx_packets, .tx_packets, .rx_bytes, .tx_bytes]
+             | all(.[]; nonnegative_integer))
+        and ([.rx_pps, .tx_pps, .rx_mbps, .tx_mbps]
+             | all(.[]; type == "number" and . >= 0))
+        and ((.rx_pps - (.rx_packets / $workload_wall)) | abs < 0.000001)
+        and ((.tx_pps - (.tx_packets / $workload_wall)) | abs < 0.000001)
+        and ((.rx_mbps - (.rx_bytes * 8 / $workload_wall / 1000000))
+             | abs < 0.000001)
+        and ((.tx_mbps - (.tx_bytes * 8 / $workload_wall / 1000000))
+             | abs < 0.000001);
     def ordered_positive_timestamps:
         . as $values
         | (all(.[]; nonnegative_integer and . > 0))
@@ -490,27 +531,31 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and .schema == "openshield.perf.report.v2"
     and .valid == true
     and .passed == true
+    and .configuration.schema == "openshield.perf.config.v2"
     and .criteria == .configuration.criteria
     and .criteria.maximum_throughput_reduction_vs_baseline_percent == 10
     and .criteria.maximum_dut_pps_reduction_vs_baseline_percent == 10
     and .criteria.maximum_latency_increase_vs_baseline_percent == 10
     and .criteria.maximum_cgroup_cpu_increase_vs_baseline_percent == 10
+    and .criteria.cpu_latency_relative_regressions_are_advisory == true
     and .criteria.require_burst_capacity == true
     and .configuration.criteria.require_burst_capacity == true
     and .configuration.capacity_certification == false
     and .relative_performance_methodology == {
-        pairing: "predetermined_adjacent_pristine_ab_ba",
+        pairing: "independent_order_balanced_adjacent_ab_ba",
         gate_phase: "steady",
-        burst_relative_role: "diagnostic_only",
+        burst_relative_role: "single_sample_threshold_gate",
         minimum_paired_samples: 3,
         confidence_level: 0.95,
-        method: "one_sided_paired_student_t_mean_lower_bound",
-        thresholds_unchanged: true
+        method: "arithmetic_mean_of_independent_paired_deltas",
+        confirmation_method: "one_sided_paired_student_t_mean_lower_bound",
+        thresholds_unchanged: true,
+        cpu_latency_release_action: "observe"
     }
     and .harness.schema == "openshield.perf.harness-evidence.v1"
     and (.harness.manifest_sha256
         | type == "string" and test("^[0-9a-f]{64}$"))
-    and (.harness.components | type == "array" and length == 10)
+    and (.harness.components | type == "array" and length == 11)
     and all(.harness.components[];
         (.path | type == "string" and length > 0)
         and (.size | type == "number" and . > 0 and . <= 4194304)
@@ -556,8 +601,8 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         == false
     and (.baseline_pairing | type == "object")
     and .baseline_pairing.schema
-        == "openshield.perf.baseline-pairing.v1"
-    and .baseline_pairing.strategy == "nearest_pristine_ab_ba"
+        == "openshield.perf.baseline-pairing.v2"
+        and .baseline_pairing.strategy == "independent_order_balanced_ab_ba"
     and .baseline_pairing.valid == true
     and (.baseline_pairing.failure_reasons
         | type == "array" and length == 0)
@@ -591,6 +636,8 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
     and (.baseline_pairing.orders.ba | nonnegative_integer and . > 0)
     and (.baseline_pairing.maximum_gap_seconds
         | type == "number" and . >= 0)
+    and .baseline_pairing.maximum_gap_seconds
+        <= .criteria.maximum_comparison_gap_seconds
     and (.backends | type == "array")
     and (([.backends[].name] | sort) == ["iptables", "nftables"])
     and all(.backends[];
@@ -611,9 +658,9 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         | .pressure_workload.metrics as $pressure
         | .metric_starts as $metric_starts
         | ([
-            $metric_starts.dut.boundary_monotonic_ns,
-            $metric_starts.peer.boundary_monotonic_ns,
-            $metric_starts.canary.boundary_monotonic_ns,
+            ([$metric_starts.dut.boundary_monotonic_ns,
+              $metric_starts.peer.boundary_monotonic_ns,
+              $metric_starts.canary.boundary_monotonic_ns] | max),
             .saturation.snapshot_before_stop.observed_at_monotonic_ns,
             .saturation.stopped_at_monotonic_ns,
             .saturation.snapshot_at_barrier.observed_at_monotonic_ns
@@ -734,7 +781,10 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         and (.metric_collectors.dut | pinned_process(0))
         and (.metric_collectors.peer | pinned_process(0))
         and (.metric_collectors.canary | pinned_process(0))
-        and .dut_metrics.schema == "openshield.perf.metrics.v2"
+        and .dut_metrics.schema == "openshield.perf.metrics.v3"
+        and (.dut_metrics as $metrics
+             | $metrics.cgroup
+             | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
         and .dut_metrics.stop_reason == "split_boundary"
         and (.dut_metrics.elapsed_seconds | type == "number" and . > 0)
         and .dut_metrics.started_at_monotonic_ns
@@ -749,16 +799,25 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
             | nonnegative_integer and . > 0)
         and .dut_metrics.finished_at_monotonic_ns
             == .dut_metric_boundary.boundary_monotonic_ns
-        and .post_resume_dut_metrics.schema == "openshield.perf.metrics.v2"
+        and .post_resume_dut_metrics.schema == "openshield.perf.metrics.v3"
+        and (.post_resume_dut_metrics as $metrics
+             | $metrics.cgroup
+             | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
         and .post_resume_dut_metrics.stop_reason == "requested"
         and (.post_resume_dut_metrics.elapsed_seconds
             | type == "number" and . > 0)
         and .post_resume_dut_metrics.started_at_monotonic_ns
             == .dut_metric_boundary.boundary_monotonic_ns
-        and .peer_metrics.schema == "openshield.perf.metrics.v2"
+        and .peer_metrics.schema == "openshield.perf.metrics.v3"
+        and (.peer_metrics as $metrics
+             | $metrics.cgroup
+             | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
         and .peer_metrics.started_at_monotonic_ns
             == $metric_starts.peer.boundary_monotonic_ns
-        and .canary_metrics.schema == "openshield.perf.metrics.v2"
+        and .canary_metrics.schema == "openshield.perf.metrics.v3"
+        and (.canary_metrics as $metrics
+             | $metrics.cgroup
+             | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
         and .canary_metrics.started_at_monotonic_ns
             == $metric_starts.canary.boundary_monotonic_ns
         and .saturation.metric_boundary_monotonic_ns
@@ -963,7 +1022,8 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
             end
         ))
     and all(.results[];
-        type == "object"
+        .workload.metrics.wall_seconds as $workload_wall
+        | type == "object"
         and (.backend == "iptables" or .backend == "nftables")
         and (.policy == "baseline"
             or .policy == "network_only"
@@ -1084,6 +1144,10 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
              end)
         and (.baseline_sample_id
             | type == "string" and test("^b[0-9]{5}$"))
+        and (.comparison_pair_id
+            | type == "string" and test("^p[0-9]{5}$"))
+        and (.comparison_repetition
+            | nonnegative_integer and . >= 1 and . <= 20)
         and (.execution_sequence | nonnegative_integer)
         and (.block_started_monotonic_ns
             | nonnegative_integer and . > 0)
@@ -1097,12 +1161,54 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
              else .topology_role == "protected"
                  and (.comparison_order == "ab" or .comparison_order == "ba")
                  and (.comparison_gap_seconds
-                     | type == "number" and . >= 0)
+                     | type == "number" and . >= 0
+                       and . <= $report.criteria.maximum_comparison_gap_seconds)
              end)
         and .valid == true
         and .passed == true
         and .safety_pass == true
-        and (.capacity_pass | type == "boolean")
+        and .dut_metrics.schema == "openshield.perf.metrics.v3"
+        and (.dut_metrics as $metrics
+             | $metrics.cgroup
+             | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
+        and (.dut_metrics as $metrics
+             | $metrics.network
+             | workload_normalized_network_rates(
+                 $metrics.elapsed_seconds; $workload_wall))
+        and .peer_metrics.schema == "openshield.perf.metrics.v3"
+        and (.peer_metrics as $metrics
+             | $metrics.cgroup
+             | collector_excluded_cgroup_cpu($metrics.elapsed_seconds))
+        and (.peer_metrics as $metrics
+             | $metrics.network
+             | workload_normalized_network_rates(
+                 $metrics.elapsed_seconds; $workload_wall))
+        and (if (.phase_role == "steady" or .phase_role == "burst")
+             then .workload.config.target_application_ops_per_second as $target
+                  | .derived.actual_application_ops_per_second as $actual
+                  | ($target | type == "number" and . > 0)
+                  and ($actual | type == "number" and . >= 0)
+                  and .capacity_pass == true
+                  and ((.derived.expected_application_ops_per_second - $target)
+                       | abs < 0.000001)
+                  and ((.derived.target_attainment_ratio - ($actual / $target))
+                       | abs < 0.000001)
+                  and .derived.target_attainment_ratio
+                      >= $report.criteria.minimum_target_ratio
+                  and (.derived.latency_p99_ms
+                       | type == "number"
+                         and . <= $report.criteria.maximum_latency_p99_ms)
+                  and (if .policy == "baseline"
+                       then true
+                       else (.dut_metrics.daemon.cpu_percent_one_core
+                             | type == "number" and . >= 0
+                               and . <= $report.criteria.maximum_daemon_cpu_percent_one_core)
+                            and (.dut_metrics.daemon.rss_bytes_peak
+                                 | type == "number" and . >= 0
+                                   and . <= $report.criteria.maximum_daemon_rss_bytes)
+                       end)
+             else (.capacity_pass | type == "boolean")
+             end)
         and (.workload.metrics.errors | type == "number" and . == 0)
         and ([
             .dut_metrics.network.rx_pps,
@@ -1206,17 +1312,46 @@ jq -e --argjson allow_unsupported_iptables "$allow_unsupported_iptables" '
         elif .phase_role == "steady"
         then (.relative_performance_evidence | type == "array" and length > 0)
              and all(.relative_performance_evidence[];
-                 .method == "one_sided_paired_student_t_mean_lower_bound"
+                 .method == "arithmetic_mean_of_independent_paired_deltas"
+                 and .confirmation_method
+                     == "one_sided_paired_student_t_mean_lower_bound"
                  and .minimum_sample_count == 3
                  and .confidence_level == 0.95
                  and (.sample_count | type == "number" and . >= 3)
-                 and (.confirmed_regression == false))
+                 and .independent_pairs_valid == true
+                 and (.independent_pair_ids | type == "array" and length >= 3)
+                 and ((.independent_pair_ids | unique | length)
+                      == (.independent_pair_ids | length))
+                 and (.baseline_sample_ids | type == "array" and length >= 3)
+                 and ((.baseline_sample_ids | unique | length)
+                      == (.baseline_sample_ids | length))
+                 and ((.comparison_orders | unique | sort) == ["ab", "ba"])
+                 and (
+                     if (.metric == "cgroup_cpu_increase_percent"
+                         or (.metric | startswith("latency_"))
+                         or (.metric | startswith("connect_latency_")))
+                     then .release_action == "observe"
+                          and (.mean_exceeded_threshold | type == "boolean")
+                          and (.confirmed_regression | type == "boolean")
+                     else .release_action == "fail"
+                          and .mean_exceeded_threshold == false
+                          and .confirmed_regression == false
+                     end))
         else (.relative_performance_evidence | type == "array" and length > 0)
              and all(.relative_performance_evidence[];
-                 .method == "single_burst_observation_not_a_relative_gate"
+                 .method == "single_paired_burst_threshold_gate"
                  and .minimum_sample_count == 3
                  and .confidence_level == 0.95
                  and (.sample_count == 0 or .sample_count == 1)
+                 and (
+                     if (.metric == "cgroup_cpu_increase_percent"
+                         or (.metric | startswith("latency_"))
+                         or (.metric | startswith("connect_latency_")))
+                     then .release_action == "observe"
+                          and (.mean_exceeded_threshold | type == "boolean")
+                     else .release_action == "fail"
+                          and .mean_exceeded_threshold == false
+                     end)
                  and .confirmed_regression == false)
         end)
 ' "$report_json" >/dev/null \
@@ -1248,6 +1383,7 @@ harness_paths = (
     "tests/perf/metrics.py",
     "tests/perf/run.py",
     "tests/perf/runtime_launcher.py",
+    "tests/perf/validate_report.py",
     "tests/perf/workloads/common.py",
     "tests/perf/workloads/identity_probe.c",
     "tests/perf/workloads/tcp.py",
@@ -1531,6 +1667,25 @@ phases.extend(
 phases.append(("burst", "burst", config["phases"]["burst"]["scale"], None))
 
 
+def comparison_phases(repetition):
+    repetitions = config["phases"]["steady"]["repetitions"]
+    selected = []
+    for phase in phases:
+        _name, role, _scale, phase_repetition = phase
+        if role == "steady":
+            if phase_repetition == repetition:
+                selected.append(phase)
+        elif role == "ramp":
+            if repetition == 1:
+                selected.append(phase)
+        elif role == "burst":
+            if repetition == repetitions:
+                selected.append(phase)
+        else:
+            selected.append(phase)
+    return selected
+
+
 def protected_scenarios(profile):
     policies = profile["policy_cases"]
     if "network_only" in policies:
@@ -1546,61 +1701,60 @@ def protected_scenarios(profile):
 def expected_backend_blocks(backend):
     sequence = 0
     sample_index = 0
+    pair_index = 0
+    group_index = 0
     expected_blocks = []
-    for profile_index, profile in enumerate(config["profiles"]):
+    repetitions = config["phases"]["steady"]["repetitions"]
+    for profile in config["profiles"]:
         scenarios = list(protected_scenarios(profile))
-        for load_index, load_level in enumerate(config["load_levels"]):
-            if not scenarios:
-                continue
-            sample_slots = []
-            for _ in range(len(scenarios) // 2 + 1):
-                sample_slots.append((backend, sample_index))
-                sample_index += 1
-            expected_blocks.append(
-                {
-                    "sequence": sequence,
-                    "sample_slot": sample_slots[0],
-                    "topology_role": "baseline",
-                    "policy": "baseline",
-                    "mode": None,
-                    "learning_variant": None,
-                    "comparison_order": None,
-                    "profile": profile,
-                    "load_level": load_level,
-                }
-            )
-            sequence += 1
-            for index, (policy, mode, variant) in enumerate(scenarios):
-                sample_slot = sample_slots[(index + 1) // 2]
-                expected_blocks.append(
-                    {
-                        "sequence": sequence,
+        for load_level in config["load_levels"]:
+            for policy, mode, variant in scenarios:
+                for repetition in range(1, repetitions + 1):
+                    sample_slot = (backend, sample_index)
+                    pair_slot = (backend, pair_index)
+                    sample_index += 1
+                    pair_index += 1
+                    order = (
+                        "ab"
+                        if (group_index + repetition - 1) % 2 == 0
+                        else "ba"
+                    )
+                    common = {
                         "sample_slot": sample_slot,
+                        "pair_slot": pair_slot,
+                        "comparison_repetition": repetition,
+                        "phases": comparison_phases(repetition),
+                        "profile": profile,
+                        "load_level": load_level,
+                    }
+                    baseline = {
+                        **common,
+                        "topology_role": "baseline",
+                        "policy": "baseline",
+                        "mode": None,
+                        "learning_variant": None,
+                        "comparison_order": None,
+                    }
+                    protected = {
+                        **common,
                         "topology_role": "protected",
                         "policy": policy,
                         "mode": mode,
                         "learning_variant": variant,
-                        "comparison_order": "ab" if index % 2 == 0 else "ba",
-                        "profile": profile,
-                        "load_level": load_level,
+                        "comparison_order": order,
                     }
-                )
-                sequence += 1
-                if index % 2 == 1:
-                    expected_blocks.append(
-                        {
-                            "sequence": sequence,
-                            "sample_slot": sample_slot,
-                            "topology_role": "baseline",
-                            "policy": "baseline",
-                            "mode": None,
-                            "learning_variant": None,
-                            "comparison_order": None,
-                            "profile": profile,
-                            "load_level": load_level,
-                        }
+                    first, second = (
+                        (baseline, protected)
+                        if order == "ab"
+                        else (protected, baseline)
                     )
+                    first["sequence"] = sequence
+                    expected_blocks.append(first)
                     sequence += 1
+                    second["sequence"] = sequence
+                    expected_blocks.append(second)
+                    sequence += 1
+                group_index += 1
     return expected_blocks
 
 
@@ -1609,7 +1763,6 @@ def reject(message):
     raise SystemExit(1)
 
 
-phase_counter = Counter(phases)
 block_constant_fields = (
     "backend",
     "policy",
@@ -1620,6 +1773,8 @@ block_constant_fields = (
     "transport",
     "load_level",
     "baseline_sample_id",
+    "comparison_pair_id",
+    "comparison_repetition",
     "comparison_order",
     "execution_sequence",
     "topology_role",
@@ -1629,8 +1784,9 @@ block_constant_fields = (
 )
 sample_slot_to_id = {}
 sample_id_to_slot = {}
+pair_slot_to_id = {}
+pair_id_to_slot = {}
 sample_references = Counter()
-sample_orders = {}
 observed_gaps = []
 observed_comparison_count = 0
 observed_order_counts = Counter()
@@ -1653,6 +1809,85 @@ def canonical_digest(document):
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def steady_measurement_intervals(row):
+    if row.get("phase_role") != "steady":
+        return None
+    dut_metrics = row.get("dut_metrics")
+    peer_metrics = row.get("peer_metrics")
+    if not isinstance(dut_metrics, dict) or not isinstance(peer_metrics, dict):
+        return None
+    dut_started = dut_metrics.get("started_at_monotonic_ns")
+    dut_finished = dut_metrics.get("finished_at_monotonic_ns")
+    peer_started = peer_metrics.get("started_at_monotonic_ns")
+    peer_finished = peer_metrics.get("finished_at_monotonic_ns")
+    workload_started = (row.get("workload_started") or {}).get(
+        "boundary_monotonic_ns"
+    )
+    workload_finished = (row.get("workload_finished") or {}).get(
+        "boundary_monotonic_ns"
+    )
+    block_started = row.get("block_started_monotonic_ns")
+    block_finished = row.get("block_finished_monotonic_ns")
+    values = (
+        dut_started,
+        peer_started,
+        workload_started,
+        workload_finished,
+        dut_finished,
+        peer_finished,
+        block_started,
+        block_finished,
+    )
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in values
+    ):
+        return None
+    dut_bounded = (
+        block_started
+        <= dut_started
+        <= workload_started
+        < workload_finished
+        <= dut_finished
+        <= block_finished
+    )
+    peer_bounded = (
+        block_started
+        <= peer_started
+        <= workload_started
+        < workload_finished
+        <= peer_finished
+        <= block_finished
+    )
+    if not dut_bounded or not peer_bounded:
+        return None
+    return (
+        (dut_started, dut_finished),
+        (peer_started, peer_finished),
+        (workload_started, workload_finished),
+    )
+
+
+def paired_steady_measurement_gap_seconds(baseline, protected, order):
+    baseline_intervals = steady_measurement_intervals(baseline)
+    protected_intervals = steady_measurement_intervals(protected)
+    if baseline_intervals is None or protected_intervals is None:
+        return None
+    gaps = []
+    for baseline_interval, protected_interval in zip(
+        baseline_intervals, protected_intervals, strict=True
+    ):
+        baseline_started, baseline_finished = baseline_interval
+        protected_started, protected_finished = protected_interval
+        if order == "ab" and baseline_finished <= protected_started:
+            gaps.append(protected_started - baseline_finished)
+        elif order == "ba" and protected_finished <= baseline_started:
+            gaps.append(baseline_started - protected_finished)
+        else:
+            return None
+    return max(gaps) / 1_000_000_000.0
 
 
 def validate_workload_lifecycle(row, prefix="workload"):
@@ -1713,7 +1948,7 @@ for backend in config["backends"]:
         reject(f"non-passing backend appears in a passing report: {backend}")
 
     expected_blocks = expected_backend_blocks(backend)
-    expected_row_count += len(expected_blocks) * len(phases)
+    expected_row_count += sum(len(block["phases"]) for block in expected_blocks)
     rows_by_sequence = {}
     observed_block_order = []
     previous_sequence = None
@@ -1745,7 +1980,8 @@ for backend in config["backends"]:
         expected_blocks, expected_sequences, strict=True
     ):
         rows = rows_by_sequence[sequence]
-        if len(rows) != len(phases):
+        expected_phases = expected_block["phases"]
+        if len(rows) != len(expected_phases):
             reject(
                 f"wrong phase count for {backend} sequence {sequence}: {len(rows)}"
             )
@@ -1762,7 +1998,7 @@ for backend in config["backends"]:
             )
             for row in rows
         )
-        if actual_phases != phase_counter:
+        if actual_phases != Counter(expected_phases):
             reject(f"phase plan mismatch: {backend} sequence {sequence}")
 
         profile = expected_block["profile"]
@@ -1775,6 +2011,7 @@ for backend in config["backends"]:
             "direction": profile["direction"],
             "transport": profile["transport"],
             "load_level": expected_block["load_level"],
+            "comparison_repetition": expected_block["comparison_repetition"],
             "comparison_order": expected_block["comparison_order"],
             "execution_sequence": sequence,
             "topology_role": expected_block["topology_role"],
@@ -1804,6 +2041,16 @@ for backend in config["backends"]:
             reject(
                 f"non-canonical baseline sample id: {backend} sequence {sequence}"
             )
+        pair_id = first.get("comparison_pair_id")
+        if not isinstance(pair_id, str) or re.fullmatch(r"p[0-9]{5}", pair_id) is None:
+            reject(f"invalid comparison pair id: {backend} sequence {sequence}")
+        qualified_pair_id = (backend, pair_id)
+        pair_slot = expected_block["pair_slot"]
+        expected_pair_id = (backend, f"p{pair_slot[1]:05d}")
+        if qualified_pair_id != expected_pair_id:
+            reject(
+                f"non-canonical comparison pair id: {backend} sequence {sequence}"
+            )
         if expected_block["topology_role"] == "baseline":
             if first.get("comparison_gap_seconds") is not None:
                 reject(f"baseline carries a comparison gap: {backend} sequence {sequence}")
@@ -1811,6 +2058,10 @@ for backend in config["backends"]:
             prior_slot = sample_id_to_slot.setdefault(qualified_sample_id, sample_slot)
             if prior_id != qualified_sample_id or prior_slot != sample_slot:
                 reject(f"baseline sample id is ambiguous: {backend}/{sample_id}")
+            prior_pair_id = pair_slot_to_id.setdefault(pair_slot, qualified_pair_id)
+            prior_pair_slot = pair_id_to_slot.setdefault(qualified_pair_id, pair_slot)
+            if prior_pair_id != qualified_pair_id or prior_pair_slot != pair_slot:
+                reject(f"comparison pair id is ambiguous: {backend}/{pair_id}")
         else:
             gap = first.get("comparison_gap_seconds")
             if (
@@ -1818,13 +2069,13 @@ for backend in config["backends"]:
                 or isinstance(gap, bool)
                 or not math.isfinite(gap)
                 or gap < 0
+                or gap > config["criteria"]["maximum_comparison_gap_seconds"]
             ):
                 reject(f"invalid comparison gap: {backend} sequence {sequence}")
             observed_gaps.append(float(gap))
             observed_comparison_count += 1
             observed_order_counts[first["comparison_order"]] += 1
             sample_references[sample_slot] += 1
-            sample_orders.setdefault(sample_slot, set()).add(first["comparison_order"])
 
     for expected_block in expected_blocks:
         sequence = expected_block["sequence"]
@@ -1832,32 +2083,66 @@ for backend in config["backends"]:
             continue
         protected = rows_by_sequence[sequence][0]
         sample_slot = expected_block["sample_slot"]
+        pair_slot = expected_block["pair_slot"]
         qualified_sample_id = (backend, protected["baseline_sample_id"])
+        qualified_pair_id = (backend, protected["comparison_pair_id"])
         if sample_slot_to_id.get(sample_slot) != qualified_sample_id:
             reject(f"protected block references wrong baseline: {backend} sequence {sequence}")
+        if pair_slot_to_id.get(pair_slot) != qualified_pair_id:
+            reject(f"protected block references wrong pair: {backend} sequence {sequence}")
         baseline_sequence = sequence - 1 if protected["comparison_order"] == "ab" else sequence + 1
         if baseline_sequence not in rows_by_sequence:
             reject(f"comparison has no adjacent baseline: {backend} sequence {sequence}")
         baseline = rows_by_sequence[baseline_sequence][0]
-        if baseline["topology_role"] != "baseline" or baseline["baseline_sample_id"] != protected["baseline_sample_id"]:
+        if (
+            baseline["topology_role"] != "baseline"
+            or baseline["baseline_sample_id"] != protected["baseline_sample_id"]
+            or baseline["comparison_pair_id"] != protected["comparison_pair_id"]
+            or baseline["comparison_repetition"]
+            != protected["comparison_repetition"]
+        ):
             reject(f"comparison baseline is not adjacent: {backend} sequence {sequence}")
         if protected["comparison_order"] == "ab":
-            gap_ns = (
-                protected["block_started_monotonic_ns"]
-                - baseline["block_finished_monotonic_ns"]
+            blocks_adjacent = (
+                baseline["block_finished_monotonic_ns"]
+                <= protected["block_started_monotonic_ns"]
             )
         else:
-            gap_ns = (
-                baseline["block_started_monotonic_ns"]
-                - protected["block_finished_monotonic_ns"]
+            blocks_adjacent = (
+                protected["block_finished_monotonic_ns"]
+                <= baseline["block_started_monotonic_ns"]
             )
-        if gap_ns < 0 or not math.isclose(
+        if not blocks_adjacent:
+            reject(f"comparison blocks overlap or are out of order: {backend} sequence {sequence}")
+        baseline_steady = [
+            row
+            for row in rows_by_sequence[baseline_sequence]
+            if row.get("phase_role") == "steady"
+        ]
+        protected_steady = [
+            row
+            for row in rows_by_sequence[sequence]
+            if row.get("phase_role") == "steady"
+        ]
+        expected_gap = (
+            paired_steady_measurement_gap_seconds(
+                baseline_steady[0],
+                protected_steady[0],
+                protected["comparison_order"],
+            )
+            if len(baseline_steady) == 1 and len(protected_steady) == 1
+            else None
+        )
+        if expected_gap is None or not math.isclose(
             protected["comparison_gap_seconds"],
-            gap_ns / 1_000_000_000.0,
+            expected_gap if expected_gap is not None else -1.0,
             rel_tol=0.0,
             abs_tol=1e-9,
         ):
-            reject(f"comparison gap does not match timestamps: {backend} sequence {sequence}")
+            reject(
+                f"comparison gap does not match steady measurement timestamps: "
+                f"{backend} sequence {sequence}"
+            )
         baseline_rows_by_phase = {row["phase"]: row for row in rows_by_sequence[baseline_sequence]}
         for protected_row in rows_by_sequence[sequence]:
             baseline_row = baseline_rows_by_phase[protected_row["phase"]]
@@ -1865,6 +2150,8 @@ for backend in config["backends"]:
             gated_phase = protected_row["phase_role"] in {"steady", "burst"}
             expected_baseline_evidence = {
                 "sample_id": baseline_row["baseline_sample_id"],
+                "comparison_pair_id": baseline_row["comparison_pair_id"],
+                "comparison_repetition": baseline_row["comparison_repetition"],
                 "comparison_order": protected_row["comparison_order"],
                 "execution_sequence": baseline_row["execution_sequence"],
                 "comparison_gap_seconds": protected_row["comparison_gap_seconds"],
@@ -1910,19 +2197,19 @@ for backend in config["backends"]:
 
 for sample_slot, qualified_sample_id in sample_slot_to_id.items():
     reference_count = sample_references[sample_slot]
-    orders = sample_orders.get(sample_slot, set())
-    if reference_count not in (1, 2):
+    if reference_count != 1:
         reject(f"baseline sample has invalid use count: {qualified_sample_id!r}")
-    if reference_count == 2 and orders != {"ab", "ba"}:
-        reject(f"twice-used baseline lacks one AB and one BA comparison: {qualified_sample_id!r}")
+
+if len(pair_slot_to_id) != len(sample_slot_to_id):
+    reject("comparison pair and baseline sample counts differ")
 
 if len(report["results"]) != expected_row_count:
     reject(
         f"result plan mismatch: expected={expected_row_count}, "
         f"actual={len(report['results'])}"
     )
-if all(status == "passed" for status in status_by_backend.values()) and expected_row_count != 384:
-    reject(f"ci-smoke AB/BA row contract drifted from 384 to {expected_row_count}")
+if all(status == "passed" for status in status_by_backend.values()) and expected_row_count != 576:
+    reject(f"ci-smoke independent AB/BA row contract drifted from 576 to {expected_row_count}")
 if pairing["baseline_sample_count"] != len(sample_slot_to_id):
     reject("baseline_pairing baseline_sample_count mismatch")
 if pairing["comparison_count"] != observed_comparison_count:
@@ -1968,7 +2255,12 @@ then
     fail 'report.json does not cover the exact configured result plan'
 fi
 
-readonly EXPECTED_CSV_HEADER='backend,policy,mode,learning_variant,profile,direction,transport,load_level,phase,phase_role,phase_scale,baseline_sample_id,comparison_order,execution_sequence,topology_role,block_started_monotonic_ns,block_finished_monotonic_ns,comparison_gap_seconds,valid,passed,safety_pass,capacity_pass,relative_performance_pass,unreliable_reasons,failure_reasons,safety_failure_reasons,relative_performance_failure_reasons,target_ops_per_second,actual_application_ops_per_second,actual_application_mbps,target_attainment_ratio,actual_cps,active_flows_peak,latency_p50_ms,latency_p95_ms,latency_p99_ms,connect_latency_p50_ms,connect_latency_p95_ms,connect_latency_p99_ms,error_ratio,udp_reply_loss_ratio,udp_scenario_accounting_valid,udp_scenario_packets_sent,udp_scenario_packets_received,udp_scenario_packet_loss,udp_scenario_packet_loss_ratio,udp_scenario_unexpected_packets,udp_scenario_packet_matched,udp_barriers_expected,udp_barriers_sent,udp_server_barriers_received,udp_server_barrier_acks_sent,udp_barrier_acks_received,udp_barrier_errors,udp_barriers_matched,tcp_retransmits,tcp_retransmits_per_tx_packet,dut_rx_pps,dut_tx_pps,dut_rx_mbps,dut_tx_mbps,aggregate_dut_pps,daemon_cpu_percent_one_core,cgroup_cpu_percent_one_core,daemon_rss_bytes_peak,softirq_net_rx,softirq_net_tx,conntrack_count_peak,nfqueue_hits,nfqueue_depth_peak,nfqueue_kernel_dropped,nfqueue_user_dropped,nfqueue_runtime_counters_valid,nfqueue_queue_overflow_delta,nfqueue_attribution_timeout_delta,nfqueue_terminal_queue_error_delta,nfqueue_denied_delta,nfqueue_hits_per_connection,nfqueue_hits_per_datagram,identity_probe_fail_open,quarantine_occurred,application_ops_reduction_percent,throughput_reduction_percent,aggregate_dut_pps_reduction_percent,latency_p50_increase_percent,latency_p95_increase_percent,latency_p99_increase_percent,connect_latency_p50_increase_percent,connect_latency_p95_increase_percent,connect_latency_p99_increase_percent,cgroup_cpu_increase_percent'
+python3 -I -B -S "$release_validator" \
+    "$config" \
+    "$report_json" \
+    || fail 'report.json failed independent configuration and relative-performance recomputation'
+
+readonly EXPECTED_CSV_HEADER='backend,policy,mode,learning_variant,profile,direction,transport,load_level,phase,phase_role,phase_scale,baseline_sample_id,comparison_pair_id,comparison_repetition,comparison_order,execution_sequence,topology_role,block_started_monotonic_ns,block_finished_monotonic_ns,comparison_gap_seconds,valid,passed,safety_pass,capacity_pass,relative_performance_pass,unreliable_reasons,failure_reasons,safety_failure_reasons,relative_performance_failure_reasons,target_ops_per_second,actual_application_ops_per_second,actual_application_mbps,target_attainment_ratio,actual_cps,active_flows_peak,latency_p50_ms,latency_p95_ms,latency_p99_ms,connect_latency_p50_ms,connect_latency_p95_ms,connect_latency_p99_ms,error_ratio,udp_reply_loss_ratio,udp_scenario_accounting_valid,udp_scenario_packets_sent,udp_scenario_packets_received,udp_scenario_packet_loss,udp_scenario_packet_loss_ratio,udp_scenario_unexpected_packets,udp_scenario_packet_matched,udp_barriers_expected,udp_barriers_sent,udp_server_barriers_received,udp_server_barrier_acks_sent,udp_barrier_acks_received,udp_barrier_errors,udp_barriers_matched,tcp_retransmits,tcp_retransmits_per_tx_packet,dut_rx_pps,dut_tx_pps,dut_rx_mbps,dut_tx_mbps,aggregate_dut_pps,daemon_cpu_percent_one_core,cgroup_cpu_percent_one_core,daemon_rss_bytes_peak,softirq_net_rx,softirq_net_tx,conntrack_count_peak,nfqueue_hits,nfqueue_depth_peak,nfqueue_kernel_dropped,nfqueue_user_dropped,nfqueue_runtime_counters_valid,nfqueue_queue_overflow_delta,nfqueue_attribution_timeout_delta,nfqueue_terminal_queue_error_delta,nfqueue_denied_delta,nfqueue_hits_per_connection,nfqueue_hits_per_datagram,identity_probe_fail_open,quarantine_occurred,application_ops_reduction_percent,throughput_reduction_percent,aggregate_dut_pps_reduction_percent,latency_p50_increase_percent,latency_p95_increase_percent,latency_p99_increase_percent,connect_latency_p50_increase_percent,connect_latency_p95_increase_percent,connect_latency_p99_increase_percent,cgroup_cpu_increase_percent'
 IFS= read -r csv_header < "$report_csv" \
     || fail 'report.csv does not contain a header'
 csv_header=${csv_header%$'\r'}

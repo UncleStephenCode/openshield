@@ -17,7 +17,7 @@ from typing import Any, BinaryIO, Callable
 
 QUEUE_NUMBER = 1_337
 CONTROL_SCHEMA = "openshield.perf.metrics.control.v2"
-METRICS_SCHEMA = "openshield.perf.metrics.v2"
+METRICS_SCHEMA = "openshield.perf.metrics.v3"
 U32_MODULUS = 1 << 32
 MAX_DURATION_SECONDS = 3_600.0
 MIN_INTERVAL_SECONDS = 0.02
@@ -336,10 +336,16 @@ def counter_group_delta(
 
 
 def cgroup_cpu_delta(
-    before: Any, after: Any, elapsed: float
+    before: Any,
+    after: Any,
+    elapsed: float,
+    collector_cpu_seconds: float | None = None,
 ) -> dict[str, Any]:
     result = {
         "source": None,
+        "accounting": "container_cgroup_minus_metric_collector",
+        "raw_cpu_seconds": None,
+        "collector_cpu_seconds_excluded": None,
         "cpu_seconds": None,
         "cpu_percent_one_core": None,
     }
@@ -362,21 +368,40 @@ def cgroup_cpu_delta(
         or after_seconds < before_seconds
     ):
         return result
-    cpu_seconds = float(after_seconds - before_seconds)
+    raw_cpu_seconds = float(after_seconds - before_seconds)
+    if (
+        not isinstance(collector_cpu_seconds, (int, float))
+        or isinstance(collector_cpu_seconds, bool)
+        or collector_cpu_seconds < 0
+        or collector_cpu_seconds > raw_cpu_seconds + 1e-6
+    ):
+        return {
+            **result,
+            "source": after.get("source"),
+            "raw_cpu_seconds": raw_cpu_seconds,
+            "collector_cpu_seconds_excluded": collector_cpu_seconds,
+        }
+    cpu_seconds = max(0.0, raw_cpu_seconds - float(collector_cpu_seconds))
     return {
         "source": after.get("source"),
+        "accounting": "container_cgroup_minus_metric_collector",
+        "raw_cpu_seconds": raw_cpu_seconds,
+        "collector_cpu_seconds_excluded": float(collector_cpu_seconds),
         "cpu_seconds": cpu_seconds,
         "cpu_percent_one_core": cpu_seconds * 100.0 / float(elapsed),
     }
 
 
-def snapshot(interface: str) -> dict[str, Any]:
+def snapshot(interface: str) -> tuple[dict[str, Any], float, float]:
     transport = transport_counters()
     observed_at_monotonic_ns = time.monotonic_ns()
-    return {
+    collector_cpu_before_cgroup = time.process_time()
+    cgroup_cpu = cgroup_cpu_usage()
+    collector_cpu_after_cgroup = time.process_time()
+    observation = {
         "monotonic": observed_at_monotonic_ns / 1_000_000_000.0,
         "monotonic_ns": observed_at_monotonic_ns,
-        "cgroup_cpu": cgroup_cpu_usage(),
+        "cgroup_cpu": cgroup_cpu,
         "interface": interface_counters(interface),
         "softirq": softirq_totals(),
         "tcp_retransmits": transport["tcp"]["RetransSegs"],
@@ -394,6 +419,11 @@ def snapshot(interface: str) -> dict[str, Any]:
         ),
         "nfqueue": nfqueue_counters(),
     }
+    return (
+        observation,
+        collector_cpu_before_cgroup,
+        collector_cpu_after_cgroup,
+    )
 
 
 def measurement_boundary(
@@ -401,11 +431,24 @@ def measurement_boundary(
 ) -> dict[str, Any]:
     """Capture one boundary object that adjacent windows can share exactly."""
 
-    observation = snapshot(interface)
+    (
+        observation,
+        collector_cpu_before_cgroup,
+        collector_cpu_after_cgroup,
+    ) = snapshot(interface)
     return {
         "snapshot": observation,
         "process_cpu_ticks": process_cpu_ticks(pid),
         "workload_cpu_ticks": process_cpu_ticks(workload_pid),
+        # Each shared boundary brackets the cgroup read with the collector's
+        # CLOCK_PROCESS_CPUTIME_ID.  A window subtracts only the interior
+        # interval: after the initial cgroup read through before the final
+        # cgroup read.  That interval is contained in the cgroup interval, so
+        # boundary bookkeeping cannot be subtracted from unrelated daemon or
+        # child work and low-activity windows cannot fail merely because the
+        # collector timestamp was sampled after the final cgroup snapshot.
+        "collector_cpu_before_cgroup": collector_cpu_before_cgroup,
+        "collector_cpu_after_cgroup": collector_cpu_after_cgroup,
         "process_rss_bytes": process_rss_bytes(pid),
         "workload_rss_bytes": process_rss_bytes(workload_pid),
     }
@@ -486,10 +529,22 @@ def _metrics_document(
         if workload_cpu_ticks is None
         else workload_cpu_ticks / clock_ticks
     )
+    collector_cpu_before = started.get("collector_cpu_after_cgroup")
+    collector_cpu_after = finished.get("collector_cpu_before_cgroup")
+    collector_cpu_seconds = (
+        None
+        if not isinstance(collector_cpu_before, (int, float))
+        or isinstance(collector_cpu_before, bool)
+        or not isinstance(collector_cpu_after, (int, float))
+        or isinstance(collector_cpu_after, bool)
+        or collector_cpu_after < collector_cpu_before
+        else float(collector_cpu_after - collector_cpu_before)
+    )
     cgroup = cgroup_cpu_delta(
         started_snapshot.get("cgroup_cpu"),
         finished_snapshot.get("cgroup_cpu"),
         elapsed,
+        collector_cpu_seconds,
     )
     network = {
         name: ordinary_delta(
@@ -587,7 +642,11 @@ def _metrics_document(
         "nfqueue": queue,
         "scope_notes": {
             "softirq": "host-wide kernel counters; compare paired baselines",
-            "cgroup_cpu": "container-wide CPU; compare the same paired workload window",
+            "cgroup_cpu": (
+                "container-wide CPU minus the cgroup-boundary-bracketed interior "
+                "metric-collector process CPU; boundary bookkeeping, daemon children, "
+                "and kernel work remain included"
+            ),
             "nfqueue_log_errors": "not included; daemon throttling makes log counts lower bounds",
         },
     }
