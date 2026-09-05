@@ -2,6 +2,8 @@
 
 # OpenShield
 
+Current source release: **v0.2.0**.
+
 OpenShield is a local, application-aware Linux host firewall written in Rust.
 It consists of a privileged daemon and a terminal user interface (TUI). The
 daemon prefers nftables and automatically falls back to a complete
@@ -150,7 +152,7 @@ fail-open bypass flag. TCP authorization is tied to a persisted 30-bit policy
 generation that increases by one and is not reused before exhaustion; UDP and
 ICMP are re-attributed for every otherwise-unmatched outbound packet.
 
-OpenShield 0.1.32 can drain at most 32 already-ready NFQUEUE packets into one
+Since v0.1.32, OpenShield can drain at most 32 already-ready NFQUEUE packets into one
 bounded attribution batch; it never waits to fill a batch. Each packet still
 gets an independent `SOCK_DIAG` socket lookup. Only the complete procfs owner
 enumerations are shared: one snapshot before identity capture and one after it.
@@ -306,8 +308,8 @@ production-like profile. Any executed invalid result row fails the report.
 
 The CI profile retains 10% relative thresholds and records every individual
 delta, crossing, three-pair arithmetic mean, and one-sided 95% Student-t lower
-confidence bound. During the v0.1.32 field-evaluation period, relative
-DUT-cgroup CPU and request/connect-latency crossings are explicitly advisory;
+confidence bound. Under the current v0.2.0 CI policy, relative DUT-cgroup CPU
+and request/connect-latency crossings are explicitly advisory;
 relative throughput and PPS regressions remain blocking. Absolute CPU/RSS and
 p99-latency limits, burst capacity, drops, NFQUEUE errors, and fail-closed
 safety also remain mandatory gates. The production-like profile keeps CPU and
@@ -315,8 +317,9 @@ latency regressions blocking. A single burst has no confidence claim, but
 directly blocks throughput/PPS crossings; CPU/latency follows the profile's
 explicit action. The
 retained full v0.1.31 run was structurally valid but failed its performance
-gate. A full v0.1.32 performance result is not claimed before its report is
-completed and retained.
+gate. The retained full local v0.1.32 run passed its authenticated performance
+gate; that evidence remains scoped to the exact v0.1.32 binary, configuration,
+and report and is not silently promoted to v0.2.0.
 
 ## Installation and init systems
 
@@ -438,13 +441,21 @@ comparison.
 
 Compatibility claims are intentionally scoped:
 
+- the current v0.2.0 source resolves all four workspace crates and their exact
+  internal dependency pins as `0.2.0`. The locked all-target Rust suite passed
+  350 tests with six environment-dependent live tests explicitly ignored;
+  formatting, all-target Clippy with warnings denied, and the release build
+  passed. Both local release executables report version `0.2.0`, and the release
+  matrix validates 43 binary builds, 43 packages, 86 declared platforms, 37
+  package-install jobs, and 74 firewall jobs. The GitHub release workflow for
+  v0.2.0 has not yet run;
 - local v0.1.32 verification on Rust 1.98.0 passed
   `cargo fmt --all -- --check` and locked
   workspace all-target clippy with warnings denied. The complete Rust suite in
   a container passed 350 tests, with six live tests ignored by the normal run;
   all six then passed in a separate live-test invocation. The Python
-  performance-harness suite passed 188 tests and reported 11 intentional
-  sandbox socket skips. These are component results, not a performance-gate
+  performance-harness suite passed 211 tests and reported one expected sandbox
+  socket skip. These are component results, not a performance-gate
   result;
 - the locally built v0.1.32 x86-64 daemon passed the isolated openSUSE
   Tumbleweed scenario with both nftables and the iptables fallback, including Learning,

@@ -318,7 +318,7 @@ are broader than firewall administration alone.
   proportional to process/task enumeration plus the descriptor tables of tasks
   whose filesystem UID matches the socket UID. One directory walk inspects at
   most 4,096 fd entries per matching-UID task and fails if proof requires a later
-  entry. A v0.1.32 batch performs two owner snapshots, each admitting at most
+  entry. Since v0.1.32, a batch performs two owner snapshots, each admitting at most
   131,072 owner records globally across all of its targets; its single 250 ms
   deadline bounds both scans and every intervening lookup and capture.
   Process/thread floods, a matching-UID fd flood, queue pressure, or the
@@ -337,7 +337,7 @@ are broader than firewall administration alone.
   PID/TID scan, introduce an authorization-result cache, or change the worst-case
   complexity. Sustained packet rates or hostile procfs cardinality can therefore
   still saturate the consumer and deny legitimate traffic.
-  The v0.1.32 micro-batch amortizes those two snapshots across at most 32
+  The micro-batch introduced in v0.1.32 amortizes those two snapshots across at most 32
   already-ready packets, but it deliberately retains per-packet `SOCK_DIAG`,
   permits identity reuse only inside the current batch, and requires stable
   before/after ownership plus mandatory-identity consensus. It reduces common-

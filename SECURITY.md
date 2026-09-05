@@ -35,7 +35,7 @@ When the running daemon has entered read-only fail-closed quarantine,
 `StatusV2` uses the distinct `EmergencyBlockAll` reason and the TUI presents it
 as an emergency; it is not confused with an operator-selected `BlockAll`.
 
-OpenShield 0.1.32 amortizes procfs owner enumeration across at most 32
+Since v0.1.32, OpenShield amortizes procfs owner enumeration across at most 32
 already-ready NFQUEUE packets without weakening attribution. `SOCK_DIAG` stays
 per packet; two bounded owner snapshots bracket capture; reuse is confined to
 one batch; mandatory process identity must reach consensus; and one absolute

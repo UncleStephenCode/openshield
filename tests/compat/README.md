@@ -205,16 +205,17 @@ scenarios must preserve identical rule semantics and fail closed if mandatory
 NFQUEUE setup is unavailable. A container result demonstrates the level
 calculation and packet paths on the runner kernel only. It does not certify the
 stock kernel, boot configuration, LSM, or Secure Boot state of the named
-distribution. OpenShield 0.1.32 has no eBPF application data plane, so none of the
+distribution. OpenShield has no eBPF application data plane, so none of the
 37 runtime rows or 49 build-only mappings is an eBPF support claim.
 The only automatic startup backend fallback is from nftables to the complete
 iptables/ip6tables bundle when nftables cannot be validated.
 
-The v0.1.32 bounded NFQUEUE micro-batch and single-process nftables observation
+The bounded NFQUEUE micro-batch and single-process nftables observation introduced in v0.1.32
 are userspace changes. They add no architecture-specific kernel object,
 capability, LSM rule, Secure Boot key, or module requirement. This statement
-describes compatibility; it does not claim that v0.1.32 E2E or performance jobs
-have passed before their reports are retained.
+describes compatibility. Retained v0.1.32 E2E and performance reports remain
+scoped to the exact artifacts they tested; a current release claim requires its
+own retained reports.
 
 ## Real firewall end-to-end workflow
 

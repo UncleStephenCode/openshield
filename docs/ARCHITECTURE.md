@@ -329,7 +329,7 @@ engine is poisoned and read-only. The latter permits observation but rejects
 all privileged mutations until recovery.
 
 L3 is a description of the policy currently compiled into nftables or
-iptables, not an eBPF implementation. OpenShield 0.1.32 has no eBPF application
+iptables, not an eBPF implementation. OpenShield currently has no eBPF application
 data plane, does not retain `CAP_BPF`, does not install a kernel module, and
 does not modify boot parameters or MOK state. A future cgroup/BPF-LSM path must
 have separate feature/load/attach/exercise probes, exact rule-equivalence tests,
@@ -504,8 +504,8 @@ evidence. A production maximum requires three successful steady repetitions.
 Relative performance uses those independent adjacent pristine AB/BA pairs.
 Every window delta and threshold crossing is preserved as evidence. The
 CI observation threshold remains 10%. Its authenticated configuration assigns
-relative throughput/PPS means to the blocking `fail` action and, for the
-v0.1.32 field-evaluation period, assigns relative CPU and latency means to the
+relative throughput/PPS means to the blocking `fail` action and, under the
+current v0.2.0 CI policy, assigns relative CPU and latency means to the
 non-blocking `observe` action. The production-like profile assigns all four to
 `fail`. A one-sided 95% Student-t lower confidence bound records stronger
 confirmation without changing the configured action. A single

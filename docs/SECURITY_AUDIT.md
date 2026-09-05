@@ -2,7 +2,10 @@
 
 # Security audit status
 
-Review snapshot: 2026-09-04, OpenShield 0.1.32 source tree, Rust stable 1.98.0.
+Review snapshot: 2026-09-05, OpenShield 0.2.0 source tree (the audited v0.1.32
+code plus release-version and documentation updates), Rust stable 1.98.0.
+Exact v0.1.32 E2E and performance evidence below remains labelled with the
+version that was measured and is not silently relabelled as v0.2.0 evidence.
 
 This document records the controls found in the current tree, the evidence that
 has actually been collected, and the remaining security boundaries. It is not a
@@ -263,6 +266,14 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   and temporary Unix sockets and did not touch the host firewall. These are
   component results and remain distinct from the full performance-gate result
   below.
+- The v0.2.0 release-version preparation resolved all four workspace crates and
+  their exact internal dependency pins as `0.2.0`. The locked all-target Rust
+  suite passed 350 tests with six environment-dependent live tests explicitly
+  ignored, formatting and all-target Clippy with warnings denied passed, the
+  release matrix validated 43 binary builds, 43 packages, 86 declared
+  platforms, 37 package-install jobs, and 74 firewall jobs, and both locally
+  built release executables reported version `0.2.0`. This is source/build
+  evidence; the v0.2.0 GitHub release workflow has not yet run.
 - The final local v0.1.32 x86-64 Tumbleweed CI-smoke performance gate completed
   with `PASS` for both nftables and the iptables fallback. It used daemon SHA-256
   `d3b824e680baebb30e30f65e2fa010cd0643d3272a2f370bc0001ee727487c29` and
@@ -380,8 +391,8 @@ identified as v0.1.28 do not certify newly built 0.1.32 artifacts.
   the typed, process-lifetime `status.data.nfqueue` counters as authoritative
   gate evidence; throttled log messages are retained only as diagnostic lower
   bounds. All per-window relative deltas and threshold crossings are retained.
-  The CI observation thresholds remain 10%. For the v0.1.32 field-evaluation
-  period, the authenticated criterion
+  The CI observation thresholds remain 10%. Under the current v0.2.0
+  field-evaluation policy, the authenticated criterion
   `cpu_latency_relative_regressions_are_advisory: true` assigns CPU and latency
   means to `observe`; throughput and PPS means retain the blocking `fail`
   action. The production-like profile sets the criterion to `false` and keeps
